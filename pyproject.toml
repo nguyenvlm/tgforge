@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tgforge"
+version = "0.0.1"
+description = "A thin aiogram layer with pluggable consumer apps (Claude Code, shell, file browser)."
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram~=3.30.0",
+    "pydantic~=2.13.0",
+    "telegramify-markdown~=1.2.0",
+]
+
+[project.scripts]
+tgforge = "tgforge.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest~=9.1.0", "ruff~=0.16.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tgforge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+# A window that kills its child without reaping leaks the subprocess transport; it
+# shows up as a ResourceWarning from __del__, which pytest wraps as an unraisable. Error
+# on both so the leak fails the run instead of shipping as a silent warning.
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+    "error::ResourceWarning",
+]

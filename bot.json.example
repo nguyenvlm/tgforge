@@ -1,0 +1,5 @@
+{
+  "token": "<bot-token-from-@BotFather>",
+  "home": "~/.tgforge",
+  "service": "mybot"
+}

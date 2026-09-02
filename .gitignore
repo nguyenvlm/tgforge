@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+tmp/
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# machine-local bot config carries the token — never commit
+bot.json
