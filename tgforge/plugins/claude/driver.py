@@ -745,7 +745,11 @@ class ClaudeTopic(Topic):
         if ctx.message is not None:
             await self.set_markup(ctx.message.message_id, None)  # clear the tapped/dead button
         if info and idx.isdigit():
-            await self._core.route_as_user(self.thread_id, info["options"][int(idx)])
+            option = info["options"][int(idx)]
+            # record the pick as a visible message so the tap is confirmed even if
+            # routing fails; the turn then replies to it (Telegram won't post as the user)
+            recorded = await self.send(f"☑️ {option}")
+            await self._core.route_as_user(self.thread_id, option, reply_to=recorded)
 
     # ── Mirror (non-driven sessions from the transcript) ───────────
     async def _mirror_loop(self):

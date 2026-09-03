@@ -182,6 +182,7 @@ def test_plain_suggestion_routes_to_agent(tmp_path):
         token = next(iter(t._suggested))
         await t._on_suggestion(SimpleNamespace(message=None), f"{token}:0")
         assert submitted == ["hi there"]  # a plain reply still reaches the agent
+        assert any("☑️ hi there" in text for _tid, text in c.bot.sent)  # tap is visibly acked
 
     asyncio.run(scenario())
 
