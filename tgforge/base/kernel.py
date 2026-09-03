@@ -33,6 +33,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiogram import Bot as AioBot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -1840,6 +1841,23 @@ class Kernel(Transport):
             await self._route_slash(message, chat_id, thread_id, text, instance, cls_id)
         else:
             await self._route_text(message, chat_id, thread_id, text, instance, cls_id)
+
+    async def route_as_user(self, thread_id: int | None, text: str) -> None:
+        """Replay `text` through the router as if the owner typed it in `thread_id`,
+        so a source other than a keystroke (a tapped suggestion) still hits slash/
+        prefix routing — a `!cmd` button runs a shell, not an agent prompt."""
+        msg = SimpleNamespace(
+            text=text,
+            caption=None,
+            photo=None,
+            document=None,
+            media_group_id=None,
+            message_id=None,
+            from_user=SimpleNamespace(id=self.owner_id),
+            chat=SimpleNamespace(id=self.chat_id),
+            message_thread_id=thread_id,
+        )
+        await self.handle_message(msg)
 
     def _split(self, text: str) -> tuple[str, str]:
         parts = text.split(maxsplit=1)

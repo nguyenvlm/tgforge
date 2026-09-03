@@ -162,3 +162,66 @@ def test_set_markup_attaches_keyboard(tmp_path):
         assert 42 in c.bot.markup_cleared  # the markup edit reached the (mock) API
 
     asyncio.run(scenario())
+
+
+# ── a tapped suggestion goes through the router, not straight to submit ──
+
+
+def test_plain_suggestion_routes_to_agent(tmp_path):
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        c.core.owners[555] = "claude"  # register ownership so routing resolves the class
+        submitted: list[str] = []
+
+        async def rec(prompt, reply_to=None):
+            submitted.append(prompt)
+
+        t.submit = rec
+        await t._attach_suggestions(7, ["hi there", "!ls"])
+        token = next(iter(t._suggested))
+        await t._on_suggestion(SimpleNamespace(message=None), f"{token}:0")
+        assert submitted == ["hi there"]  # a plain reply still reaches the agent
+
+    asyncio.run(scenario())
+
+
+def test_bang_suggestion_runs_shell_not_prompt(tmp_path):
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        c.core.owners[555] = "claude"
+        submitted: list[str] = []
+
+        async def rec(prompt, reply_to=None):
+            submitted.append(prompt)
+
+        shelled: list[tuple[str, bool]] = []
+
+        async def fake_one_shot(ctx, chain):
+            shelled.append((ctx.text, chain))
+
+        t.submit = rec
+        t.plugin._one_shot = fake_one_shot
+        await t._attach_suggestions(7, ["hi there", "!ls"])
+        token = next(iter(t._suggested))
+        await t._on_suggestion(SimpleNamespace(message=None), f"{token}:1")  # tap "!ls"
+        assert shelled == [("!ls", False)]  # ran the shell prefix, honouring the ! route
+        assert submitted == []  # never handed to the agent as a prompt
+
+    asyncio.run(scenario())
+
+
+# ── a busy account switch is refused, not carried mid-turn ──────────
+
+
+def test_account_switch_refused_while_busy(tmp_path):
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t.busy = True  # a turn is still writing the old account's jsonl
+        await t._pick_account()
+        assert t.config_dir is None  # the switch never happened
+        assert any("busy" in r for r in c.replies)  # the user was told to /cancel first
+
+    asyncio.run(scenario())
