@@ -327,6 +327,25 @@ def test_unhandled_text_in_window_falls_back_to_help_not_menu(tmp_path):
     asyncio.run(scenario())
 
 
+def test_message_in_unowned_topic_is_ignored(tmp_path):
+    """Two bots sharing one forum group both pass the chat_id check; a message in a
+    topic this bot doesn't own must be dropped, else the non-owner spams help."""
+
+    async def scenario():
+        core = _core(tmp_path)
+        inst = await core.open_window(100, ShellTopic, "work")
+        core.bot.sent.clear()
+        EVENTS.clear()
+        # a topic this bot never opened (not in owners) — as if a co-resident bot owns it
+        await core.handle_message(_msg("hello", inst.thread_id + 777))
+        assert core.bot.sent == []  # stayed silent — no help/unhandled reply
+        assert EVENTS == []  # never reached the window's handlers
+        await core.handle_message(_msg("hello", inst.thread_id))  # its own topic still routes
+        assert ("msg", "hello") in EVENTS
+
+    asyncio.run(scenario())
+
+
 def test_unhandled_mention_in_general_falls_back_to_help(tmp_path):
     async def scenario():
         core = _core(tmp_path)

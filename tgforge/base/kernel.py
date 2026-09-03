@@ -1815,6 +1815,10 @@ class Kernel(Transport):
             return
         if chat_id != self.chat_id:
             return  # user authorization is enforced by the auth middleware
+        if thread_id is not None and thread_id not in self.owners:
+            # a topic this bot doesn't own: when bots share one forum group both pass the
+            # chat_id check, so the non-owner must bow out here or it replies with help noise.
+            return
 
         # 1. a pending prompt (await_next / ask_text) wins first
         pending = self._await_input.get(thread_id or 0)
