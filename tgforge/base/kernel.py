@@ -36,7 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from aiogram import Bot as AioBot
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -50,6 +50,8 @@ from tgforge.base.config import BotConfig
 from tgforge.base.ui import MAX_MSG, chunks, md_chunks, to_md
 
 LOGGER = logging.getLogger("tgforge")
+
+_NOT_MODIFIED = object()  # a benign edit no-op: the new content already matches the message
 
 Fallback = Callable[[str], Awaitable[None]]
 RECONCILE_INTERVAL = 300  # seconds between manual-deletion sweeps
@@ -631,16 +633,23 @@ class Transport:
     def __init__(self, bot: AioBot):
         self.bot = bot
 
-    async def _call(self, make_coro):
+    async def _call(self, make_coro, ok_not_modified=False):
         """Issue an aiogram call and return its result. `make_coro` is a zero-arg factory
         (`lambda: self.bot.send_message(...)`) so a flood-wait retry can re-issue a fresh
         coroutine — awaiting the same one twice is a RuntimeError. Honors one flood-wait;
-        swallows API errors, returning None."""
+        swallows API errors, returning None. With `ok_not_modified`, a "message is not
+        modified" 400 returns the `_NOT_MODIFIED` sentinel (an editing no-op is success,
+        not a failure that would trip a plain-text fallback and flip the message format)."""
         for _ in range(2):
             try:
                 return await make_coro()
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after)
+            except TelegramBadRequest as e:
+                if ok_not_modified and "message is not modified" in str(e):
+                    return _NOT_MODIFIED
+                LOGGER.debug("telegram api error: %r", e)
+                return None
             except TelegramAPIError as e:
                 LOGGER.debug("telegram api error: %r", e)
                 return None
@@ -667,7 +676,8 @@ class Transport:
                 chat_id=chat_id,
                 message_id=msg_id,
                 reply_markup=reply_markup,
-            )
+            ),
+            ok_not_modified=True,
         )
         return msg is not None
 
@@ -698,7 +708,8 @@ class Transport:
                 chat_id=chat_id,
                 message_id=msg_id,
                 parse_mode="MarkdownV2",
-            )
+            ),
+            ok_not_modified=True,
         )
         if msg is not None:
             return True
@@ -712,7 +723,8 @@ class Transport:
                 message_id=msg_id,
                 parse_mode="MarkdownV2",
                 reply_markup=reply_markup,
-            )
+            ),
+            ok_not_modified=True,
         )
         if msg is not None:
             return True
