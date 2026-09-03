@@ -745,7 +745,7 @@ class ClaudeTopic(Topic):
         if ctx.message is not None:
             await self.set_markup(ctx.message.message_id, None)  # clear the tapped/dead button
         if info and idx.isdigit():
-            await self.submit(info["options"][int(idx)])
+            await self._core.route_as_user(self.thread_id, info["options"][int(idx)])
 
     # ── Mirror (non-driven sessions from the transcript) ───────────
     async def _mirror_loop(self):
@@ -1022,6 +1022,11 @@ class ClaudeTopic(Topic):
             await self.send(f"📁 workspace · {Path(choice).name}")
 
     async def _pick_account(self, allow_new=True):
+        if self.busy:
+            # the live turn is still writing the old account's jsonl; carrying it now
+            # would drop the turn's tail. Switch once the turn settles.
+            await self.send("busy — /cancel first, then switch account")
+            return
         cd = self.plugin.claude_dir
         default_label = f"default ({self._account_name(cd)})"
         options = [(default_label + (" ✓" if self.config_dir is None else ""), "__default__")]

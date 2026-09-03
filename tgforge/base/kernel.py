@@ -33,6 +33,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiogram import Bot as AioBot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -1221,9 +1222,11 @@ class Kernel(Transport):
             lambda: self.bot.delete_forum_topic(chat_id=self.chat_id, message_thread_id=thread_id)
         )
         if deleted is None:
-            # the topic is still in Telegram — keep it owned so the reconcile sweep retries
-            # rather than forgetting it into a permanently orphaned, unowned window.
-            LOGGER.warning("delete_forum_topic failed for %s; left for reconcile", thread_id)
+            # the delete failed but the topic is still in Telegram — keep it owned so it
+            # isn't forgotten into an orphaned, unowned window. The reconcile sweep does not
+            # retry the delete; it only drops this window once the topic is actually gone
+            # (re-run /close to retry the delete itself).
+            LOGGER.warning("delete_forum_topic failed for %s; kept owned", thread_id)
             return
         self.db.drop(window_ns(cls_id, thread_id))
         self._forget(thread_id)
@@ -1812,6 +1815,10 @@ class Kernel(Transport):
             return
         if chat_id != self.chat_id:
             return  # user authorization is enforced by the auth middleware
+        if thread_id is not None and thread_id not in self.owners:
+            # a topic this bot doesn't own: when bots share one forum group both pass the
+            # chat_id check, so the non-owner must bow out here or it replies with help noise.
+            return
 
         # 1. a pending prompt (await_next / ask_text) wins first
         pending = self._await_input.get(thread_id or 0)
@@ -1840,6 +1847,23 @@ class Kernel(Transport):
             await self._route_slash(message, chat_id, thread_id, text, instance, cls_id)
         else:
             await self._route_text(message, chat_id, thread_id, text, instance, cls_id)
+
+    async def route_as_user(self, thread_id: int | None, text: str) -> None:
+        """Replay `text` through the router as if the owner typed it in `thread_id`,
+        so a source other than a keystroke (a tapped suggestion) still hits slash/
+        prefix routing — a `!cmd` button runs a shell, not an agent prompt."""
+        msg = SimpleNamespace(
+            text=text,
+            caption=None,
+            photo=None,
+            document=None,
+            media_group_id=None,
+            message_id=None,
+            from_user=SimpleNamespace(id=self.owner_id),
+            chat=SimpleNamespace(id=self.chat_id),
+            message_thread_id=thread_id,
+        )
+        await self.handle_message(msg)
 
     def _split(self, text: str) -> tuple[str, str]:
         parts = text.split(maxsplit=1)
