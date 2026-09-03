@@ -1222,9 +1222,11 @@ class Kernel(Transport):
             lambda: self.bot.delete_forum_topic(chat_id=self.chat_id, message_thread_id=thread_id)
         )
         if deleted is None:
-            # the topic is still in Telegram — keep it owned so the reconcile sweep retries
-            # rather than forgetting it into a permanently orphaned, unowned window.
-            LOGGER.warning("delete_forum_topic failed for %s; left for reconcile", thread_id)
+            # the delete failed but the topic is still in Telegram — keep it owned so it
+            # isn't forgotten into an orphaned, unowned window. The reconcile sweep does not
+            # retry the delete; it only drops this window once the topic is actually gone
+            # (re-run /close to retry the delete itself).
+            LOGGER.warning("delete_forum_topic failed for %s; kept owned", thread_id)
             return
         self.db.drop(window_ns(cls_id, thread_id))
         self._forget(thread_id)
