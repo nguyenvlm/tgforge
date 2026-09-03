@@ -11,6 +11,7 @@ render/events/session/background modules.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -339,8 +340,7 @@ class ClaudeTopic(Topic):
             pass
 
     async def _open_holder(self, reply_to=None, reuse_id=None):
-        if self.background_updater_task is not None and not self.background_updater_task.done():
-            self.background_updater_task.cancel()
+        await self._stop_background_updater()  # quiesce it before settling the old card
         if self.last_final_id is not None and self.last_final_body is not None:
             md, plain = self.last_final_body
             await self.edit_md(self.last_final_id, md, plain, reply_markup=self.last_final_markup)
@@ -412,6 +412,7 @@ class ClaudeTopic(Topic):
         and re-mirrors after the restart."""
         if self.holder_id is None:
             return
+        await self._stop_heartbeat()  # own the holder before settling it
         note = "⏸ interrupted by a restart — resuming shortly"
         events = self._events_block(drop_last_text=False)
         if events:
@@ -502,6 +503,8 @@ class ClaudeTopic(Topic):
             if self.release_task is not None:
                 self.release_task.cancel()
                 self.release_task = None
+            await self._stop_heartbeat()  # own the holder before warn_interrupted paints
+            await self._stop_background_updater()
             await self._warn_interrupted()
             if self._jsonl().exists():
                 self.mirror_offset = self._jsonl().stat().st_size
@@ -511,12 +514,6 @@ class ClaudeTopic(Topic):
             self.pending_writes = []
             self.cur_reply_to = None
             self.owned = False
-            if self.heartbeat_task is not None:
-                self.heartbeat_task.cancel()
-                self.heartbeat_task = None
-            if self.background_updater_task is not None:
-                self.background_updater_task.cancel()
-                self.background_updater_task = None
             self.reader_task = None
             self._save()
 
@@ -546,7 +543,9 @@ class ClaudeTopic(Topic):
                 spin += 1
                 background.mark_orphans(self)
                 panel = background.panel(self, spin)
-                if panel is None or self.last_final_body is None:
+                # revalidate after the sleep: the reader may have settled/cleared the
+                # final card while this tick was parked, leaving a stale id to paint
+                if panel is None or self.last_final_id is None or self.last_final_body is None:
                     break
                 md, plain = self.last_final_body
                 await self.edit_md(
@@ -614,10 +613,29 @@ class ClaudeTopic(Topic):
         except Exception as exc:
             LOGGER.warning("quota alert failed: %r", exc)
 
+    async def _quiesce(self, name: str):
+        """Cancel a periodic painter task and wait for it to fully unwind, so no
+        in-flight timer edit lands after the reader writes the holder — the reader
+        owns the message and must quiesce the one live painter before it paints
+        (else a stale timer edit reverts the card to a running frame or a dead id)."""
+        t = getattr(self, name)
+        setattr(self, name, None)
+        if t is not None:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+
+    async def _stop_heartbeat(self):
+        await self._quiesce("heartbeat_task")
+
+    async def _stop_background_updater(self):
+        await self._quiesce("background_updater_task")
+
     async def _finalize_turn(self, result_text, subtype="success", is_error=False):
         holder_id = self.holder_id
         self.busy = False
         self.holder_id = None
+        await self._stop_heartbeat()
         ans = finalize_answer(
             self.turn,
             result_text,
