@@ -480,6 +480,7 @@ class ClaudeTopic(Topic):
                         is_error=bool(ev.get("is_error")),
                     )
                     if self.pending_writes:
+                        self.cancel_requested = False  # the next queued turn cancels on its own
                         continue
                     self.busy = False
                     running = any(x["done"] is None for x in self.background_tasks.values())
@@ -1151,8 +1152,20 @@ class ClaudeTopic(Topic):
     @command("/cancel", "interrupt the running turn", icon="✖️")
     async def cancel(self, ctx):
         if self.busy and self.proc and self.proc.returncode is None:
+            if self.cancel_requested:
+                await self.send("already cancelling...")  # one interrupt is enough
+                return
             await self._interrupt()
             await self.send("cancelling...")
+            return
+        running = sum(1 for t in self.background_tasks.values() if t["done"] is None)
+        if running:
+            await self.send(
+                f"no running turn to cancel — {running} background job(s) still going; "
+                "they finish on their own"
+            )
+        else:
+            await self.send("nothing to cancel — no turn is running")
 
     def _fresh_session(self) -> str:
         """Reset to a brand-new session id (old transcript stays resumable); returns
