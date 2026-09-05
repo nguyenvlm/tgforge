@@ -209,8 +209,7 @@ class ShellTopic(PtyWindow):
         if not self.tui and any(s in scan for s in _TUI_ON):
             self.tui = True
             self.allow_universal = False  # a full-screen app owns the window
-            self.dirty = True
-            asyncio.ensure_future(self._end_tui())  # kill it and hand the shell back
+            asyncio.ensure_future(self._end_tui())  # notify, kill it, hand the shell back
             return
         if self.tui:
             if any(s in scan for s in _TUI_OFF):
@@ -257,10 +256,19 @@ class ShellTopic(PtyWindow):
             return True  # can't tell → assume the child is gone
 
     async def _end_tui(self):
-        """A TUI was detected; the panel can't render it. SIGTERM its process group,
-        escalate to SIGKILL if it clings, then reset the panel — we do NOT wait for
-        the app to emit the alt-screen-off sequence (nano and friends never do), so
-        the shell is always handed back rather than stranded on the notice card."""
+        """A TUI was detected; the panel can't render it. Post a one-shot notice as its
+        own message (the live panel returns to the shell, so a notice edited into it
+        would vanish before it's read), then SIGTERM its process group, escalate to
+        SIGKILL if it clings, and reset the panel — we do NOT wait for the app to emit
+        the alt-screen-off sequence (nano and friends never do), so the shell is always
+        handed back rather than stranded."""
+        cmd = self.last_cmd or "a program"
+        asyncio.ensure_future(
+            self.send_rich(
+                f"⚠️ `{cmd}` opened a full-screen terminal UI — this panel streams line "
+                "output only, so it was closed. Run a full-screen app on the PC instead."
+            )
+        )
         self._signal_foreground(signal.SIGTERM)
         for sig in (None, signal.SIGKILL):
             if sig is not None and not self._foreground_is_shell():
@@ -284,14 +292,7 @@ class ShellTopic(PtyWindow):
 
     async def _render(self):
         if self.tui:
-            cmd = self.last_cmd or "a program"
-            plain = (
-                f"⚠️ {cmd} opened a full-screen terminal UI — this panel streams line "
-                "output only, so it was closed. Run a full-screen app on the PC instead."
-            )
-            md = plain.replace(cmd, f"`{cmd}`", 1) if cmd != "a program" else plain
-            await self._push(md, plain)
-            return
+            return  # a full-screen app briefly holds the screen; _end_tui posts the notice
         body = self.acc[-TAIL_CHARS:].strip() or "(no output yet)"
         esc = body.replace("\\", "\\\\").replace("`", "\\`")
         await self._push(f"```\n{esc}\n```", body)
