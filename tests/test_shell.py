@@ -1,6 +1,6 @@
 """The shell plugin on the new base: a real PTY streams output, tracks cwd, a
-revived window lands in the saved cwd, and a full-screen TUI shows the notice card
-(and drops allow_universal) instead of streaming redraw noise."""
+revived window lands in the saved cwd, and a full-screen TUI is stopped (dropping
+allow_universal) with a one-shot notice instead of streaming redraw noise."""
 
 from __future__ import annotations
 
@@ -207,16 +207,23 @@ def test_clear_command_is_not_intercepted(tmp_path):
     asyncio.run(scenario())
 
 
-def test_tui_notice_card_renders(tmp_path):
+def test_tui_intercept_posts_notice(tmp_path):
+    """A detected TUI posts a persistent notice from the kill path, not the live panel:
+    _end_tui clears tui within ~100ms, faster than a flush render could ever catch a
+    tui=True frame, so a notice edited into the panel was a no-op the user never saw."""
+
     async def scenario():
         core = _kernel(tmp_path)
         inst = await core.open_window(100, ShellTopic, "work")
-        inst.tui = True  # the notice shown while a detected TUI is being stopped
-        inst.last_cmd = "htop"
         core.bot.sent.clear()
-        await inst._render()
-        assert any("full-screen" in t and "htop" in t for t in core.bot.sent)
-        inst.tui = False
+        cmd = (
+            "python3 -c 'import signal,sys,time; signal.signal(signal.SIGTERM, "
+            'lambda *a: sys.exit(0)); sys.stdout.write("\\033[?1049h"); '
+            "sys.stdout.flush(); time.sleep(30)'"
+        )
+        await core.handle_message(_msg(cmd, inst.thread_id))
+        # MarkdownV2 escaping mangles "full-screen"; "terminal UI" survives clean
+        assert await _until(lambda: any("terminal UI" in t for t in core.bot.sent))
         await inst._kill()
 
     asyncio.run(scenario())
