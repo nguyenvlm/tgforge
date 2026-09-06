@@ -52,6 +52,23 @@ from tgforge.base.ui import MAX_MSG, chunks, md_chunks, to_md
 LOGGER = logging.getLogger("tgforge")
 
 _NOT_MODIFIED = object()  # a benign edit no-op: the new content already matches the message
+_SKIPPED = object()  # a droppable call dropped under flood-wait, not an error
+FLOOD_WAIT_CAP = 30  # s: the longest an essential call blocks on one flood-wait
+REQUEST_TIMEOUT = 45  # s: per-request HTTP timeout, so a stuck socket can't wedge a call
+STALL_WARN = 30  # s: log a warning when a live turn's reader has been quiet this long
+
+
+def setup_logging() -> None:
+    """Attach a stderr handler to the `tgforge` logger once (level via TGFORGE_LOG_LEVEL,
+    default INFO). Without this the logger has no handler and warnings vanish."""
+    if LOGGER.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(os.environ.get("TGFORGE_LOG_LEVEL", "INFO").upper())
+    LOGGER.propagate = False
+
 
 Fallback = Callable[[str], Awaitable[None]]
 RECONCILE_INTERVAL = 300  # seconds between manual-deletion sweeps
@@ -493,20 +510,24 @@ class Topic:
         self.name = name
 
     # ── Replies bound to this window's thread ──────────────────────
-    async def send(self, text, reply_to=None):
-        return await self._core.send(self._core.chat_id, text, self.thread_id, reply_to=reply_to)
+    async def send(self, text, reply_to=None, droppable=False):
+        return await self._core.send(
+            self._core.chat_id, text, self.thread_id, reply_to=reply_to, droppable=droppable
+        )
 
     async def send_rich(self, text, reply_to=None):
         return await self._core.send_rich(
             self._core.chat_id, text, self.thread_id, reply_to=reply_to
         )
 
-    async def edit(self, msg_id, text, reply_markup=None):
-        return await self._core.edit(self._core.chat_id, msg_id, text, reply_markup=reply_markup)
+    async def edit(self, msg_id, text, reply_markup=None, droppable=False):
+        return await self._core.edit(
+            self._core.chat_id, msg_id, text, reply_markup=reply_markup, droppable=droppable
+        )
 
-    async def edit_md(self, msg_id, md, plain, reply_markup=None):
+    async def edit_md(self, msg_id, md, plain, reply_markup=None, droppable=False):
         return await self._core.edit_md(
-            self._core.chat_id, msg_id, md, plain, reply_markup=reply_markup
+            self._core.chat_id, msg_id, md, plain, reply_markup=reply_markup, droppable=droppable
         )
 
     async def edit_rich(self, msg_id, text):
@@ -533,8 +554,8 @@ class Topic:
             self._core.chat_id, msg_id, media_type, b64, reply_markup=reply_markup
         )
 
-    async def delete(self, msg_id):
-        await self._core.delete_msg(self._core.chat_id, msg_id)
+    async def delete(self, msg_id, droppable=False):
+        await self._core.delete_msg(self._core.chat_id, msg_id, droppable=droppable)
 
     async def ask_buttons(self, text, options, timeout=300, announce=None, cancel=True):
         return await self._core.ask_buttons(
@@ -633,18 +654,25 @@ class Transport:
     def __init__(self, bot: AioBot):
         self.bot = bot
 
-    async def _call(self, make_coro, ok_not_modified=False):
+    async def _call(self, make_coro, ok_not_modified=False, droppable=False):
         """Issue an aiogram call and return its result. `make_coro` is a zero-arg factory
         (`lambda: self.bot.send_message(...)`) so a flood-wait retry can re-issue a fresh
-        coroutine — awaiting the same one twice is a RuntimeError. Honors one flood-wait;
-        swallows API errors, returning None. With `ok_not_modified`, a "message is not
-        modified" 400 returns the `_NOT_MODIFIED` sentinel (an editing no-op is success,
-        not a failure that would trip a plain-text fallback and flip the message format)."""
-        for _ in range(2):
+        coroutine — awaiting the same one twice is a RuntimeError. A `droppable` call (a
+        live-panel edit) returns `_SKIPPED` on flood-wait instead of sleeping, so the
+        reader/turn is never blocked — the next repaint retries with fresher state. An
+        essential call sleeps at most FLOOD_WAIT_CAP once, then retries. Swallows API
+        errors, returning None. With `ok_not_modified`, a "message is not modified" 400
+        returns the `_NOT_MODIFIED` sentinel (an editing no-op is success, not a failure
+        that would trip a plain-text fallback and flip the message format)."""
+        for attempt in range(2):
             try:
                 return await make_coro()
             except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
+                LOGGER.warning("flood-wait %ss (droppable=%s)", e.retry_after, droppable)
+                if droppable:
+                    return _SKIPPED
+                if attempt == 0:
+                    await asyncio.sleep(min(e.retry_after, FLOOD_WAIT_CAP))
             except TelegramBadRequest as e:
                 if ok_not_modified and "message is not modified" in str(e):
                     return _NOT_MODIFIED
@@ -655,7 +683,9 @@ class Transport:
                 return None
         return None
 
-    async def send(self, chat_id, text, thread_id=None, reply_to=None) -> int | None:
+    async def send(
+        self, chat_id, text, thread_id=None, reply_to=None, droppable=False
+    ) -> int | None:
         mid = None
         for i, chunk in enumerate(chunks(text)):
             kw = {}
@@ -664,12 +694,15 @@ class Transport:
             if reply_to is not None and i == 0:
                 kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
             msg = await self._call(
-                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, chunk[:MAX_MSG], **kw)
+                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, chunk[:MAX_MSG], **kw),
+                droppable=droppable,
             )
+            if msg is _SKIPPED:
+                return mid
             mid = msg.message_id if msg else mid
         return mid
 
-    async def edit(self, chat_id, msg_id, text, reply_markup=None) -> bool:
+    async def edit(self, chat_id, msg_id, text, reply_markup=None, droppable=False) -> bool:
         msg = await self._call(
             lambda: self.bot.edit_message_text(
                 text[:MAX_MSG],
@@ -678,6 +711,7 @@ class Transport:
                 reply_markup=reply_markup,
             ),
             ok_not_modified=True,
+            droppable=droppable,
         )
         return msg is not None
 
@@ -715,7 +749,7 @@ class Transport:
             return True
         return await self.edit(chat_id, msg_id, text)
 
-    async def edit_md(self, chat_id, msg_id, md, plain, reply_markup=None) -> bool:
+    async def edit_md(self, chat_id, msg_id, md, plain, reply_markup=None, droppable=False) -> bool:
         msg = await self._call(
             lambda: self.bot.edit_message_text(
                 md[:MAX_MSG],
@@ -725,13 +759,16 @@ class Transport:
                 reply_markup=reply_markup,
             ),
             ok_not_modified=True,
+            droppable=droppable,
         )
         if msg is not None:
             return True
-        return await self.edit(chat_id, msg_id, plain, reply_markup=reply_markup)
+        return await self.edit(
+            chat_id, msg_id, plain, reply_markup=reply_markup, droppable=droppable
+        )
 
-    async def delete_msg(self, chat_id, msg_id):
-        await self._call(lambda: self.bot.delete_message(chat_id, msg_id))
+    async def delete_msg(self, chat_id, msg_id, droppable=False):
+        await self._call(lambda: self.bot.delete_message(chat_id, msg_id), droppable=droppable)
 
     async def send_photo_b64(self, chat_id, media_type, b64, thread_id=None, reply_markup=None):
         raw = base64.b64decode(b64)

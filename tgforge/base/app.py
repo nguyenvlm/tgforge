@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from aiogram import BaseMiddleware, Dispatcher, Router
 from aiogram import Bot as AioBot
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import CallbackQuery, Message, TelegramObject, User
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
+from tgforge.base.kernel import REQUEST_TIMEOUT, Kernel, setup_logging
 
 
 class OwnerOnly(BaseMiddleware):
@@ -49,7 +50,8 @@ class App:
         return self
 
     async def start(self) -> None:
-        aiobot = AioBot(self.config.token)
+        setup_logging()
+        aiobot = AioBot(self.config.token, session=AiohttpSession(timeout=REQUEST_TIMEOUT))
         core = Kernel(aiobot, self.config, self._plugins)
 
         router = Router(name="tgforge")
