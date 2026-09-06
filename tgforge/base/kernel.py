@@ -653,6 +653,7 @@ class Plugin:
 class Transport:
     def __init__(self, bot: AioBot):
         self.bot = bot
+        self.flood_until = 0.0  # monotonic deadline of the last droppable flood-wait
 
     async def _call(self, make_coro, ok_not_modified=False, droppable=False):
         """Issue an aiogram call and return its result. `make_coro` is a zero-arg factory
@@ -670,6 +671,7 @@ class Transport:
             except TelegramRetryAfter as e:
                 LOGGER.warning("flood-wait %ss (droppable=%s)", e.retry_after, droppable)
                 if droppable:
+                    self.flood_until = time.monotonic() + e.retry_after
                     return _SKIPPED
                 if attempt == 0:
                     await asyncio.sleep(min(e.retry_after, FLOOD_WAIT_CAP))
@@ -713,6 +715,8 @@ class Transport:
             ok_not_modified=True,
             droppable=droppable,
         )
+        if msg is _SKIPPED:
+            return False
         return msg is not None
 
     async def send_rich(self, chat_id, text, thread_id=None, reply_to=None) -> int | None:
@@ -761,6 +765,8 @@ class Transport:
             ok_not_modified=True,
             droppable=droppable,
         )
+        if msg is _SKIPPED:
+            return False  # flooded: don't fall back to a plain edit that floods too
         if msg is not None:
             return True
         return await self.edit(

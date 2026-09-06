@@ -72,6 +72,26 @@ def test_essential_caps_the_sleep_then_retries(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_droppable_flood_records_deadline_and_reports_not_landed(monkeypatch):
+    """A flooded droppable edit reports False (not landed) and stamps flood_until, so the
+    heartbeat can back off and skip the closed window instead of hammering it."""
+
+    async def scenario():
+        t = Transport(bot=SimpleNamespace())
+        t.bot.edit_message_text = lambda *a, **k: (_ for _ in ()).throw(_Flood(300))
+        monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: 1000.0)
+
+        landed = await t.edit(7, 42, "hi", droppable=True)
+        assert landed is False  # dropped, not a phantom success
+        assert t.flood_until == 1300.0  # exact retry_after deadline recorded
+
+        # edit_md must also report not-landed and NOT fall back to a plain edit that floods
+        landed_md = await t.edit_md(7, 42, "*hi*", "hi", droppable=True)
+        assert landed_md is False
+
+    asyncio.run(scenario())
+
+
 def test_essential_gives_up_after_two_floods(monkeypatch):
     async def scenario():
         slept = []

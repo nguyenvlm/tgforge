@@ -69,3 +69,25 @@ def test_macos_detached_restart_spawns_waiter(tmp_path, monkeypatch):
     assert len(spawned) == 1
     script = spawned[0][2]
     assert "kickstart -k" in script and str(tmp_path) in script
+    # the waiter scopes to the bot's subtree (walk each claude's ancestry to the bot
+    # pid), not any claude on the machine — an unrelated terminal claude must not block
+    assert "descends_from_bot" in script and "launchctl list demo" in script
+
+
+def test_linux_waiter_counts_any_bot_claude(monkeypatch):
+    """The Linux waiter marks busy on ANY claude in the unit's cgroup — a driven turn,
+    a /compact, or a subagent — not only a claude-under-claude subagent, the old check
+    that let a restart kill another window's live turn."""
+    monkeypatch.setattr(service, "IS_MACOS", False)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda cmd, **kw: ran.append(cmd) or subprocess.CompletedProcess(cmd, 0),
+    )
+    service.detached_restart("demo", None)
+    # systemd-run carries the waiter script as its trailing arg
+    script = ran[-1][-1]
+    assert "cgroup.procs" in script
+    assert "= claude ]; then busy=1" in script  # any cgroup claude ⇒ busy
+    assert "PPid" not in script  # the nested parent==claude check is gone

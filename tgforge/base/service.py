@@ -5,8 +5,9 @@ restart from inside a bot-driven turn would deadlock against the graceful drain)
 Two backends, picked by platform: systemd --user on Linux, launchd LaunchAgent on
 macOS. Both grant the main process a drain window on stop (systemd
 KillMode=mixed + TimeoutStopSec, launchd ExitTimeOut) and both wait, before even
-issuing the restart, while a background subagent (a `claude` whose parent is
-`claude`) is still alive.
+issuing the restart, while any bot-driven `claude` is still alive — a live turn, a
+/compact, or a subagent, in any window — so a restart never interrupts another
+window's in-flight work. The wait is bounded (a 60-min cap), then it restarts anyway.
 """
 
 from __future__ import annotations
@@ -132,18 +133,17 @@ def service_active(service: str) -> bool:
     return r.stdout.strip() == "active"
 
 
-# Wait while a background subagent is alive, then restart. On Linux the search is
-# scoped to the unit's cgroup; on macOS there is no cgroup, so it scans every
-# process (a claude whose parent is claude = a background subagent).
+# Wait while any bot-driven claude is alive, then restart — a live turn, a /compact,
+# or a subagent, in ANY window — so a restart never interrupts another window's work.
+# The scope is the bot's process subtree: on Linux that's exactly the unit's cgroup;
+# on macOS there is no cgroup, so each claude's parent chain is walked up to the bot.
 _LINUX_RESTART = """
 cgroup="$(systemctl --user show {service} -p ControlGroup --value)"
 cgroup_file="/sys/fs/cgroup$cgroup/cgroup.procs"
 for _ in $(seq 1 720); do
     busy=0
     for pid in $(cat "$cgroup_file" 2>/dev/null); do
-        [ "$(cat /proc/$pid/comm 2>/dev/null)" = claude ] || continue
-        ppid="$(awk '/^PPid:/{{print $2}}' /proc/$pid/status 2>/dev/null)"
-        if [ "$(cat /proc/$ppid/comm 2>/dev/null)" = claude ]; then busy=1; break; fi
+        if [ "$(cat /proc/$pid/comm 2>/dev/null)" = claude ]; then busy=1; break; fi
     done
     [ "$busy" -eq 0 ] && break
     sleep 5
@@ -155,16 +155,23 @@ _MACOS_RESTART = """
 lock="{home}/restart.lock"
 mkdir "$lock" 2>/dev/null || exit 0
 trap 'rmdir "$lock" 2>/dev/null' EXIT
+bot="$(launchctl list {service} 2>/dev/null | sed -n 's/.*"PID" = \\([0-9][0-9]*\\).*/\\1/p')"
+descends_from_bot() {{
+    p="$1"
+    for _ in $(seq 1 40); do
+        [ -z "$p" ] && return 1
+        [ "$p" = "$bot" ] && return 0
+        [ "$p" = 1 ] && return 1
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    done
+    return 1
+}}
 for _ in $(seq 1 720); do
+    [ -z "$bot" ] && break
     busy=0
-    while read -r pid ppid; do
-        [ "$(ps -o comm= -p "$pid" 2>/dev/null | xargs basename 2>/dev/null)" = claude ] || continue
-        if [ "$(ps -o comm= -p "$ppid" 2>/dev/null | xargs basename 2>/dev/null)" = claude ]; then
-            busy=1; break
-        fi
-    done <<EOF
-$(ps -axo pid=,ppid=)
-EOF
+    for pid in $(pgrep -x claude 2>/dev/null); do
+        if descends_from_bot "$pid"; then busy=1; break; fi
+    done
     [ "$busy" -eq 0 ] && break
     sleep 5
 done
