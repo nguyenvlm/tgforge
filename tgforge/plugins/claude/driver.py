@@ -24,6 +24,7 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import (
+    STALL_WARN,
     Plugin,
     Topic,
     action,
@@ -134,6 +135,8 @@ class ClaudeTopic(Topic):
         self.holder_id: int | None = None
         self.cur_reply_to: int | None = None
         self.turn_start = 0.0
+        self.last_reader_event = 0.0
+        self._stall_warned = False
         self.word_seed = 0
         self.spin = 0
         self.pending_writes: list[dict] = []
@@ -348,8 +351,11 @@ class ClaudeTopic(Topic):
             self.last_final_markup = None
         self.turn = TurnState()
         self.turn_start = time.monotonic()
+        self.last_reader_event = self.turn_start
+        self._stall_warned = False
         self.word_seed = random.randrange(len(WORDS))
         self.busy = True
+        LOGGER.info("turn start (%s)", self.name)
         self.cur_reply_to = reply_to
         self.spin = 0
         head = status_head(self.word_seed, 0, 0, 0)
@@ -365,9 +371,12 @@ class ClaudeTopic(Topic):
         self.spin += 1
         tokens = self.turn.tok_base + self.turn.tok_latest
         head = status_head(self.word_seed, self.spin, elapsed, tokens)
-        self.holder_id = await self.send(head, reply_to=self.cur_reply_to)
+        new_id = await self.send(head, reply_to=self.cur_reply_to, droppable=True)
+        if new_id is None:  # dropped under flood-wait — keep the old holder in place
+            return
+        self.holder_id = new_id
         if old is not None:
-            await self.delete(old)
+            await self.delete(old, droppable=True)
 
     async def submit(self, prompt, reply_to=None):
         """The single prompt entry point (on_message, a skill slash, the ! chain,
@@ -442,6 +451,7 @@ class ClaudeTopic(Topic):
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                self.last_reader_event = time.monotonic()
                 if self.release_task is not None:
                     self.release_task.cancel()
                     self.release_task = None
@@ -554,6 +564,7 @@ class ClaudeTopic(Topic):
                     f"{md}\n\n{panel[0]}",
                     f"{plain}\n\n{panel[1]}",
                     reply_markup=self.last_final_markup,
+                    droppable=True,
                 )
         except asyncio.CancelledError:
             pass
@@ -636,6 +647,13 @@ class ClaudeTopic(Topic):
         holder_id = self.holder_id
         self.busy = False
         self.holder_id = None
+        LOGGER.info(
+            "turn end (%s): %.0fs, %s tokens, %s",
+            self.name,
+            time.monotonic() - self.turn_start,
+            self.turn.tok_base + self.turn.tok_latest,
+            subtype,
+        )
         await self._stop_heartbeat()
         ans = finalize_answer(
             self.turn,
@@ -717,6 +735,10 @@ class ClaudeTopic(Topic):
                 await asyncio.sleep(EDIT_INTERVAL)
                 if not self.busy or self.holder_id is None:
                     continue
+                quiet = time.monotonic() - self.last_reader_event
+                if quiet > STALL_WARN and not self._stall_warned:
+                    self._stall_warned = True
+                    LOGGER.warning("reader quiet %.0fs on a live turn (%s)", quiet, self.name)
                 elapsed = int(time.monotonic() - self.turn_start)
                 self.spin += 1
                 tokens = self.turn.tok_base + self.turn.tok_latest
@@ -740,9 +762,10 @@ class ClaudeTopic(Topic):
                         self.holder_id,
                         f"{mdv2_escape(base)}\n\n{panel[0]}",
                         f"{base}\n\n{panel[1]}",
+                        droppable=True,
                     )
                 else:
-                    await self.edit(self.holder_id, base)
+                    await self.edit(self.holder_id, base, droppable=True)
         except asyncio.CancelledError:
             pass
         except Exception:
