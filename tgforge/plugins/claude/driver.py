@@ -72,7 +72,11 @@ from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answ
 LOGGER = logging.getLogger("tgforge")
 
 MAX_BLOCK_BODY = 1500
-EDIT_INTERVAL = 2.5
+EDIT_INTERVAL = 2.5  # base seconds between live-panel repaints
+EDIT_INTERVAL_MAX = 30.0  # cap the adaptive backoff so the panel still repaints
+EDIT_BACKOFF = 2.0  # multiply the interval on each dropped (flooded) repaint
+EDIT_DECAY_STEP = 0.5  # shrink it back this many seconds per landed repaint
+PANEL_KEEPALIVE = 10.0  # repaint at least this often even with no new content
 MAX_OUTPUT_MSGS = 8
 ALBUM_DEBOUNCE = 2.0
 RELEASE_IDLE_SEC = 1800
@@ -137,6 +141,9 @@ class ClaudeTopic(Topic):
         self.turn_start = 0.0
         self.last_reader_event = 0.0
         self._stall_warned = False
+        self._edit_interval = EDIT_INTERVAL  # adaptive; grows on flood, decays on success
+        self._last_paint_sig: tuple | None = None
+        self._last_paint_at = 0.0
         self.word_seed = 0
         self.spin = 0
         self.pending_writes: list[dict] = []
@@ -548,9 +555,16 @@ class ClaudeTopic(Topic):
 
     async def _background_updater(self):
         spin = 0
+        interval = UPDATER_INTERVAL  # adaptive, same as the heartbeat: grow on flood
         try:
             while self.background_tasks and self.last_final_id is not None:
-                await asyncio.sleep(UPDATER_INTERVAL)
+                # honor the exact flood deadline on top of the adaptive interval (A),
+                # so a long background job's panel never hammers a closed edit window
+                wait = interval
+                slack = self._core.flood_until - time.monotonic()
+                if slack > 0:
+                    wait = max(wait, slack)
+                await asyncio.sleep(wait)
                 spin += 1
                 background.mark_orphans(self)
                 panel = background.panel(self, spin)
@@ -559,13 +573,18 @@ class ClaudeTopic(Topic):
                 if panel is None or self.last_final_id is None or self.last_final_body is None:
                     break
                 md, plain = self.last_final_body
-                await self.edit_md(
+                landed = await self.edit_md(
                     self.last_final_id,
                     f"{md}\n\n{panel[0]}",
                     f"{plain}\n\n{panel[1]}",
                     reply_markup=self.last_final_markup,
                     droppable=True,
                 )
+                # adaptive cadence (B): back off on a dropped edit, decay back on success
+                if landed:
+                    interval = max(UPDATER_INTERVAL, interval - EDIT_DECAY_STEP)
+                else:
+                    interval = min(EDIT_INTERVAL_MAX, interval * EDIT_BACKOFF)
         except asyncio.CancelledError:
             pass
         finally:
@@ -732,8 +751,16 @@ class ClaudeTopic(Topic):
     async def _heartbeat(self):
         try:
             while True:
-                await asyncio.sleep(EDIT_INTERVAL)
+                # sleep the adaptive interval, but never inside a known flood window —
+                # honor the exact retry_after deadline the transport recorded (A)
+                wait = self._edit_interval
+                slack = self._core.flood_until - time.monotonic()
+                if slack > 0:
+                    wait = max(wait, slack)
+                await asyncio.sleep(wait)
                 if not self.busy or self.holder_id is None:
+                    self._edit_interval = EDIT_INTERVAL  # reset between turns
+                    self._last_paint_sig = None
                     continue
                 quiet = time.monotonic() - self.last_reader_event
                 if quiet > STALL_WARN and not self._stall_warned:
@@ -742,30 +769,46 @@ class ClaudeTopic(Topic):
                 elapsed = int(time.monotonic() - self.turn_start)
                 self.spin += 1
                 tokens = self.turn.tok_base + self.turn.tok_latest
-                head = status_head(self.word_seed, self.spin, elapsed, tokens)
                 lines, _, _ = render_timeline(self.turn.timeline, drop_last_text=False)
                 thinking = "".join(self.turn.thinking_parts).strip()
                 answer = "".join(self.turn.preview_parts).strip()
-                if thinking:
-                    lines.append(f"🧠 {thinking}")
-                if answer:
-                    lines.append(f"💬 {answer}")
-                interim = "\n\n".join(lines)
-                base = f"{head}\n\n{interim}" if interim else head
                 background.mark_orphans(self)
                 panel = background.panel(self, self.spin)
+                # skip a no-op repaint when nothing meaningful changed (B): saves edits
+                # during silent tool calls, so we don't spend the per-message rate budget
+                # on a spinner tick. A slow keepalive still advances the elapsed clock.
+                sig = (tokens, tuple(lines), thinking, answer, bool(panel))
+                now = time.monotonic()
+                if sig == self._last_paint_sig and now - self._last_paint_at < PANEL_KEEPALIVE:
+                    continue
+                head = status_head(self.word_seed, self.spin, elapsed, tokens)
+                lines2 = list(lines)
+                if thinking:
+                    lines2.append(f"🧠 {thinking}")
+                if answer:
+                    lines2.append(f"💬 {answer}")
+                interim = "\n\n".join(lines2)
+                base = f"{head}\n\n{interim}" if interim else head
                 room = MAX_MSG - (len(panel[1]) + 8 if panel else 0)
                 if len(base) > room:
                     base = f"{head}\n\n…{base[-(room - len(head) - 5) :]}"
                 if panel:
-                    await self.edit_md(
+                    landed = await self.edit_md(
                         self.holder_id,
                         f"{mdv2_escape(base)}\n\n{panel[0]}",
                         f"{base}\n\n{panel[1]}",
                         droppable=True,
                     )
                 else:
-                    await self.edit(self.holder_id, base, droppable=True)
+                    landed = await self.edit(self.holder_id, base, droppable=True)
+                # adaptive cadence (B): a dropped repaint means we're over the ceiling —
+                # back off multiplicatively; a landed one decays the interval back down
+                if landed:
+                    self._last_paint_sig = sig
+                    self._last_paint_at = time.monotonic()
+                    self._edit_interval = max(EDIT_INTERVAL, self._edit_interval - EDIT_DECAY_STEP)
+                else:
+                    self._edit_interval = min(EDIT_INTERVAL_MAX, self._edit_interval * EDIT_BACKOFF)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -851,7 +894,9 @@ class ClaudeTopic(Topic):
             plural = "s" if n != 1 else ""
             head = f"{frame} {word}… ({fmt_duration(elapsed)} · {n} tool call{plural})"
             body = "\n".join(self.mirror_recent) or "thinking"
-            await self.edit(self.mirror_holder, f"{head}\n{body}")
+            # droppable: the spinner is cosmetic — a flood-wait must never block the mirror
+            # loop (which also delivers the real mirrored messages); the next poll retries
+            await self.edit(self.mirror_holder, f"{head}\n{body}", droppable=True)
         elif self.mirror_holder is not None:
             await self.delete(self.mirror_holder)
             self.mirror_holder = None
