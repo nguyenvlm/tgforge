@@ -293,6 +293,17 @@ class ClaudeTopic(Topic):
     # ── Turn driving ───────────────────────────────────────────────
     async def _ensure_proc(self):
         if self.proc is not None and self.proc.returncode is None:
+            # a proc reused across turns (kept alive for background tasks) had its
+            # heartbeat cancelled when the prior turn settled — restart it so this
+            # turn's live panel paints instead of freezing at its first frame
+            revived = self.heartbeat_task is None or self.heartbeat_task.done()
+            if revived:
+                self.heartbeat_task = asyncio.create_task(self._heartbeat())
+            LOGGER.info(
+                "proc reuse (%s): heartbeat %s",
+                self.name,
+                "revived (was dead)" if revived else "alive",
+            )
             return
         if self.reader_task is not None and not self.reader_task.done():
             self.reader_task.cancel()
@@ -333,6 +344,7 @@ class ClaudeTopic(Topic):
         self.owned = True
         self.reader_task = asyncio.create_task(self._reader())
         self.heartbeat_task = asyncio.create_task(self._heartbeat())
+        LOGGER.info("proc spawn (%s): reader + heartbeat armed", self.name)
 
     async def _write_prompt(self, prompt: str):
         # A queued write can race the reader's teardown (which closes stdin + kills the
@@ -810,9 +822,11 @@ class ClaudeTopic(Topic):
                 else:
                     self._edit_interval = min(EDIT_INTERVAL_MAX, self._edit_interval * EDIT_BACKOFF)
         except asyncio.CancelledError:
-            pass
+            pass  # normal stop: the reader owns the holder at settle
         except Exception:
-            LOGGER.exception("heartbeat error (%s)", self.name)
+            # the painter died mid-turn (not a clean cancel) — the panel freezes at its
+            # last frame, the exact fault behind a "spinner stuck on one number" report
+            LOGGER.exception("heartbeat died mid-turn (%s): panel frozen", self.name)
 
     async def _attach_suggestions(self, message_id, options):
         token = uuid.uuid4().hex[:8]
