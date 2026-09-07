@@ -291,19 +291,22 @@ class ClaudeTopic(Topic):
         return self._proj_dir() / f"{self.session_id}.jsonl"
 
     # ── Turn driving ───────────────────────────────────────────────
+    def _arm_heartbeat(self) -> bool:
+        """Start the live-panel painter if it isn't running; return whether it was
+        (re)armed. Idempotent — the singleton guarantee — so every turn-open path can
+        arm without risking a second painter. Armed at the turn-open boundary
+        (`_open_holder`), the one point all entry paths share, not at proc creation:
+        a turn triggered by a background-task completion reuses a live proc and never
+        calls `_ensure_proc`, so arming there left its panel frozen at frame one."""
+        if self.heartbeat_task is None or self.heartbeat_task.done():
+            self.heartbeat_task = asyncio.create_task(self._heartbeat())
+            return True
+        return False
+
     async def _ensure_proc(self):
         if self.proc is not None and self.proc.returncode is None:
-            # a proc reused across turns (kept alive for background tasks) had its
-            # heartbeat cancelled when the prior turn settled — restart it so this
-            # turn's live panel paints instead of freezing at its first frame
-            revived = self.heartbeat_task is None or self.heartbeat_task.done()
-            if revived:
-                self.heartbeat_task = asyncio.create_task(self._heartbeat())
-            LOGGER.info(
-                "proc reuse (%s): heartbeat %s",
-                self.name,
-                "revived (was dead)" if revived else "alive",
-            )
+            # reused across turns (kept alive for background tasks); _open_holder arms
+            LOGGER.info("proc reuse (%s)", self.name)
             return
         if self.reader_task is not None and not self.reader_task.done():
             self.reader_task.cancel()
@@ -343,7 +346,7 @@ class ClaudeTopic(Topic):
         self.proc = proc
         self.owned = True
         self.reader_task = asyncio.create_task(self._reader())
-        self.heartbeat_task = asyncio.create_task(self._heartbeat())
+        self._arm_heartbeat()
         LOGGER.info("proc spawn (%s): reader + heartbeat armed", self.name)
 
     async def _write_prompt(self, prompt: str):
@@ -374,7 +377,6 @@ class ClaudeTopic(Topic):
         self._stall_warned = False
         self.word_seed = random.randrange(len(WORDS))
         self.busy = True
-        LOGGER.info("turn start (%s)", self.name)
         self.cur_reply_to = reply_to
         self.spin = 0
         head = status_head(self.word_seed, 0, 0, 0)
@@ -383,6 +385,11 @@ class ClaudeTopic(Topic):
             self.holder_id = reuse_id
         else:
             self.holder_id = await self.send(head, reply_to=reply_to)
+        # arm the painter for THIS turn now that busy+holder are set. Every turn-open
+        # path lands here (submit, a background-completion opened by the reader, a
+        # prompt replay, the result fallback); the prior turn's settle left it dead.
+        revived = self._arm_heartbeat()
+        LOGGER.info("turn start (%s): live panel %s", self.name, "revived" if revived else "alive")
 
     async def _reorder_holder(self):
         old = self.holder_id

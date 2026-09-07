@@ -58,10 +58,11 @@ def test_finalize_stops_heartbeat_before_editing(tmp_path):
     asyncio.run(scenario())
 
 
-def test_ensure_proc_restarts_dead_heartbeat_on_reused_proc(tmp_path, monkeypatch):
-    """A proc kept alive across turns (a prior turn left a background task running) had
-    its heartbeat cancelled at settle; the next turn must restart it, or the live panel
-    freezes at its first frame with no intermediate updates."""
+def test_open_holder_revives_dead_heartbeat_on_reused_proc(tmp_path, monkeypatch):
+    """A background-task completion opens the next turn straight through the reader's
+    `_open_holder` — it never calls `_ensure_proc`. The prior turn's settle cancelled
+    the heartbeat, so `_open_holder` must revive it, or the live panel freezes at its
+    first frame (`… 0s · ↓ 0 tokens`) with no intermediate updates before the result."""
 
     async def scenario():
         monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.01)
@@ -71,43 +72,34 @@ def test_ensure_proc_restarts_dead_heartbeat_on_reused_proc(tmp_path, monkeypatc
         class _LiveProc:
             returncode = None
 
-        t.proc = _LiveProc()
+        t.proc = _LiveProc()  # kept alive across turns by a background task
         t.heartbeat_task = None  # cancelled by the prior turn's _finalize_turn
-        await t._ensure_proc()  # reuse path: must not spawn, must revive the heartbeat
+        await t._open_holder()  # background-completion path: must revive the painter
         assert t.heartbeat_task is not None and not t.heartbeat_task.done()
 
-        t.busy = True
-        t.holder_id = 99
-        t.turn_start = asyncio.get_event_loop().time()
         await asyncio.sleep(0.05)
-        assert any(mid == 99 for mid, _ in c.bot.edits)  # this turn actually paints
+        assert any(mid == t.holder_id for mid, _ in c.bot.edits)  # this turn actually paints
         await t._stop_heartbeat()
         t.proc = None
 
     asyncio.run(scenario())
 
 
-def test_ensure_proc_keeps_a_live_heartbeat_singleton(tmp_path):
-    """Reusing a proc whose heartbeat is still alive must not spawn a second painter."""
+def test_open_holder_keeps_a_live_heartbeat_singleton(tmp_path):
+    """Opening a turn whose heartbeat is still alive must not spawn a second painter."""
 
     async def scenario():
         c = TestClient(home=str(tmp_path))
         t = c.core._instantiate(ClaudeTopic, 555, "work")
-
-        class _LiveProc:
-            returncode = None
-
-        t.proc = _LiveProc()
 
         async def _idle():
             await asyncio.sleep(3600)
 
         live = asyncio.create_task(_idle())
         t.heartbeat_task = live
-        await t._ensure_proc()
+        await t._open_holder()
         assert t.heartbeat_task is live  # same task, not duplicated
         live.cancel()
-        t.proc = None
 
     asyncio.run(scenario())
 
