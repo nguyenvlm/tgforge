@@ -104,3 +104,28 @@ def test_essential_gives_up_after_two_floods(monkeypatch):
         assert slept == [FLOOD_WAIT_CAP]
 
     asyncio.run(scenario())
+
+
+def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
+    """An md render over MAX_MSG (MarkdownV2 escaping inflates a live panel past the
+    limit) must never be hard-cut and sent — its final words would vanish mid-word.
+    edit_md skips the oversized md and edits the caller-bounded plain in full."""
+    from tgforge.base.kernel import MAX_MSG, Transport
+
+    async def scenario():
+        sent = []
+
+        async def rec(text, **kw):
+            sent.append(text)
+            return SimpleNamespace(message_id=kw.get("message_id"))
+
+        t = Transport(bot=SimpleNamespace(edit_message_text=rec))
+        md = "*" + "x" * (MAX_MSG + 500) + " MD_TAIL"  # would be cut at MAX_MSG
+        plain = "the reply body ends with PLAIN_TAIL_KEPT"
+        landed = await t.edit_md(7, 42, md, plain)
+        assert landed is True
+        assert len(sent) == 1  # the oversized md attempt was skipped entirely
+        assert sent[0] == plain  # full plain, tail intact
+        assert "PLAIN_TAIL_KEPT" in sent[0]
+
+    asyncio.run(scenario())

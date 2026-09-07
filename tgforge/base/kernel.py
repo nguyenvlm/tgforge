@@ -53,6 +53,20 @@ LOGGER = logging.getLogger("tgforge")
 
 _NOT_MODIFIED = object()  # a benign edit no-op: the new content already matches the message
 _SKIPPED = object()  # a droppable call dropped under flood-wait, not an error
+
+
+def _cap(text: str) -> str:
+    """Last-resort MAX_MSG guard before an aiogram call. A hit means a caller sent an
+    oversized body and the tail (an answer's final words) is being lost mid-word — that
+    is a composition bug, so log it loudly instead of cutting silently."""
+    if len(text) > MAX_MSG:
+        LOGGER.warning(
+            "message over MAX_MSG (%d), tail truncated — fix the caller's compose", len(text)
+        )
+        return text[:MAX_MSG]
+    return text
+
+
 FLOOD_WAIT_CAP = 30  # s: the longest an essential call blocks on one flood-wait
 REQUEST_TIMEOUT = 45  # s: per-request HTTP timeout, so a stuck socket can't wedge a call
 STALL_WARN = 30  # s: log a warning when a live turn's reader has been quiet this long
@@ -696,7 +710,7 @@ class Transport:
             if reply_to is not None and i == 0:
                 kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
             msg = await self._call(
-                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, chunk[:MAX_MSG], **kw),
+                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, _cap(chunk), **kw),
                 droppable=droppable,
             )
             if msg is _SKIPPED:
@@ -707,7 +721,7 @@ class Transport:
     async def edit(self, chat_id, msg_id, text, reply_markup=None, droppable=False) -> bool:
         msg = await self._call(
             lambda: self.bot.edit_message_text(
-                text[:MAX_MSG],
+                _cap(text),
                 chat_id=chat_id,
                 message_id=msg_id,
                 reply_markup=reply_markup,
@@ -729,42 +743,50 @@ class Transport:
                 kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
             msg = await self._call(
                 lambda raw=raw, kw=kw: self.bot.send_message(
-                    chat_id, to_md(raw)[:MAX_MSG], parse_mode="MarkdownV2", **kw
+                    chat_id, _cap(to_md(raw)), parse_mode="MarkdownV2", **kw
                 )
             )
             if msg is None:
                 msg = await self._call(
-                    lambda raw=raw, kw=kw: self.bot.send_message(chat_id, raw[:MAX_MSG], **kw)
+                    lambda raw=raw, kw=kw: self.bot.send_message(chat_id, _cap(raw), **kw)
                 )
             mid = msg.message_id if msg else mid
         return mid
 
     async def edit_rich(self, chat_id, msg_id, text) -> bool:
-        msg = await self._call(
-            lambda: self.bot.edit_message_text(
-                to_md(text)[:MAX_MSG],
-                chat_id=chat_id,
-                message_id=msg_id,
-                parse_mode="MarkdownV2",
-            ),
-            ok_not_modified=True,
-        )
+        md = to_md(text)
+        msg = None
+        if len(md) <= MAX_MSG:  # never send a tail-cut md; fall to plain (see edit_md)
+            msg = await self._call(
+                lambda: self.bot.edit_message_text(
+                    md,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    parse_mode="MarkdownV2",
+                ),
+                ok_not_modified=True,
+            )
         if msg is not None:
             return True
         return await self.edit(chat_id, msg_id, text)
 
     async def edit_md(self, chat_id, msg_id, md, plain, reply_markup=None, droppable=False) -> bool:
-        msg = await self._call(
-            lambda: self.bot.edit_message_text(
-                md[:MAX_MSG],
-                chat_id=chat_id,
-                message_id=msg_id,
-                parse_mode="MarkdownV2",
-                reply_markup=reply_markup,
-            ),
-            ok_not_modified=True,
-            droppable=droppable,
-        )
+        # an over-limit md would be hard-cut mid-escape and, if the cut happened to
+        # land on valid markup, silently drop the message's final words — go straight
+        # to the (caller-bounded) plain render instead of ever sending a cut md.
+        msg = None
+        if len(md) <= MAX_MSG:
+            msg = await self._call(
+                lambda: self.bot.edit_message_text(
+                    md,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    parse_mode="MarkdownV2",
+                    reply_markup=reply_markup,
+                ),
+                ok_not_modified=True,
+                droppable=droppable,
+            )
         if msg is _SKIPPED:
             return False  # flooded: don't fall back to a plain edit that floods too
         if msg is not None:
