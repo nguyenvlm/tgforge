@@ -79,6 +79,7 @@ EDIT_BACKOFF = 2.0  # multiply the interval on each dropped (flooded) repaint
 EDIT_DECAY_STEP = 0.5  # shrink it back this many seconds per landed repaint
 PANEL_KEEPALIVE = 10.0  # repaint at least this often even with no new content
 MAX_OUTPUT_MSGS = 8
+ANSWER_SEND_ATTEMPTS = 5  # the turn's answer is essential — retry across flood windows
 ALBUM_DEBOUNCE = 2.0
 RELEASE_IDLE_SEC = 1800
 UPDATER_INTERVAL = 5.0
@@ -683,6 +684,23 @@ class ClaudeTopic(Topic):
     async def _stop_background_updater(self):
         await self._quiesce("background_updater_task")
 
+    async def _send_answer(self, chunk):
+        """Deliver a turn-answer chunk, retrying across flood windows. Unlike a
+        live-panel repaint, the reply is the turn's product — a drop loses it and
+        strands the events-summary holder, so retry, then log loudly if it still fails."""
+        for attempt in range(ANSWER_SEND_ATTEMPTS):
+            mid = await self.send_rich(chunk)
+            if mid is not None:
+                return mid
+            if attempt == ANSWER_SEND_ATTEMPTS - 1:
+                break
+            slack = self._core.flood_until - time.monotonic()
+            await asyncio.sleep(min(max(slack, EDIT_INTERVAL), EDIT_INTERVAL_MAX))
+        LOGGER.error(
+            "turn answer chunk dropped after %d attempts (%s)", ANSWER_SEND_ATTEMPTS, self.name
+        )
+        return None
+
     async def _finalize_turn(self, result_text, subtype="success", is_error=False):
         holder_id = self.holder_id
         self.busy = False
@@ -724,7 +742,7 @@ class ClaudeTopic(Topic):
         last_body = None  # a chunked turn moves the panel to the last chunk; track its body
         if len(combined_md) <= MAX_MSG:
             if not await self.edit_md(holder_id, combined_md, combined_plain):
-                sent = await self.send_rich(ans.text)
+                sent = await self._send_answer(ans.text)
                 last_id = sent or last_id
         elif events:
             await self.edit_md(holder_id, events[0], events[1])
@@ -732,7 +750,7 @@ class ClaudeTopic(Topic):
                 if i >= MAX_OUTPUT_MSGS:
                     await self.send("(output truncated)")
                     break
-                sent = await self.send_rich(chunk)
+                sent = await self._send_answer(chunk)
                 last_id = sent or last_id
                 last_body = (to_md(chunk), chunk)
         else:
@@ -741,10 +759,11 @@ class ClaudeTopic(Topic):
                     await self.send("(output truncated)")
                     break
                 if i == 0:
-                    await self.edit_rich(holder_id, chunk)
+                    if not await self.edit_rich(holder_id, chunk):
+                        last_id = await self._send_answer(chunk) or last_id
                     last_body = (to_md(chunk), chunk)
                 else:
-                    sent = await self.send_rich(chunk)
+                    sent = await self._send_answer(chunk)
                     last_id = sent or last_id
                     last_body = (to_md(chunk), chunk)
         for p in ans.attachments:

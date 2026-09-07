@@ -53,6 +53,7 @@ class App:
         setup_logging()
         aiobot = AioBot(self.config.token, session=AiohttpSession(timeout=REQUEST_TIMEOUT))
         core = Kernel(aiobot, self.config, self._plugins)
+        core.enable_pacing()  # self-limit under Telegram's per-group rate (off in tests)
 
         router = Router(name="tgforge")
         auth = self._auth(core)

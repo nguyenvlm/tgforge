@@ -70,6 +70,56 @@ def _cap(text: str) -> str:
 FLOOD_WAIT_CAP = 30  # s: the longest an essential call blocks on one flood-wait
 REQUEST_TIMEOUT = 45  # s: per-request HTTP timeout, so a stuck socket can't wedge a call
 STALL_WARN = 30  # s: log a warning when a live turn's reader has been quiet this long
+# Telegram caps a group/supergroup at 20 messages/minute (all topics share one budget).
+# Pace below that with margin so we self-limit before the 429 ever fires.
+PACE_MAX_PER_MIN = 18  # sustained sends/edits per minute across the whole transport
+PACE_BURST = 3  # bucket capacity: how many may fire back-to-back before pacing kicks in
+
+
+class _Pacer:
+    """A shared token bucket that paces every outbound Telegram call so we stay under
+    the per-group rate. Essential calls wait for a slot; droppable ones (live-panel
+    repaints) skip when none is free and yield to any waiting essential — the reply
+    never loses its slot to a spinner tick. `per_min<=0` disables pacing entirely."""
+
+    def __init__(self, per_min: float, burst: float):
+        self.enabled = per_min > 0
+        self.refill = per_min / 60.0  # tokens per second
+        self.capacity = max(1.0, burst)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self.waiting = 0  # essential calls currently blocked on a slot
+        self._lock = asyncio.Lock()
+
+    def _replenish(self):
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.refill)
+        self.last = now
+
+    async def acquire(self, *, wait: bool) -> bool:
+        if not self.enabled:
+            return True
+        if not wait:
+            async with self._lock:
+                if self.waiting:  # a reply is queued — a repaint yields its turn
+                    return False
+                self._replenish()
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return True
+                return False
+        self.waiting += 1
+        try:
+            while True:
+                async with self._lock:
+                    self._replenish()
+                    if self.tokens >= 1:
+                        self.tokens -= 1
+                        return True
+                    delay = (1 - self.tokens) / self.refill
+                await asyncio.sleep(delay)
+        finally:
+            self.waiting -= 1
 
 
 def setup_logging() -> None:
@@ -665,9 +715,15 @@ class Plugin:
 
 
 class Transport:
-    def __init__(self, bot: AioBot):
+    def __init__(self, bot: AioBot, pace_per_min: float = 0, pace_burst: float = PACE_BURST):
         self.bot = bot
         self.flood_until = 0.0  # monotonic deadline of the last droppable flood-wait
+        self._pacer = _Pacer(pace_per_min, pace_burst)
+
+    def enable_pacing(self):
+        """Turn on outbound rate pacing for the live bot. Off by default so tests never
+        real-sleep; the `tgforge run` entry point calls this."""
+        self._pacer = _Pacer(PACE_MAX_PER_MIN, PACE_BURST)
 
     async def _call(self, make_coro, ok_not_modified=False, droppable=False):
         """Issue an aiogram call and return its result. `make_coro` is a zero-arg factory
@@ -679,13 +735,15 @@ class Transport:
         errors, returning None. With `ok_not_modified`, a "message is not modified" 400
         returns the `_NOT_MODIFIED` sentinel (an editing no-op is success, not a failure
         that would trip a plain-text fallback and flip the message format)."""
+        if not await self._pacer.acquire(wait=not droppable):
+            return _SKIPPED  # paced out: a droppable repaint skips now, retries next tick
         for attempt in range(2):
             try:
                 return await make_coro()
             except TelegramRetryAfter as e:
                 LOGGER.warning("flood-wait %ss (droppable=%s)", e.retry_after, droppable)
+                self.flood_until = max(self.flood_until, time.monotonic() + e.retry_after)
                 if droppable:
-                    self.flood_until = time.monotonic() + e.retry_after
                     return _SKIPPED
                 if attempt == 0:
                     await asyncio.sleep(min(e.retry_after, FLOOD_WAIT_CAP))
