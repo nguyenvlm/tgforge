@@ -129,3 +129,20 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
         assert "PLAIN_TAIL_KEPT" in sent[0]
 
     asyncio.run(scenario())
+
+
+def test_essential_flood_records_deadline_for_callers(monkeypatch):
+    """An essential (non-droppable) flood must also stamp flood_until, so the turn's
+    answer-delivery retry can honor the exact window instead of a blind backoff."""
+
+    async def scenario():
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+        monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: 1000.0)
+        t = Transport(bot=SimpleNamespace())
+        attempt, _ = _flooding(2, retry_after=300)  # floods both attempts, then None
+        out = await t._call(lambda: attempt())
+        assert out is None
+        assert t.flood_until == 1300.0  # recorded on the essential path too
+
+    asyncio.run(scenario())
