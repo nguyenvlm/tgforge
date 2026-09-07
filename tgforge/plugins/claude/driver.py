@@ -41,6 +41,7 @@ from tgforge.base.service import service_manager
 from tgforge.base.ui import (
     MAX_MSG,
     chunks,
+    compose_capped,
     expandable,
     fmt_duration,
     mdv2_escape,
@@ -592,10 +593,11 @@ class ClaudeTopic(Topic):
                 if panel is None or self.last_final_id is None or self.last_final_body is None:
                     break
                 md, plain = self.last_final_body
+                comp_md, comp_plain = compose_capped(md, plain, panel[0], panel[1])
                 landed = await self.edit_md(
                     self.last_final_id,
-                    f"{md}\n\n{panel[0]}",
-                    f"{plain}\n\n{panel[1]}",
+                    comp_md,
+                    comp_plain,
                     reply_markup=self.last_final_markup,
                     droppable=True,
                 )
