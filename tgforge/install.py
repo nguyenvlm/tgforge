@@ -159,7 +159,7 @@ def main() -> None:
         break
 
     print("Add at least one workspace — a directory the agent can run in.")
-    print("(add more later with  tgforge workspaces add <dir>  or /workspaces in Telegram)")
+    print("(add more later with  tgforge workspaces add <dir>  or /workspace in Telegram)")
     workspaces: list[str] = []
     while True:
         p = _ask("Workspace directory" + (" (blank to finish)" if workspaces else ""))

@@ -149,7 +149,9 @@ class ClaudeTopic(Topic):
         self.word_seed = 0
         self.spin = 0
         self.pending_writes: list[dict] = []
+        self.turn_seq = 0  # boundary counter: bumped once per result; stamps each ack's turn
         self.cancel_requested = False
+        self.cancel_msg_id: int | None = None  # the "cancelling…" bubble, settled at turn end
         self.turn = TurnState()
         self.release_task: asyncio.Task | None = None
         self.background_tasks: dict[str, dict] = {}
@@ -404,7 +406,9 @@ class ClaudeTopic(Topic):
             return
         self.holder_id = new_id
         if old is not None:
-            await self.delete(old, droppable=True)
+            # essential, not droppable: once the new card is up, a dropped delete would
+            # strand the old card as a duplicate (and the reorder would look like a no-op)
+            await self.delete(old)
 
     async def submit(self, prompt, reply_to=None):
         """The single prompt entry point (on_message, a skill slash, the ! chain,
@@ -423,18 +427,41 @@ class ClaudeTopic(Topic):
                 brief = f"{self._env_tag()} {SESSION_BRIEF}"
                 extra = self._app_brief()
                 prompt = f"{prompt}\n\n{brief}" + (f"\n{extra}" if extra else "")
+            proc_alive = self.proc is not None and self.proc.returncode is None
+            LOGGER.info(
+                "submit (%s): busy=%s proc_alive=%s pending=%d holder=%s seq=%d :: %r",
+                self.name,
+                self.busy,
+                proc_alive,
+                len(self.pending_writes),
+                self.holder_id,
+                self.turn_seq,
+                prompt[:40],
+            )
             if self.busy:
                 ack = await self.send("queued ✓", reply_to=reply_to)
+                LOGGER.info("submit (%s): QUEUED mid-turn (ack bubble=%s)", self.name, ack)
                 self.pending_writes.append(
-                    {"is_initiator": False, "bubble_id": ack, "reply_to": reply_to}
+                    {
+                        "is_initiator": False,
+                        "bubble_id": ack,
+                        "reply_to": reply_to,
+                        "turn_seq": self.turn_seq,
+                    }
                 )
                 await self._write_prompt(prompt)
             else:
+                LOGGER.info("submit (%s): NEW turn (busy was False)", self.name)
                 self.busy = True
                 self.cancel_requested = False
                 await self._open_holder(reply_to=reply_to)
                 self.pending_writes.append(
-                    {"is_initiator": True, "bubble_id": None, "reply_to": reply_to}
+                    {
+                        "is_initiator": True,
+                        "bubble_id": None,
+                        "reply_to": reply_to,
+                        "turn_seq": self.turn_seq,
+                    }
                 )
                 await self._write_prompt(prompt)
 
@@ -517,23 +544,33 @@ class ClaudeTopic(Topic):
                         subtype=ev.get("subtype", "success"),
                         is_error=bool(ev.get("is_error")),
                     )
-                    if self.pending_writes:
-                        self.cancel_requested = False  # the next queued turn cancels on its own
-                        continue
-                    self.busy = False
-                    running = any(x["done"] is None for x in self.background_tasks.values())
-                    if has_background_tasks or running:
-                        has_background_tasks = False
-                        if self.release_task is not None:
-                            self.release_task.cancel()
-                        self.release_task = asyncio.create_task(self._release_idle())
-                        continue
-                    try:
-                        self.proc.stdin.close()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    self.proc.kill()
-                    break
+                    # Clear busy + decide kill/keep atomically vs submit(): a message in the
+                    # settle window either queued here (busy was still True → pending_writes)
+                    # or, if we kill, respawns a fresh proc — never writes to a proc we kill.
+                    async with self.lock:
+                        if self.pending_writes:
+                            LOGGER.info(
+                                "reader (%s): result done, %d queued → next turn",
+                                self.name,
+                                len(self.pending_writes),
+                            )
+                            self.cancel_requested = False  # the next queued turn cancels itself
+                            continue
+                        self.busy = False
+                        running = any(x["done"] is None for x in self.background_tasks.values())
+                        if has_background_tasks or running:
+                            has_background_tasks = False
+                            if self.release_task is not None:
+                                self.release_task.cancel()
+                            self.release_task = asyncio.create_task(self._release_idle())
+                            continue
+                        LOGGER.info("reader (%s): result done, idle → ending proc", self.name)
+                        try:
+                            self.proc.stdin.close()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        self.proc.kill()
+                        break
                 if has_background_launch(ev):
                     has_background_tasks = True
         except Exception:
@@ -545,6 +582,7 @@ class ClaudeTopic(Topic):
             await self._stop_heartbeat()  # own the holder before warn_interrupted paints
             await self._stop_background_updater()
             await self._warn_interrupted()
+            await self._settle_cancel_note()  # a cancel that ended via a dead proc
             if self._jsonl().exists():
                 self.mirror_offset = self._jsonl().stat().st_size
             self.proc = None
@@ -701,10 +739,53 @@ class ClaudeTopic(Topic):
         )
         return None
 
+    async def _settle_events(self, holder_id, md, plain):
+        """Fold the timeline into the holder, retrying across flood windows. A single
+        dropped edit would otherwise leave the live working frame as the finalized card
+        (the reply already gets this via _send_answer); log loudly if it still fails."""
+        for attempt in range(ANSWER_SEND_ATTEMPTS):
+            if await self.edit_md(holder_id, md, plain):
+                return True
+            if attempt == ANSWER_SEND_ATTEMPTS - 1:
+                break
+            slack = self._core.flood_until - time.monotonic()
+            await asyncio.sleep(min(max(slack, EDIT_INTERVAL), EDIT_INTERVAL_MAX))
+        LOGGER.error(
+            "folded-timeline edit dropped after %d attempts (%s)", ANSWER_SEND_ATTEMPTS, self.name
+        )
+        return False
+
     async def _finalize_turn(self, result_text, subtype="success", is_error=False):
-        holder_id = self.holder_id
-        self.busy = False
-        self.holder_id = None
+        async with self.lock:  # the boundary is atomic vs submit()'s ack+queue
+            holder_id = self.holder_id
+            # busy stays True through the whole settle (reply send included); the reader
+            # clears it atomically with the kill/keep decision. A message in the settle
+            # window then queues (busy path) rather than opening a new-turn card mid-send.
+            boundary = self.turn_seq
+            self.turn_seq += 1  # the result closes this turn; later acks belong to the next
+            LOGGER.info(
+                "finalize (%s): boundary seq %d→%d, pending=%d (busy held until settled)",
+                self.name,
+                boundary,
+                self.turn_seq,
+                len(self.pending_writes),
+            )
+            # Mid-turn messages this turn acknowledged sit below the live card (their
+            # "queued ✓" acks). The finalized reply must stay below them, so fold those acks
+            # and reorder the card to the bottom — under the lock, so a next-turn ack can't
+            # land between the card and those messages. A message ack'd at/after this point
+            # is stamped with the bumped turn_seq and stays for the next turn (card above it).
+            mine = [e for e in self.pending_writes if e.get("turn_seq", 0) <= boundary]
+            self.pending_writes = [
+                e for e in self.pending_writes if e.get("turn_seq", 0) > boundary
+            ]
+            acks = [e["bubble_id"] for e in mine if not e["is_initiator"] and e.get("bubble_id")]
+            if holder_id is not None and acks:
+                for bid in acks:
+                    await self.delete(bid)
+                await self._reorder_holder()
+                holder_id = self.holder_id
+            self.holder_id = None
         LOGGER.info(
             "turn end (%s): %.0fs, %s tokens, %s",
             self.name,
@@ -745,7 +826,7 @@ class ClaudeTopic(Topic):
                 sent = await self._send_answer(ans.text)
                 last_id = sent or last_id
         elif events:
-            await self.edit_md(holder_id, events[0], events[1])
+            await self._settle_events(holder_id, events[0], events[1])
             for i, chunk in enumerate(chunks(ans.text)):
                 if i >= MAX_OUTPUT_MSGS:
                     await self.send("(output truncated)")
@@ -776,6 +857,7 @@ class ClaudeTopic(Topic):
             if kb and self.last_final_id is not None:
                 self.last_final_markup = kb
         await self._sync_title()
+        await self._settle_cancel_note()  # settle a '/cancel' bubble at the turn boundary
         if self._jsonl().exists():
             self.mirror_offset = self._jsonl().stat().st_size
         self.turn = TurnState()
@@ -1196,8 +1278,28 @@ class ClaudeTopic(Topic):
         self._carry_transcript(old_dir, new_dir)
         self.config_dir = config_dir
         self._save()
+        self._respawn_idle()  # --resume finds the carried jsonl under the new account
+
+    def _respawn_idle(self):
+        """After a config change (per-window model/effort/account/workspace or app-wide
+        mode), drop an idle proc so the next message respawns with it; a live turn is
+        left untouched."""
         if self.proc is not None and self.proc.returncode is None and not self.busy:
-            self.proc.kill()  # idle: next message respawns (and --resume finds the carried jsonl)
+            self.proc.kill()
+
+    async def _switch_model(self):
+        cur = self.model or self.plugin.default_model
+        opts = [
+            (f"{label}{' ✓' if value == cur else ''}", value) for label, value in self.plugin.models
+        ]
+        opts.append((f"Default{' ✓' if not self.model else ''}", "__default__"))
+        choice = await self.menu("🔀 Switch model", opts)
+        if not choice:
+            return
+        self.model = None if choice == "__default__" else choice
+        self._save()
+        await self.send(f"🧠 model → {self.model or 'default'}")
+        self._respawn_idle()
 
     async def _pick_model_effort(self):
         if self.plugin.models:  # only ask when the bot configured a choice
@@ -1247,6 +1349,14 @@ class ClaudeTopic(Topic):
             pass
         self.cancel_requested = True
 
+    async def _settle_cancel_note(self):
+        """Settle the '/cancel' bubble so it never sticks at 'cancelling…'. Bound to
+        every turn-end path — the finalize boundary and the reader teardown — since a
+        cancel can end via a result or a dead proc."""
+        if self.cancel_msg_id is not None:
+            mid, self.cancel_msg_id = self.cancel_msg_id, None
+            await self.edit(mid, "✖️ cancelled")
+
     # ── Class commands ─────────────────────────────────────────────
     @command("/stop", "close this window (session stays on disk)", icon="⏹")
     async def stop(self, ctx):
@@ -1266,7 +1376,7 @@ class ClaudeTopic(Topic):
                 await self.send("already cancelling...")  # one interrupt is enough
                 return
             await self._interrupt()
-            await self.send("cancelling...")
+            self.cancel_msg_id = await self.send("cancelling...")
             return
         running = sum(1 for t in self.background_tasks.values() if t["done"] is None)
         if running:
@@ -1302,7 +1412,9 @@ class ClaudeTopic(Topic):
     async def cli(self, ctx):
         cfg = str(self._session_config_dir())
         line = f"cd {self.workspace} && CLAUDE_CONFIG_DIR={cfg} claude --resume {self.session_id}"
-        await self.send(f"pick up on the PC:\n{line}")
+        intro = mdv2_escape("Continue this session on your computer — paste this into a terminal:")
+        fenced = line.replace("\\", "\\\\").replace("`", "\\`")  # a tap-to-copy code block
+        await self.send_rich(f"{intro}\n\n```\n{fenced}\n```")
 
     @command("/rename", "rename this window (auto-titles if no name given)", icon="✏️")
     async def rename_cmd(self, ctx):
@@ -1332,8 +1444,7 @@ class ClaudeTopic(Topic):
             return
         self.plugin.set_permission_mode(choice)
         await self.send(f"permission mode → {choice}")
-        if self.proc is not None and self.proc.returncode is None and not self.busy:
-            self.proc.kill()  # idle: next message respawns with the new mode
+        self._respawn_idle()
 
     @command("/status", "show this session's state", icon="🗒", inline=True)
     async def status(self, ctx):
@@ -1344,13 +1455,26 @@ class ClaudeTopic(Topic):
             f"mode {self.plugin.permission_mode}"
         )
 
-    @command("/models", "edit the model list offered at /claude", icon="🧠")
-    async def models(self, ctx):
+    @command("/model", "switch the model, or edit the offered list", icon="🧠")
+    async def model_cmd(self, ctx):
         await self.plugin.models_cmd(ctx, self)
 
-    @command("/workspaces", "switch, add, or remove workspace roots", icon="📁")
-    async def workspaces(self, ctx):
-        if ctx.args:  # typed add/rm keeps working from the keyboard
+    @command("/effort", "switch this window's reasoning effort", icon="⚡")
+    async def effort_cmd(self, ctx):
+        cur = self.effort
+        opts = [(f"{e}{' ✓' if e == cur else ''}", e) for e in ("low", "medium", "high")]
+        opts.append((f"default{' ✓' if not cur else ''}", "__default__"))
+        choice = await self.menu("⚡ Effort", opts)
+        if not choice:
+            return
+        self.effort = None if choice == "__default__" else choice
+        self._save()
+        await self.send(f"⚡ effort → {self.effort or 'default'}")
+        self._respawn_idle()
+
+    @command("/workspace", "switch, add, or remove workspace roots", icon="📁")
+    async def workspace_cmd(self, ctx):
+        if ctx and ctx.args:  # typed add/rm keeps working from the keyboard
             await self.plugin.workspaces_cmd(ctx)
             return
         roots = self.plugin.roots
@@ -1615,7 +1739,7 @@ class Claude(Plugin):
             self._save()
             await ctx.send(f"✅ '{name}' re-logged in")
 
-    # ── Model-list edits (shared by the typed path + the /models menu) ─
+    # ── Model-list edits (shared by the typed path + the /model menu) ─
     def add_model(self, label: str, value: str) -> None:
         self.models.append([label, value])
         self._save()
@@ -1658,37 +1782,39 @@ class Claude(Plugin):
         lines += [f"  • {w}" for w in self.workspaces]
         return "\n".join(lines)
 
-    # ── /models + /workspaces (list editors, run from a claude window) ─
+    # ── /model + /workspace list editing (run from a claude window) ─
     async def models_cmd(self, ctx, topic):
-        if ctx.args:  # typed add/rm/reset keeps working from the keyboard
+        if ctx and ctx.args:  # typed add/rm/reset keeps working from the keyboard
             await self._models_typed(ctx)
             return
-        opts = [("➕ Add a model", "add")]
+        opts = [("🔀 Switch model", "switch"), ("➕ Add a model", "add")]
         if self.models:
             opts.append(("➖ Remove a model", "remove"))
         opts += [("↩️ Reset to defaults", "reset"), ("📋 List models", "list")]
-        choice = await ctx.menu("🧠 Models", opts)
-        if choice == "add":
-            raw = await ctx.ask_text("Send the model as `label | model-id` (or just the id):")
+        choice = await topic.menu("🧠 Model", opts)
+        if choice == "switch":
+            await topic._switch_model()
+        elif choice == "add":
+            raw = await topic.ask_text("Send the model as `label | model-id` (or just the id):")
             if raw and raw.strip():
                 label, _, value = raw.strip().partition("|")
                 label, value = label.strip(), (value.strip() or label.strip())
                 self.add_model(label, value)
-                await ctx.send(f"added '{label}' → {value}")
+                await topic.send(f"added '{label}' → {value}")
         elif choice == "remove":
-            pick = await ctx.menu(
+            pick = await topic.menu(
                 "➖ Remove a model",
                 [(f"{label} — {value}", str(i)) for i, (label, value) in enumerate(self.models)],
             )
             if pick is not None:
                 removed = self.remove_model(int(pick))
                 if removed:
-                    await ctx.send(f"removed '{removed[0]}'")
+                    await topic.send(f"removed '{removed[0]}'")
         elif choice == "reset":
             self.reset_models()
-            await ctx.send("model list reset to defaults")
+            await topic.send("model list reset to defaults")
         elif choice == "list":
-            await ctx.send(self.models_text())
+            await topic.send(self.models_text())
 
     async def _models_typed(self, ctx):
         parts = ctx.args.split(maxsplit=1)
