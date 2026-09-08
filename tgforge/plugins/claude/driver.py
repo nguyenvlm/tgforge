@@ -159,6 +159,7 @@ class ClaudeTopic(Topic):
         self.last_final_id: int | None = None
         self.last_final_body: tuple | None = None
         self.last_final_markup: list | None = None
+        self.suggest_anchor: dict | None = None  # {id, plain, kb} of the live suggestion message
         self.mirror_holder: int | None = None
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
@@ -406,10 +407,31 @@ class ClaudeTopic(Topic):
         if old is not None:
             await self.delete(old, droppable=True)
 
+    async def _reanchor_suggestions(self):
+        """A new prompt lands below the prior turn's suggestion buttons, and Telegram
+        can't move a message — so delete that message and resend it, re-anchoring the
+        buttons below the new prompt so it reads as acknowledged. Bound to `submit`,
+        the boundary every prompt path shares, not a single turn-open path."""
+        anchor = self.suggest_anchor
+        if anchor is None:
+            return
+        self.suggest_anchor = None
+        old_id = anchor["id"]
+        await self.delete(old_id, droppable=True)
+        new_id = await self.send_rich(anchor["plain"])
+        if new_id is None:
+            return
+        await self.set_markup(new_id, anchor["kb"])
+        anchor["id"] = new_id
+        self.suggest_anchor = anchor
+        if self.last_final_id == old_id:  # a live background-updater card follows the resend
+            self.last_final_id = new_id
+
     async def submit(self, prompt, reply_to=None):
         """The single prompt entry point (on_message, a skill slash, the ! chain,
         and the agent.prompt service all funnel here)."""
         async with self.lock:
+            await self._reanchor_suggestions()  # supersede the prior turn's stranded buttons
             if self.busy and (self.proc is None or self.proc.returncode is not None):
                 self.busy = False
                 self.holder_id = None
@@ -775,6 +797,10 @@ class ClaudeTopic(Topic):
             kb = await self._attach_suggestions(last_id, ans.options)
             if kb and self.last_final_id is not None:
                 self.last_final_markup = kb
+            _, plain = last_body if last_body is not None else (combined_md, combined_plain)
+            self.suggest_anchor = {"id": last_id, "plain": plain, "kb": kb}
+        else:
+            self.suggest_anchor = None
         await self._sync_title()
         if self._jsonl().exists():
             self.mirror_offset = self._jsonl().stat().st_size
@@ -869,6 +895,7 @@ class ClaudeTopic(Topic):
     async def _on_suggestion(self, ctx, arg):
         token, _, idx = arg.partition(":")
         info = self._suggested.pop(token, None)
+        self.suggest_anchor = None  # tapped: don't re-anchor a keyboard the user just consumed
         if ctx.message is not None:
             await self.set_markup(ctx.message.message_id, None)  # clear the tapped/dead button
         if info and idx.isdigit():
