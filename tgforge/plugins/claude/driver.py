@@ -427,8 +427,20 @@ class ClaudeTopic(Topic):
                 brief = f"{self._env_tag()} {SESSION_BRIEF}"
                 extra = self._app_brief()
                 prompt = f"{prompt}\n\n{brief}" + (f"\n{extra}" if extra else "")
+            proc_alive = self.proc is not None and self.proc.returncode is None
+            LOGGER.info(
+                "submit (%s): busy=%s proc_alive=%s pending=%d holder=%s seq=%d :: %r",
+                self.name,
+                self.busy,
+                proc_alive,
+                len(self.pending_writes),
+                self.holder_id,
+                self.turn_seq,
+                prompt[:40],
+            )
             if self.busy:
                 ack = await self.send("queued ✓", reply_to=reply_to)
+                LOGGER.info("submit (%s): QUEUED mid-turn (ack bubble=%s)", self.name, ack)
                 self.pending_writes.append(
                     {
                         "is_initiator": False,
@@ -439,6 +451,7 @@ class ClaudeTopic(Topic):
                 )
                 await self._write_prompt(prompt)
             else:
+                LOGGER.info("submit (%s): NEW turn (busy was False)", self.name)
                 self.busy = True
                 self.cancel_requested = False
                 await self._open_holder(reply_to=reply_to)
@@ -531,23 +544,33 @@ class ClaudeTopic(Topic):
                         subtype=ev.get("subtype", "success"),
                         is_error=bool(ev.get("is_error")),
                     )
-                    if self.pending_writes:
-                        self.cancel_requested = False  # the next queued turn cancels on its own
-                        continue
-                    self.busy = False
-                    running = any(x["done"] is None for x in self.background_tasks.values())
-                    if has_background_tasks or running:
-                        has_background_tasks = False
-                        if self.release_task is not None:
-                            self.release_task.cancel()
-                        self.release_task = asyncio.create_task(self._release_idle())
-                        continue
-                    try:
-                        self.proc.stdin.close()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
-                    self.proc.kill()
-                    break
+                    # Clear busy + decide kill/keep atomically vs submit(): a message in the
+                    # settle window either queued here (busy was still True → pending_writes)
+                    # or, if we kill, respawns a fresh proc — never writes to a proc we kill.
+                    async with self.lock:
+                        if self.pending_writes:
+                            LOGGER.info(
+                                "reader (%s): result done, %d queued → next turn",
+                                self.name,
+                                len(self.pending_writes),
+                            )
+                            self.cancel_requested = False  # the next queued turn cancels itself
+                            continue
+                        self.busy = False
+                        running = any(x["done"] is None for x in self.background_tasks.values())
+                        if has_background_tasks or running:
+                            has_background_tasks = False
+                            if self.release_task is not None:
+                                self.release_task.cancel()
+                            self.release_task = asyncio.create_task(self._release_idle())
+                            continue
+                        LOGGER.info("reader (%s): result done, idle → ending proc", self.name)
+                        try:
+                            self.proc.stdin.close()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        self.proc.kill()
+                        break
                 if has_background_launch(ev):
                     has_background_tasks = True
         except Exception:
@@ -735,9 +758,18 @@ class ClaudeTopic(Topic):
     async def _finalize_turn(self, result_text, subtype="success", is_error=False):
         async with self.lock:  # the boundary is atomic vs submit()'s ack+queue
             holder_id = self.holder_id
-            self.busy = False
+            # busy stays True through the whole settle (reply send included); the reader
+            # clears it atomically with the kill/keep decision. A message in the settle
+            # window then queues (busy path) rather than opening a new-turn card mid-send.
             boundary = self.turn_seq
             self.turn_seq += 1  # the result closes this turn; later acks belong to the next
+            LOGGER.info(
+                "finalize (%s): boundary seq %d→%d, pending=%d (busy held until settled)",
+                self.name,
+                boundary,
+                self.turn_seq,
+                len(self.pending_writes),
+            )
             # Mid-turn messages this turn acknowledged sit below the live card (their
             # "queued ✓" acks). The finalized reply must stay below them, so fold those acks
             # and reorder the card to the bottom — under the lock, so a next-turn ack can't

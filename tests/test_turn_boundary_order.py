@@ -130,6 +130,26 @@ def test_message_arriving_after_the_boundary_stays_below_the_finalized_card(tmp_
     asyncio.run(scenario())
 
 
+def test_finalize_keeps_busy_until_the_reader_settles(tmp_path, monkeypatch):
+    """busy is cleared by the reader atomically with the kill/keep decision, NOT early in
+    _finalize_turn. Otherwise a message during the reply-send (busy=False) would open a
+    new-turn card mid-send instead of queuing; keeping busy True routes it to the queue."""
+
+    async def scenario():
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+        c = TestClient(home=str(tmp_path))
+        t = _ready(c, tmp_path)
+        t.holder_id = 42
+        t.busy = True
+
+        await t._finalize_turn("a reply")
+
+        assert t.busy is True  # finalize leaves busy for the reader to clear under the lock
+
+    asyncio.run(scenario())
+
+
 def test_reorder_deletes_the_old_card_essentially(tmp_path, monkeypatch):
     """A reorder sends the new card (droppable — skip the whole move under flood) then
     deletes the old. That delete must be essential, not droppable: a dropped delete
