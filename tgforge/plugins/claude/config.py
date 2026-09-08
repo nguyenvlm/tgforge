@@ -11,7 +11,7 @@ from pathlib import Path
 
 # No model ids baked into the library — a specific list goes stale and is one
 # opinion imposed on every bot. A bot sets its own list: `Claude(models=[...])`
-# in the app module, or at runtime via the /models UI (persisted per window).
+# in the app module, or at runtime via the /model UI (persisted per window).
 # With none, the picker still offers "Default" — the Claude CLI's own default,
 # no --model.
 DEFAULT_MODELS: list[list[str]] = []

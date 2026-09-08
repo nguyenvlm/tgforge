@@ -61,7 +61,8 @@ Writing a plugin: subclass `Topic` (one window class), declare commands with dec
 
 Claude-plugin extras:
 
-- **Workspaces** (where the agent runs): `tgforge workspaces add <path-or-glob>` on the CLI, or `/workspaces` in Telegram. Switching a topic to another root starts a fresh session there; the old one stays resumable.
+- **Workspaces** (where the agent runs): `tgforge workspaces add <path-or-glob>` on the CLI, or `/workspace` in Telegram. Switching a topic to another root starts a fresh session there; the old one stays resumable.
+- **Model / effort** (per window): `/model` switches the active model (and edits the offered list), `/effort` switches the reasoning effort — the next message respawns the session with it.
 - **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every agent turn.
 - Every turn is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
 
