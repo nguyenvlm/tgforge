@@ -43,9 +43,10 @@ def _fake_login_cli(tmp_path):
 class _FlowIO:
     """A stand-in topic/ctx for the login flow: scripted ask_text answers, recorded sends."""
 
-    def __init__(self, *answers):
+    def __init__(self, *answers, args=""):
         self.sent = []
         self._answers = list(answers)
+        self.args = args
 
     async def send(self, text, **kw):
         self.sent.append(text)
@@ -71,10 +72,11 @@ def _write_ok(dir_path):
 
 
 class _FakeCtx:
-    def __init__(self, choice=None):
+    def __init__(self, choice=None, args=""):
         self.sent = []
         self.menu_calls = []
         self._choice = choice
+        self.args = args
 
     async def send(self, text, **kw):
         self.sent.append(text)
@@ -91,14 +93,17 @@ def _plugin(tmp_path):
     return p
 
 
-def test_login_all_healthy_reports_no_menu(tmp_path):
+def test_login_all_healthy_reports_and_offers_menu(tmp_path):
     _write_ok(tmp_path / ".claude")  # the default account is healthy
 
     async def scenario():
-        ctx = _FakeCtx()
+        ctx = _FakeCtx(choice=None)
         await _plugin(tmp_path).login_cmd(ctx)
         assert any("login status" in t for t in ctx.sent)
-        assert not ctx.menu_calls  # nothing expired → no re-login prompt
+        assert ctx.menu_calls  # still offers a menu
+        _title, options = ctx.menu_calls[0]
+        labels = [label for label, _v in options]
+        assert "default" in labels and "➕ Log in new account" in labels
 
     asyncio.run(scenario())
 
@@ -219,3 +224,56 @@ def test_login_new_account_invalid_name(tmp_path):
         assert any("invalid name" in t for t in topic.sent)
 
     asyncio.run(scenario())
+
+
+def test_login_arg_relogins_named_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_LOGIN_MODE", "ok")
+    c = TestClient(Claude(), home=str(tmp_path))
+    plugin = c.core.plugin_by_id["claude"]
+    plugin.claude_bin = _fake_login_cli(tmp_path)
+    plugin.claude_dir = tmp_path / ".claude"
+    cfg = tmp_path / ".claude-work"
+    plugin.accounts["work"] = str(cfg)
+    _write_ok(cfg)
+
+    async def scenario():
+        io = _FlowIO("the-pasted-code", args="work")
+        await plugin.login_cmd(io)
+        assert not hasattr(io, "menu_calls")  # _FlowIO has no menu
+        assert any("re-logged in" in t for t in io.sent)
+
+    asyncio.run(scenario())
+
+
+def test_login_arg_unknown_account_reports(tmp_path):
+    _write_ok(tmp_path / ".claude")
+
+    async def scenario():
+        ctx = _FakeCtx(args="nope")
+        await _plugin(tmp_path).login_cmd(ctx)
+        assert any("no account 'nope' — known: default" in t for t in ctx.sent)
+        assert not ctx.menu_calls
+
+    asyncio.run(scenario())
+
+
+def test_status_label_does_not_claim_refresh_ok(tmp_path):
+    now = int(time.time() * 1000)
+    cfg = tmp_path / ".claude"
+    cfg.mkdir(parents=True)
+    (cfg / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "subscriptionType": "pro",
+                    "expiresAt": now - 1,
+                    "refreshTokenExpiresAt": now + 30 * 86_400_000,
+                }
+            }
+        )
+    )
+    plugin = _plugin(tmp_path)
+    rows = plugin.account_status()
+    default_row = rows[0]
+    assert "access token expired" in default_row["label"]
+    assert "refresh OK" not in default_row["label"]

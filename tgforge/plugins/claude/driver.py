@@ -1693,38 +1693,51 @@ class Claude(Plugin):
         rows: list[dict] = []
         for name, cfg_dir in sorted(accounts.items()):
             creds = Path(cfg_dir) / ".credentials.json"
-            expired = False
             if not creds.exists():
-                label, expired = f"❌ {name} — no credentials", True
+                label = f"❌ {name} — no credentials"
             else:
                 try:
                     oauth = json.loads(creds.read_text()).get("claudeAiOauth", {})
                 except (OSError, ValueError):
                     oauth = None
                 if oauth is None:
-                    label, expired = f"⚠️ {name} — error reading creds", True
+                    label = f"⚠️ {name} — error reading creds"
                 else:
                     sub = oauth.get("subscriptionType", "?")
                     exp = oauth.get("expiresAt", 0)
                     rexp = oauth.get("refreshTokenExpiresAt", 0)
                     if rexp and rexp < now_ms:
-                        label, expired = f"❌ {name} — {sub} — refresh token expired", True
+                        label = f"❌ {name} — {sub} — refresh token expired"
                     elif exp and exp < now_ms:
-                        label = f"🔄 {name} — {sub} — access token expired (refresh OK)"
+                        label = f"🔄 {name} — {sub} — access token expired — re-login if sync fails"
                     else:
                         days = (rexp - now_ms) / 86_400_000 if rexp else 0
                         label = f"✅ {name} — {sub} — OK ({days:.0f}d)"
-            rows.append({"name": name, "dir": cfg_dir, "label": label, "expired": expired})
+            rows.append({"name": name, "dir": cfg_dir, "label": label})
         return rows
 
-    @universal("/login", "credential status; re-login expired", icon="🔑")
+    async def _relogin(self, ctx, name, cfg):
+        if await self._run_login(ctx, name, cfg):
+            if cfg != self.claude_dir:
+                self.accounts[name] = str(cfg)
+                self._save()
+            await ctx.send(f"✅ '{name}' re-logged in")
+
+    @universal("/login", "credential status; re-login any account", icon="🔑")
     async def login_cmd(self, ctx):
         rows = self.account_status()
         await ctx.send("account login status:\n" + "\n".join(r["label"] for r in rows))
-        expired = [r for r in rows if r["expired"]]
-        if not expired:
+        args = getattr(ctx, "args", "").strip()
+        if args:
+            row = next((r for r in rows if r["name"] == args), None)
+            if not row:
+                known = ", ".join(r["name"] for r in rows)
+                await ctx.send(f"no account '{args}' — known: {known}")
+                return
+            await self._relogin(ctx, row["name"], Path(row["dir"]))
             return
-        options = [(r["name"], r["dir"]) for r in expired]
+
+        options = [(r["name"], r["dir"]) for r in rows]
         options.append(("➕ Log in new account", "__new__"))
         choice = await ctx.menu("🔑 Re-login an account?", options)
         if not choice:
@@ -1733,11 +1746,8 @@ class Claude(Plugin):
             await self.login_new_account(ctx)
             return
         cfg = Path(str(choice))
-        name = next((r["name"] for r in expired if r["dir"] == str(choice)), cfg.name)
-        if await self._run_login(ctx, name, cfg):
-            self.accounts[name] = str(cfg)
-            self._save()
-            await ctx.send(f"✅ '{name}' re-logged in")
+        name = next((r["name"] for r in rows if r["dir"] == str(choice)), cfg.name)
+        await self._relogin(ctx, name, cfg)
 
     # ── Model-list edits (shared by the typed path + the /model menu) ─
     def add_model(self, label: str, value: str) -> None:
