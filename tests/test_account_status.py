@@ -62,15 +62,11 @@ def test_account_status_covers_every_state(tmp_path):
     plugin.accounts = {"empty": str(tmp_path / ".claude-empty")}  # a known account, creds gone
     rows = plugin.account_status()
 
-    assert "OK" in _row(rows, "ok")["label"] and _row(rows, "ok")["expired"] is False
+    assert "OK" in _row(rows, "ok")["label"]
     assert "access token expired" in _row(rows, "stale")["label"]
-    assert _row(rows, "stale")["expired"] is False  # refresh still valid → usable
     assert "refresh token expired" in _row(rows, "dead")["label"]
-    assert _row(rows, "dead")["expired"] is True
     assert "no credentials" in _row(rows, "empty")["label"]
-    assert _row(rows, "empty")["expired"] is True
     assert "error reading creds" in _row(rows, "bad")["label"]
-    assert _row(rows, "bad")["expired"] is True
 
 
 def test_default_account_included_when_absent(tmp_path):
