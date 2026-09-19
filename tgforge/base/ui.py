@@ -80,23 +80,6 @@ def md_chunks(text: str) -> list[str]:
     return out
 
 
-def compose_capped(body_md: str, body_plain: str, tail_md: str, tail_plain: str) -> tuple[str, str]:
-    """Join a live body with a trailing status block so BOTH the MarkdownV2 and plain
-    renders fit MAX_MSG. Under the limit: the plain join. Over it: keep the tail block
-    whole and the body's END (a live answer's conclusion sits there), head-trimming the
-    body with '…' — never a silent tail cut by the transport's MAX_MSG slice. The md
-    drops to the escaped trim so escaping can't re-overflow it."""
-    md = f"{body_md}\n\n{tail_md}"
-    plain = f"{body_plain}\n\n{tail_plain}"
-    if len(md) <= MAX_MSG and len(plain) <= MAX_MSG:
-        return md, plain
-    room = max(0, MAX_MSG - len(tail_plain) - 8)
-    trimmed = body_plain if len(body_plain) <= room else "…" + body_plain[-(room - 1) :]
-    plain2 = f"{trimmed}\n\n{tail_plain}"
-    esc_md = f"{mdv2_escape(trimmed)}\n\n{tail_md}"
-    return (esc_md if len(esc_md) <= MAX_MSG else plain2), plain2
-
-
 def mdv2_escape(text: str) -> str:
     return "".join("\\" + c if c in "_*[]()~`>#+-=|{}.!\\" else c for c in text)
 

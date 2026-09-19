@@ -34,6 +34,7 @@ class MockBot:
         self.sent: list[tuple[int | None, str]] = []  # (thread_id, text)
         self.edits: list[tuple[int, str]] = []  # (message_id, text)
         self.markup_cleared: list[int] = []
+        self.deleted: list[int] = []  # message ids passed to delete_message
         self.deleted_topics: list[int] = []
         self.last_markup = None
 
@@ -86,6 +87,7 @@ class MockBot:
         return True
 
     async def delete_message(self, chat_id, message_id):
+        self.deleted.append(message_id)
         return True
 
 

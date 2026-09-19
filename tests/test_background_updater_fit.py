@@ -1,7 +1,6 @@
-"""A settled answer whose MarkdownV2 render already fills MAX_MSG still gets a live
-background panel appended every updater tick. The compose must keep the answer's end
-and the panel within the limit — the transport used to hard-cut the tail (the answer's
-final words) when body + panel crossed MAX_MSG."""
+"""The background panel is its OWN message, so its size can never trim the main text.
+The updater paints only the panel message; even a panel with many running jobs is trimmed
+(oldest rows first) to fit MAX_MSG on its own, and the settled final card is never touched."""
 
 from __future__ import annotations
 
@@ -13,22 +12,20 @@ from tgforge.plugins.claude import driver as drv
 from tgforge.testing import TestClient
 
 
-def test_background_updater_keeps_answer_tail_under_panel(tmp_path, monkeypatch):
+def test_background_updater_paints_only_its_own_message(tmp_path, monkeypatch):
     async def scenario():
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
         monkeypatch.setattr(drv, "UPDATER_INTERVAL", 0.01)
         c = TestClient(home=str(tmp_path))
         t = c.core._instantiate(ClaudeTopic, 555, "work")
-        t.last_final_id = 88
-        # an md render that already exceeds MAX_MSG on its own; appending the panel md
-        # keeps it over the limit. The distinctive tail sits at the very end.
-        md = "x" * (MAX_MSG + 200) + " CONCLUSIONKEPT"
-        plain = "the reply ends with CONCLUSIONKEPT"
-        t.last_final_body = (md, plain)
-        t.last_final_markup = None
+        t.background_panel_id = 88  # a live panel message from a between-turn job
+        # many running jobs — the panel body alone would exceed MAX_MSG
         now = asyncio.get_event_loop().time()
-        t.background_tasks = {"j": {"done": None, "start": now, "label": "job", "path": "/no/such"}}
+        t.background_tasks = {
+            f"j{i}": {"done": None, "start": now, "label": f"job-{i}", "path": "/no/such"}
+            for i in range(400)
+        }
 
         task = asyncio.create_task(t._background_updater())
         await real_sleep(0.02)  # let it paint at least one tick
@@ -38,11 +35,11 @@ def test_background_updater_keeps_answer_tail_under_panel(tmp_path, monkeypatch)
         except asyncio.CancelledError:
             pass
 
-        edits = [txt for mid, txt in c.bot.edits if mid == 88]
-        assert edits, "the updater painted the final card at least once"
-        last = edits[-1]
-        assert len(last) <= MAX_MSG
-        assert "CONCLUSIONKEPT" in last  # the answer's tail survived the panel append
-        assert "background · 1 job" in last  # the panel is still there
+        panel_edits = [txt for mid, txt in c.bot.edits if mid == 88]
+        assert panel_edits, "the updater painted the panel message at least once"
+        assert all(len(txt) <= MAX_MSG for txt in panel_edits)  # panel trimmed to fit itself
+        assert "older job(s) hidden" in panel_edits[-1]  # oldest rows dropped, not the message
+        # no other message was ever edited — the panel never rides a main card
+        assert {mid for mid, _ in c.bot.edits} == {88}
 
     asyncio.run(scenario())
