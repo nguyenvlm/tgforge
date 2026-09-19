@@ -56,21 +56,3 @@ def test_parse_cta_roundtrip():
     assert ui.parse_cta("cta:reload:") == ("reload", "")
     assert ui.parse_cta("sug:x:1") is None
     assert ui.parse_cta("plain") is None
-
-
-def test_compose_capped_under_limit_joins_both():
-    md, plain = ui.compose_capped("body-md", "body-plain", "TAIL-md", "TAIL-plain")
-    assert md == "body-md\n\nTAIL-md"
-    assert plain == "body-plain\n\nTAIL-plain"
-
-
-def test_compose_capped_over_limit_keeps_answer_tail_and_panel():
-    # body + panel exceeds MAX_MSG; the answer's conclusion sits at the body's end and
-    # must survive — the old path let the transport hard-cut it mid-word.
-    body = "A" * ui.MAX_MSG + " CONCLUSION_KEPT"
-    panel = "background · 1 job"
-    md, plain = ui.compose_capped(body, body, f"```\n{panel}\n```", panel)
-    assert len(md) <= ui.MAX_MSG and len(plain) <= ui.MAX_MSG
-    assert "CONCLUSION_KEPT" in plain and "CONCLUSION_KEPT" in md  # tail preserved
-    assert panel in plain  # the status block stays whole
-    assert plain.startswith("…")  # trimmed from the head, not the tail

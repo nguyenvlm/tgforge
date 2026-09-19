@@ -597,6 +597,11 @@ class Topic:
     async def edit_rich(self, msg_id, text):
         return await self._core.edit_rich(self._core.chat_id, msg_id, text)
 
+    async def send_md(self, md, plain, reply_to=None):
+        return await self._core.send_md(
+            self._core.chat_id, md, plain, self.thread_id, reply_to=reply_to
+        )
+
     async def set_markup(self, msg_id, reply_markup):
         """Attach/replace an inline keyboard on an existing message."""
         await self._core._call(
@@ -810,6 +815,23 @@ class Transport:
                 )
             mid = msg.message_id if msg else mid
         return mid
+
+    async def send_md(self, chat_id, md, plain, thread_id=None, reply_to=None) -> int | None:
+        """Send a pre-rendered MarkdownV2 body with a plain fallback (mirrors edit_md).
+        The caller keeps `md`/`plain` within MAX_MSG — no chunking."""
+        kw = {}
+        if thread_id is not None:
+            kw["message_thread_id"] = thread_id
+        if reply_to is not None:
+            kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
+        msg = None
+        if len(md) <= MAX_MSG:
+            msg = await self._call(
+                lambda: self.bot.send_message(chat_id, _cap(md), parse_mode="MarkdownV2", **kw)
+            )
+        if msg is None:
+            msg = await self._call(lambda: self.bot.send_message(chat_id, _cap(plain), **kw))
+        return msg.message_id if msg else None
 
     async def edit_rich(self, chat_id, msg_id, text) -> bool:
         md = to_md(text)

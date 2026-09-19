@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from tgforge.base.kernel import file_held_open
-from tgforge.base.ui import fmt_duration
+from tgforge.base.ui import MAX_MSG, fmt_duration
 from tgforge.plugins.claude.render import SPINNER
 
 LOGGER = logging.getLogger("tgforge")
@@ -43,25 +43,43 @@ def last_line(path: str) -> str:
 
 
 def panel(session, spin: int = 0) -> tuple[str, str] | None:
-    """A monospace, never-collapsed panel of background tasks (md, plain), or None.
-    One row per task: a mark (spinner while running, ✓/✗/◼ when done), label,
-    elapsed, and the last output line. `spin` animates the mark."""
-    tasks = session.background_tasks
-    if not tasks:
+    """A monospace, never-collapsed panel of RUNNING background tasks (md, plain),
+    or None when none run. One row per running task: the spinner, label, elapsed,
+    and the last output line. `spin` animates the mark. A finished job drops off at
+    the next render — its completion already reached the user through the turn's
+    content. The panel is its own message, so if many jobs make it exceed a Telegram
+    message the OLDEST rows are dropped first — the panel never costs the main text."""
+    running = [t for t in session.background_tasks.values() if t["done"] is None]
+    if not running:
         return None
     frame = SPINNER[spin % len(SPINNER)]
-    n = len(tasks)
-    rows = [f"background · {n} job{'s' if n != 1 else ''}"]
     now = time.monotonic()
-    for t in tasks.values():
-        mark = t["done"] or frame
-        el = fmt_duration(int((t.get("done_at") or now) - t["start"]))
+    header = f"background · {len(running)} job{'s' if len(running) != 1 else ''}"
+    task_rows = []
+    for t in running:
+        el = fmt_duration(int(now - t["start"]))
         label = t["label"][:24]
-        tail = last_line(t["path"]) or ("done" if t["done"] else "running…")
-        rows.append(f"{mark} {label:<24} {el:>5}  {tail}")
-    body = "\n".join(rows)
+        tail = last_line(t["path"]) or "running…"
+        task_rows.append(f"{frame} {label:<24} {el:>5}  {tail}")
+    body = _fit_panel(header, task_rows)
     esc = body.replace("\\", "\\\\").replace("`", "\\`")
     return f"```\n{esc}\n```", body
+
+
+def _fit_panel(header: str, task_rows: list[str]) -> str:
+    """Join header + rows; if the escaped code block would exceed a Telegram message,
+    drop the oldest rows (front of the list) until it fits, marking the elision."""
+    limit = MAX_MSG - 10  # leave room for the ``` fences and a backtick-escape or two
+    rows = list(task_rows)
+    while rows:
+        shown = [header, *rows]
+        if len(rows) < len(task_rows):
+            shown.insert(1, f"… {len(task_rows) - len(rows)} older job(s) hidden")
+        body = "\n".join(shown)
+        if len(body) <= limit:
+            return body
+        rows.pop(0)
+    return header
 
 
 def _output_file_held_open(path: str) -> bool:

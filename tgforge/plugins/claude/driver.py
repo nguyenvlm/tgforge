@@ -41,7 +41,6 @@ from tgforge.base.service import service_manager
 from tgforge.base.ui import (
     MAX_MSG,
     chunks,
-    compose_capped,
     expandable,
     fmt_duration,
     mdv2_escape,
@@ -158,9 +157,7 @@ class ClaudeTopic(Topic):
         self.background_labels: dict[str, str] = {}
         self.background_probe_at = 0.0
         self.background_updater_task: asyncio.Task | None = None
-        self.last_final_id: int | None = None
-        self.last_final_body: tuple | None = None
-        self.last_final_markup: list | None = None
+        self.background_panel_id: int | None = None  # the running-jobs panel's own message
         self.mirror_holder: int | None = None
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
@@ -369,12 +366,9 @@ class ClaudeTopic(Topic):
             pass
 
     async def _open_holder(self, reply_to=None, reuse_id=None):
-        await self._stop_background_updater()  # quiesce it before settling the old card
-        if self.last_final_id is not None and self.last_final_body is not None:
-            md, plain = self.last_final_body
-            await self.edit_md(self.last_final_id, md, plain, reply_markup=self.last_final_markup)
-            self.last_final_id = None
-            self.last_final_markup = None
+        # quiesce the between-turn panel updater so the heartbeat is the sole painter of
+        # the panel message during this turn (single writer, no stale timer edit)
+        await self._stop_background_updater()
         self.turn = TurnState()
         self.turn_start = time.monotonic()
         self.last_reader_event = self.turn_start
@@ -607,6 +601,25 @@ class ClaudeTopic(Topic):
                 pass
             self.proc.kill()
 
+    def _running_bg(self) -> bool:
+        return any(t["done"] is None for t in self.background_tasks.values())
+
+    async def _paint_panel(self, spin: int) -> bool:
+        """Render the running-jobs panel as its OWN message, never part of the turn's
+        main card, so panel size can never trim the main text. No running jobs → retire
+        the message (the mirror-holder retire pattern). Returns whether the paint landed
+        (for the caller's adaptive cadence)."""
+        panel = background.panel(self, spin)
+        if panel is None:
+            if self.background_panel_id is not None:
+                await self.delete(self.background_panel_id, droppable=True)
+                self.background_panel_id = None
+            return True
+        if self.background_panel_id is None:
+            self.background_panel_id = await self.send_md(panel[0], panel[1])
+            return self.background_panel_id is not None
+        return await self.edit_md(self.background_panel_id, panel[0], panel[1], droppable=True)
+
     def _ensure_background_updater(self):
         if self.background_updater_task is not None and not self.background_updater_task.done():
             self.background_updater_task.cancel()
@@ -616,7 +629,7 @@ class ClaudeTopic(Topic):
         spin = 0
         interval = UPDATER_INTERVAL  # adaptive, same as the heartbeat: grow on flood
         try:
-            while self.background_tasks and self.last_final_id is not None:
+            while True:
                 # honor the exact flood deadline on top of the adaptive interval (A),
                 # so a long background job's panel never hammers a closed edit window
                 wait = interval
@@ -626,20 +639,9 @@ class ClaudeTopic(Topic):
                 await asyncio.sleep(wait)
                 spin += 1
                 background.mark_orphans(self)
-                panel = background.panel(self, spin)
-                # revalidate after the sleep: the reader may have settled/cleared the
-                # final card while this tick was parked, leaving a stale id to paint
-                if panel is None or self.last_final_id is None or self.last_final_body is None:
-                    break
-                md, plain = self.last_final_body
-                comp_md, comp_plain = compose_capped(md, plain, panel[0], panel[1])
-                landed = await self.edit_md(
-                    self.last_final_id,
-                    comp_md,
-                    comp_plain,
-                    reply_markup=self.last_final_markup,
-                    droppable=True,
-                )
+                landed = await self._paint_panel(spin)
+                if not self._running_bg():
+                    break  # _paint_panel already retired the panel message
                 # adaptive cadence (B): back off on a dropped edit, decay back on success
                 if landed:
                     interval = max(UPDATER_INTERVAL, interval - EDIT_DECAY_STEP)
@@ -805,22 +807,9 @@ class ClaudeTopic(Topic):
         md_answer = to_md(ans.text)
         combined_md = f"{events[0]}\n\n{md_answer}" if events else md_answer
         combined_plain = f"{events[1]}\n\n{ans.text}" if events else ans.text
-        panel = background.panel(self, self.spin)
-        if panel:
-            prefix_md, prefix_plain = combined_md, combined_plain
-            combined_md = f"{combined_md}\n\n{panel[0]}"
-            combined_plain = f"{combined_plain}\n\n{panel[1]}"
-            if any(x["done"] is None for x in self.background_tasks.values()):
-                self.last_final_id = holder_id
-                self.last_final_body = (prefix_md, prefix_plain)
-                self.last_final_markup = None
-            else:
-                self.background_tasks = {}
-                self.background_labels = {}
-                self.last_final_id = None
-                self.last_final_markup = None
+        # The panel is its own message (painted below), never part of the final card, so
+        # the main text is bounded by MAX_MSG alone — panel size can never trim it.
         last_id = holder_id
-        last_body = None  # a chunked turn moves the panel to the last chunk; track its body
         if len(combined_md) <= MAX_MSG:
             if not await self.edit_md(holder_id, combined_md, combined_plain):
                 sent = await self._send_answer(ans.text)
@@ -833,7 +822,6 @@ class ClaudeTopic(Topic):
                     break
                 sent = await self._send_answer(chunk)
                 last_id = sent or last_id
-                last_body = (to_md(chunk), chunk)
         else:
             for i, chunk in enumerate(chunks(ans.text)):
                 if i >= MAX_OUTPUT_MSGS:
@@ -842,31 +830,30 @@ class ClaudeTopic(Topic):
                 if i == 0:
                     if not await self.edit_rich(holder_id, chunk):
                         last_id = await self._send_answer(chunk) or last_id
-                    last_body = (to_md(chunk), chunk)
                 else:
                     sent = await self._send_answer(chunk)
                     last_id = sent or last_id
-                    last_body = (to_md(chunk), chunk)
         for p in ans.attachments:
             try:
                 await self.send_file(Path(p).expanduser())
             except (RuntimeError, OSError) as e:
                 await self.send(f"⚠️ could not attach {p}: {e}")
         if ans.options and last_id is not None:
-            kb = await self._attach_suggestions(last_id, ans.options)
-            if kb and self.last_final_id is not None:
-                self.last_final_markup = kb
+            await self._attach_suggestions(last_id, ans.options)
         await self._sync_title()
         await self._settle_cancel_note()  # settle a '/cancel' bubble at the turn boundary
         if self._jsonl().exists():
             self.mirror_offset = self._jsonl().stat().st_size
         self.turn = TurnState()
-        if self.last_final_id is not None:
-            self.last_final_id = last_id
-            if last_body is not None:
-                # a chunked turn: the panel rides the last answer chunk, so give the
-                # updater that chunk's body (not the full text) — no oversized bad edit
-                self.last_final_body = last_body
+        # Prune finished jobs: this turn's content already reported their completion, so
+        # they must never linger in the panel or grow the tracking dict without bound.
+        for bid in [b for b, t in self.background_tasks.items() if t["done"] is not None]:
+            del self.background_tasks[bid]
+        self.background_labels = {}
+        # repaint (or retire) the panel as its own message; keep the between-turn updater
+        # running while jobs still run so its elapsed clock and pruning stay live
+        await self._paint_panel(self.spin)
+        if self._running_bg():
             self._ensure_background_updater()
         self._save()
 
@@ -895,11 +882,12 @@ class ClaudeTopic(Topic):
                 thinking = "".join(self.turn.thinking_parts).strip()
                 answer = "".join(self.turn.preview_parts).strip()
                 background.mark_orphans(self)
-                panel = background.panel(self, self.spin)
                 # skip a no-op repaint when nothing meaningful changed (B): saves edits
                 # during silent tool calls, so we don't spend the per-message rate budget
                 # on a spinner tick. A slow keepalive still advances the elapsed clock.
-                sig = (tokens, tuple(lines), thinking, answer, bool(panel))
+                # The running-jobs flag forces a paint when the set toggles (so the panel
+                # message appears/retires promptly); the panel is its own message below.
+                sig = (tokens, tuple(lines), thinking, answer, self._running_bg())
                 now = time.monotonic()
                 if sig == self._last_paint_sig and now - self._last_paint_at < PANEL_KEEPALIVE:
                     continue
@@ -911,18 +899,10 @@ class ClaudeTopic(Topic):
                     lines2.append(f"💬 {answer}")
                 interim = "\n\n".join(lines2)
                 base = f"{head}\n\n{interim}" if interim else head
-                room = MAX_MSG - (len(panel[1]) + 8 if panel else 0)
-                if len(base) > room:
-                    base = f"{head}\n\n…{base[-(room - len(head) - 5) :]}"
-                if panel:
-                    landed = await self.edit_md(
-                        self.holder_id,
-                        f"{mdv2_escape(base)}\n\n{panel[0]}",
-                        f"{base}\n\n{panel[1]}",
-                        droppable=True,
-                    )
-                else:
-                    landed = await self.edit(self.holder_id, base, droppable=True)
+                if len(base) > MAX_MSG:  # the main card is bounded by MAX_MSG alone now
+                    base = f"{head}\n\n…{base[-(MAX_MSG - len(head) - 5) :]}"
+                landed = await self.edit(self.holder_id, base, droppable=True)
+                await self._paint_panel(self.spin)  # the running-jobs panel, its own message
                 # adaptive cadence (B): a dropped repaint means we're over the ceiling —
                 # back off multiplicatively; a landed one decays the interval back down
                 if landed:

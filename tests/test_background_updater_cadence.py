@@ -30,9 +30,7 @@ def test_background_updater_honors_flood_deadline(tmp_path, monkeypatch):
             c.bot, "edit_message_text", lambda *a, **k: (_ for _ in ()).throw(_Flood(300))
         )
         t = c.core._instantiate(ClaudeTopic, 555, "work")
-        t.last_final_id = 88
-        t.last_final_body = ("m", "p")
-        t.last_final_markup = None
+        t.background_panel_id = 88  # the panel message the updater edits under flood
         now = asyncio.get_event_loop().time()
         t.background_tasks = {"j": {"done": None, "start": now, "label": "job", "path": "/no/such"}}
 

@@ -104,27 +104,24 @@ def test_open_holder_keeps_a_live_heartbeat_singleton(tmp_path):
     asyncio.run(scenario())
 
 
-def test_open_holder_quiesces_updater_before_settle(tmp_path):
+def test_open_holder_quiesces_updater_at_turn_open(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
         t = c.core._instantiate(ClaudeTopic, 555, "work")
-        t.last_final_id = 88
-        t.last_final_body = ("m", "p")
-        t.last_final_markup = None
-        order: list[str] = []
+        t.background_panel_id = 88  # a live panel message from a between-turn job
+        stopped: list[str] = []
 
         async def rec_stop():
-            order.append("stop")
-
-        async def rec_edit(*a, **k):
-            order.append("edit")
-            return True
+            stopped.append("stop")
 
         t._stop_background_updater = rec_stop
-        t.edit_md = rec_edit
         await t._open_holder()
-        # the panel updater is quiesced before the old card is settled, so no stale
-        # updater tick can paint the id this settle just retired
-        assert order[:2] == ["stop", "edit"]
+        if t.heartbeat_task is not None:
+            t.heartbeat_task.cancel()
+        # the between-turn panel updater is quiesced at turn open so the heartbeat is the
+        # sole painter of the panel message; the panel message itself is left in place
+        # (its job may still be running) — never settled or retired at the turn boundary
+        assert stopped == ["stop"]
+        assert t.background_panel_id == 88
 
     asyncio.run(scenario())
