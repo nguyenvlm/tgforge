@@ -165,6 +165,7 @@ class ClaudeTopic(Topic):
         self.background_updater_task: asyncio.Task | None = None
         self.background_panel_id: int | None = None  # the background-jobs panel's message
         self.panel_reanchor_task: asyncio.Task | None = None  # an in-flight panel re-send
+        self.stale_panel_ids: list[int] = []  # replaced panels whose delete was dropped
         self.mirror_holder: int | None = None
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
@@ -621,11 +622,13 @@ class ClaudeTopic(Topic):
         if self.panel_reanchor_task is not None:
             # a re-send a cancelled painter left in flight: let it land and swap first
             await asyncio.shield(self.panel_reanchor_task)
+        await self._delete_stale_panels()
         panel = background.panel(self, spin)
         if panel is None:
             if self.background_panel_id is not None:
-                await self.delete(self.background_panel_id, droppable=True)
+                self.stale_panel_ids.append(self.background_panel_id)
                 self.background_panel_id = None
+                await self._delete_stale_panels()
             return True
         old = self.background_panel_id
         if old is not None and self.latest_message_id() <= old:
@@ -643,10 +646,18 @@ class ClaudeTopic(Topic):
                 return False  # keep the old panel (if any) until a paint lands
             self.background_panel_id = new_id
             if old is not None:
-                await self.delete(old)  # essential: a dropped delete strands a duplicate
+                self.stale_panel_ids.append(old)
+                await self._delete_stale_panels()
             return True
         finally:
             self.panel_reanchor_task = None
+
+    async def _delete_stale_panels(self):
+        """Delete replaced panels droppably, so the painter never waits on a flood-wait;
+        a dropped delete stays queued for the next paint (never a stranded duplicate)."""
+        for panel_id in list(self.stale_panel_ids):
+            if await self.delete(panel_id, droppable=True):
+                self.stale_panel_ids.remove(panel_id)
 
     def _ensure_background_updater(self):
         if self.background_updater_task is not None and not self.background_updater_task.done():
@@ -669,8 +680,9 @@ class ClaudeTopic(Topic):
                 background.mark_orphans(self)
                 background.prune_finished(self, time.monotonic())
                 landed = await self._paint_panel(spin)
-                if not background.visible_tasks(self, time.monotonic()):
-                    break  # _paint_panel already retired the panel message
+                shown = background.visible_tasks(self, time.monotonic())
+                if not shown and not self.stale_panel_ids:
+                    break  # the panel is retired and no replaced panel awaits its delete
                 # adaptive cadence (B): back off on a dropped edit, decay back on success
                 if landed:
                     interval = max(UPDATER_INTERVAL, interval - EDIT_DECAY_STEP)
@@ -879,7 +891,7 @@ class ClaudeTopic(Topic):
         # repaint (or retire) the panel as its own message; keep the between-turn updater
         # running while it shows rows so its clock, lingering rows and pruning stay live
         await self._paint_panel(self.spin)
-        if background.visible_tasks(self, time.monotonic()):
+        if background.visible_tasks(self, time.monotonic()) or self.stale_panel_ids:
             self._ensure_background_updater()
         self._save()
 
