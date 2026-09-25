@@ -105,7 +105,9 @@ SESSION_BRIEF = (
     "file: `[[attach]] /absolute/path` — sent after the text as a photo (images "
     "≤10MB) or a document (≤50MB); the marker line never renders. Do "
     "not use Markdown tables in replies — Telegram renders them as raw text, not a "
-    "grid; present tabular data as short labeled lines or a bullet list instead."
+    "grid; present tabular data as short labeled lines or a bullet list instead. "
+    "Keep lists one level deep — no nested bullets; group detail into short "
+    "paragraphs led by a bold label instead."
 )
 
 
