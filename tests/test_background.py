@@ -189,3 +189,22 @@ def test_read_of_a_finished_jobs_output_takes_the_marker(tmp_path, code, mark):
     s.background_tasks["bid"] = {"path": str(out), "label": "train", "start": 0.0, "done": None}
     assert background.mark_done(s, _read_result(out)) == "bid"
     assert s.background_tasks["bid"]["done"] == mark
+
+
+def test_read_after_the_completion_event_keeps_its_outcome(tmp_path):
+    """The completion event already marked the job; a later Read of its finished output
+    must not re-mark it (nor restart its linger)."""
+    out = tmp_path / "tasks" / "bid.output"
+    out.parent.mkdir()
+    out.write_text("done\n\n[exited with code 0]\n")
+    s = _session()
+    s.background_tasks["bid"] = {
+        "path": str(out),
+        "label": "train",
+        "start": 0.0,
+        "done": "✗",  # as the completion event reported it
+        "done_at": 5.0,
+    }
+    assert background.mark_done(s, _read_result(out)) is None
+    assert s.background_tasks["bid"]["done"] == "✗"
+    assert s.background_tasks["bid"]["done_at"] == 5.0

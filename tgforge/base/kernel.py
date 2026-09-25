@@ -733,8 +733,9 @@ class Topic:
             self._core.chat_id, msg_id, media_type, b64, reply_markup=reply_markup
         )
 
-    async def delete(self, msg_id, droppable=False):
-        await self._core.delete_msg(self._core.chat_id, msg_id, droppable=droppable)
+    async def delete(self, msg_id, droppable=False) -> bool:
+        """False only when a droppable delete was dropped (retry it later)."""
+        return await self._core.delete_msg(self._core.chat_id, msg_id, droppable=droppable)
 
     async def ask_buttons(self, text, options, timeout=300, announce=None, cancel=True):
         return await self._core.ask_buttons(
@@ -1011,8 +1012,13 @@ class Transport:
             chat_id, msg_id, plain, reply_markup=reply_markup, droppable=droppable
         )
 
-    async def delete_msg(self, chat_id, msg_id, droppable=False):
-        await self._call(lambda: self.bot.delete_message(chat_id, msg_id), droppable=droppable)
+    async def delete_msg(self, chat_id, msg_id, droppable=False) -> bool:
+        """False only when a droppable delete was dropped under flood-wait or pacing; an
+        API error (the message is already gone) counts as done."""
+        result = await self._call(
+            lambda: self.bot.delete_message(chat_id, msg_id), droppable=droppable
+        )
+        return result is not _SKIPPED
 
     async def send_photo_b64(self, chat_id, media_type, b64, thread_id=None, reply_markup=None):
         raw = base64.b64decode(b64)

@@ -34,7 +34,7 @@ The finalized reply is the BOTTOM-MOST of the turn's messages. Everything posted
 
 A message ack'd at/after the boundary is the next turn's and stays below the finalized reply (card above it).
 
-The background-jobs panel is not a turn message: it sits below everything, the finalized reply included. The kernel records the newest message id per thread (every `Transport._call` result, every inbound message, and a successful topic rename, whose service message the bot never receives); a panel paint that finds a newer id than the panel's re-sends the panel silently (`disable_notification`) and droppably (under flood-wait the old panel stays and the next tick retries), then deletes the old one. The send, the id swap and the delete run as one task shielded from the painter's cancel, and every paint first waits for one still in flight.
+The background-jobs panel is not a turn message: it sits below everything, the finalized reply included. The kernel records the newest message id per thread (every `Transport._call` result, every inbound message, and a successful topic rename, whose service message the bot never receives); a panel paint that finds a newer id than the panel's re-sends the panel silently (`disable_notification`) and droppably (under flood-wait the old panel stays and the next tick retries), then queues the old one for a droppable delete; every paint first retries the queued deletes, a dropped one stays queued, and the between-turn updater runs until the queue is empty. No panel call ever waits out a flood-wait in the painter. The send, the id swap and the delete run as one task shielded from the painter's cancel, and every paint first waits for one still in flight.
 
 ### Finalized-turn format
 

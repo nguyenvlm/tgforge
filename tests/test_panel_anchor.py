@@ -9,7 +9,7 @@ import contextlib
 from types import SimpleNamespace
 
 import pytest
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from tgforge.plugins.claude import ClaudeTopic
 from tgforge.testing import TestClient
@@ -227,5 +227,101 @@ def test_a_topic_rename_re_anchors_the_panel(tmp_path, monkeypatch):
         assert await c.core.rename_topic(THREAD, "a new title")  # unchanged: no API call
         await t._paint_panel(2)
         assert t.background_panel_id == second_panel  # nothing new, edited in place
+
+    asyncio.run(scenario())
+
+
+def _flood_deletes(c, times: int, retry_after: float = 25) -> list[int]:
+    """The next `times` delete_message calls hit a flood-wait; returns the ids refused."""
+    real_delete = c.bot.delete_message
+    refused: list[int] = []
+
+    async def delete_message(chat_id, message_id):
+        if len(refused) < times:
+            refused.append(message_id)
+            raise _Flood(retry_after)
+        return await real_delete(chat_id, message_id)
+
+    c.bot.delete_message = delete_message
+    return refused
+
+
+def test_a_flooded_delete_after_a_landed_re_send_never_stalls(tmp_path, monkeypatch):
+    """The old panel's delete is droppable too: the painter returns at once, the old id
+    stays queued, and the next paint removes it — never two panels for good."""
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        first_panel = t.background_panel_id
+        await t.send("a reply")  # buries the panel
+        refused = _flood_deletes(c, times=1)
+
+        landed = await asyncio.wait_for(t._paint_panel(1), 1)  # a 25s sleep would time out
+        assert landed is True and refused == [first_panel]
+        assert t.stale_panel_ids == [first_panel]
+
+        await t._paint_panel(2)
+        assert first_panel in c.bot.deleted and t.stale_panel_ids == []
+        assert _live_panels(c) == [t.background_panel_id]
+
+    asyncio.run(scenario())
+
+
+def test_a_dropped_retire_delete_is_retried_by_the_updater(tmp_path, monkeypatch):
+    """The last row lingered out and the retire delete was dropped: the updater keeps
+    going until the panel is really gone."""
+
+    async def scenario():
+        import tgforge.plugins.claude.driver as drv
+
+        monkeypatch.setattr(drv, "UPDATER_INTERVAL", 0.01)
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        panel = t.background_panel_id
+        t.background_tasks.clear()  # nothing left to show
+        refused = _flood_deletes(c, times=2, retry_after=0.02)  # the updater waits it out
+
+        t._ensure_background_updater()
+        await asyncio.wait_for(t.background_updater_task, 2)  # ends by itself
+
+        assert refused == [panel, panel]  # dropped twice, then retried until it landed
+        assert panel in c.bot.deleted and _live_panels(c) == []
+        assert t.background_panel_id is None and t.stale_panel_ids == []
+
+    asyncio.run(scenario())
+
+
+class _BadMarkdown(TelegramBadRequest):
+    def __init__(self):
+        self.message = "Bad Request: can't parse entities"
+
+    def __str__(self):
+        return self.message
+
+
+def test_the_plain_text_fallback_re_send_is_droppable_too(tmp_path, monkeypatch):
+    """MarkdownV2 refused, then the plain-text retry hits a flood-wait: the painter still
+    returns at once with the old panel in place."""
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        first_panel = t.background_panel_id
+        await t.send("a reply")  # buries the panel
+        real_send = c.bot.send_message
+
+        async def picky(chat_id, text, **kw):
+            if "background ·" in text:
+                raise _BadMarkdown() if kw.get("parse_mode") else _Flood()
+            return await real_send(chat_id, text, **kw)
+
+        c.bot.send_message = picky
+        landed = await asyncio.wait_for(t._paint_panel(1), 1)  # a 25s sleep would time out
+        assert landed is False
+        assert t.background_panel_id == first_panel and first_panel not in c.bot.deleted
 
     asyncio.run(scenario())
