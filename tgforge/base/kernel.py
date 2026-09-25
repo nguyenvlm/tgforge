@@ -160,6 +160,19 @@ async def reap(proc) -> None:
     await proc.wait()
 
 
+async def kill_process_group(proc) -> None:
+    """Kill a subprocess spawned with `start_new_session=True` together with everything it
+    started (a shell's children outlive a kill of the shell alone), then wait for it."""
+    import os
+    import signal
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    await proc.wait()
+
+
 def pid_cwd(pid: int) -> str | None:
     """Working directory of a live process, or None if it can't be read."""
     if IS_LINUX:
