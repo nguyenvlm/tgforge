@@ -198,29 +198,114 @@ def pid_cwd(pid: int) -> str | None:
     return None
 
 
+def file_holders(path: str) -> set[int] | None:
+    """PIDs of the processes holding `path` open, or None where there is no probe
+    (Linux only: a /proc fd scan)."""
+    if not IS_LINUX:
+        return None
+    try:
+        fd_dirs = list(Path("/proc").glob("[0-9]*/fd"))
+    except OSError:
+        return set()
+    holders: set[int] = set()
+    for fd_dir in fd_dirs:
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue  # the process exited mid-scan
+        for fd in fds:
+            try:
+                if os.readlink(fd) == path:
+                    holders.add(int(fd_dir.parent.name))
+                    break
+            except OSError:
+                continue  # this fd closed mid-scan; keep checking the rest
+    return holders
+
+
+def _process_table() -> dict[int, tuple[int, int, int]]:
+    """pid → (ppid, pgid, sid) for every live process, read from /proc."""
+    table: dict[int, tuple[int, int, int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            table[int(stat.parent.name)] = (int(fields[1]), int(fields[2]), int(fields[3]))
+        except (OSError, IndexError, ValueError):
+            continue  # the process exited mid-scan
+    return table
+
+
+def _job_tree(path: str) -> set[int] | None:
+    """Every process of the job writing `path`: its holders, all processes in the
+    holders' sessions, and all their descendants (a child that left the group or
+    session via setpgid/setsid is still a descendant). None where there is no probe.
+    Raises if the set would reach this process's own pid, group, or session."""
+    holders = file_holders(path)
+    if holders is None:
+        return None
+    table = _process_table()
+    sessions = {table[pid][2] for pid in holders if pid in table}
+    tree = holders | {pid for pid, (_, _, sid) in table.items() if sid in sessions}
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    stack = list(tree)
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in tree:
+                tree.add(child)
+                stack.append(child)
+    own = (os.getpid(), os.getpgrp(), os.getsid(0))
+    hits = sorted(
+        pid
+        for pid in tree
+        if pid == own[0] or (pid in table and (table[pid][1] == own[1] or table[pid][2] == own[2]))
+    )
+    if hits:
+        raise RuntimeError(f"job tree of {path} reaches this process's own group: {hits}")
+    return tree
+
+
+async def kill_file_holders(path: str, grace: float = 2.0) -> int | None:
+    """Stop the job writing `path` (see `_job_tree`): SIGTERM the whole tree, then
+    SIGKILL whatever outlives `grace` seconds. Returns how many processes were
+    signalled, or None where there is no probe."""
+    import signal
+
+    tree = _job_tree(path)
+    if tree is None:
+        return None
+    for pid in tree:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        live = [pid for pid in tree if _alive(pid)]
+        if not live:
+            break
+        await asyncio.sleep(0.1)
+    for pid in tree:
+        if _alive(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+    return len(tree)
+
+
+def _alive(pid: int) -> bool:
+    """True if `pid` exists and is not a zombie."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
 def file_held_open(path: str) -> bool:
     """True if any process holds `path` open. On platforms with no probe, returns
     True — the conservative answer, since callers use a False to declare a process
     gone and a false negative would end a live job early."""
     if IS_LINUX:
-        import os
-
-        try:
-            fd_dirs = list(Path("/proc").glob("[0-9]*/fd"))
-        except OSError:
-            return False
-        for fd_dir in fd_dirs:
-            try:
-                fds = list(fd_dir.iterdir())
-            except OSError:
-                continue  # the process exited mid-scan
-            for fd in fds:
-                try:
-                    if os.readlink(fd) == path:
-                        return True
-                except OSError:
-                    continue  # this fd closed mid-scan; keep checking the rest
-        return False
+        return bool(file_holders(path))
     if IS_MACOS:
         try:
             return (
@@ -586,6 +671,10 @@ class Topic:
         await self._core.rename_topic(self.thread_id, name)
         self.name = name
 
+    def latest_message_id(self) -> int:
+        """The newest message id in this window, sent or received (0 if none seen)."""
+        return self._core.latest_message_ids.get(self.thread_id, 0)
+
     # ── Replies bound to this window's thread ──────────────────────
     async def send(self, text, reply_to=None, droppable=False):
         return await self._core.send(
@@ -610,9 +699,9 @@ class Topic:
     async def edit_rich(self, msg_id, text):
         return await self._core.edit_rich(self._core.chat_id, msg_id, text)
 
-    async def send_md(self, md, plain, reply_to=None):
+    async def send_md(self, md, plain, reply_to=None, silent=False):
         return await self._core.send_md(
-            self._core.chat_id, md, plain, self.thread_id, reply_to=reply_to
+            self._core.chat_id, md, plain, self.thread_id, reply_to=reply_to, silent=silent
         )
 
     async def set_markup(self, msg_id, reply_markup):
@@ -737,6 +826,13 @@ class Transport:
         self.bot = bot
         self.flood_until = 0.0  # monotonic deadline of the last droppable flood-wait
         self._pacer = _Pacer(pace_per_min, pace_burst)
+        # thread_id → the newest message id seen there, sent or received (ids only grow
+        # within a chat, so any message above a given id landed below that message)
+        self.latest_message_ids: dict[int | None, int] = {}
+
+    def note_message(self, thread_id: int | None, message_id: int) -> None:
+        if message_id > self.latest_message_ids.get(thread_id, 0):
+            self.latest_message_ids[thread_id] = message_id
 
     def enable_pacing(self):
         """Turn on outbound rate pacing for the live bot. Off by default so tests never
@@ -757,7 +853,7 @@ class Transport:
             return _SKIPPED  # paced out: a droppable repaint skips now, retries next tick
         for attempt in range(2):
             try:
-                return await make_coro()
+                result = await make_coro()
             except TelegramRetryAfter as e:
                 LOGGER.warning("flood-wait %ss (droppable=%s)", e.retry_after, droppable)
                 self.flood_until = max(self.flood_until, time.monotonic() + e.retry_after)
@@ -773,6 +869,11 @@ class Transport:
             except TelegramAPIError as e:
                 LOGGER.debug("telegram api error: %r", e)
                 return None
+            else:
+                message_id = getattr(result, "message_id", None)
+                if isinstance(message_id, int):  # a sent (or edited) message
+                    self.note_message(getattr(result, "message_thread_id", None), message_id)
+                return result
         return None
 
     async def send(
@@ -829,10 +930,15 @@ class Transport:
             mid = msg.message_id if msg else mid
         return mid
 
-    async def send_md(self, chat_id, md, plain, thread_id=None, reply_to=None) -> int | None:
+    async def send_md(
+        self, chat_id, md, plain, thread_id=None, reply_to=None, silent=False
+    ) -> int | None:
         """Send a pre-rendered MarkdownV2 body with a plain fallback (mirrors edit_md).
-        The caller keeps `md`/`plain` within MAX_MSG — no chunking."""
+        The caller keeps `md`/`plain` within MAX_MSG — no chunking. `silent` sends
+        without a notification."""
         kw = {}
+        if silent:
+            kw["disable_notification"] = True
         if thread_id is not None:
             kw["message_thread_id"] = thread_id
         if reply_to is not None:
@@ -1962,6 +2068,7 @@ class Kernel(Transport):
         return True
 
     async def handle_message(self, message: Message) -> None:
+        self.note_message(message.message_thread_id, message.message_id)
         text = (message.text or message.caption or "").strip()
         has_media = bool(message.photo or message.document)
         if not text and not has_media:

@@ -68,6 +68,7 @@ def _core(tmp_path):
 
 def _msg(text, thread_id):
     return SimpleNamespace(
+        message_id=1,
         text=text,
         caption=None,
         photo=None,

@@ -62,6 +62,7 @@ def test_media_only_does_not_cancel_ask_text(tmp_path):
         task = asyncio.create_task(c.core.ask_text(100, None, "Path?"))
         await c.pump()
         photo = SimpleNamespace(
+            message_id=1,
             text=None,
             caption=None,
             photo=["file"],
