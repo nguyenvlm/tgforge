@@ -29,6 +29,7 @@ from tgforge.base.kernel import (
     Topic,
     action,
     command,
+    kill_process_group,
     launch,
     on_message,
     on_unknown,
@@ -1880,6 +1881,7 @@ class Claude(Plugin):
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=topic.workspace,
                 env=env,
+                start_new_session=True,
             )
 
             async def pump():
@@ -1899,9 +1901,11 @@ class Claude(Plugin):
             status = f"exit {proc.returncode}"
         except TimeoutError:
             if proc is not None:
-                proc.kill()
-                await proc.wait()
-            status = f"timed out after {SHELL_TIMEOUT}s"
+                await kill_process_group(proc)
+            status = (
+                f"timed out after {SHELL_TIMEOUT}s — stopped: the command and every process "
+                "it started were killed; for a longer run, detach it (nohup … &) and watch its log"
+            )
         except Exception as exc:
             status = f"failed to run: {exc}"
         finally:

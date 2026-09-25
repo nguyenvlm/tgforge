@@ -42,3 +42,38 @@ def test_release_also_reaps(tmp_path):
         assert proc.returncode is not None
 
     asyncio.run(scenario())
+
+
+def test_kill_process_group_kills_what_the_shell_started(tmp_path):
+    """A timed-out `!` command must not leave its children running: killing only the
+    shell orphaned a child that kept working after the timeout was reported."""
+    import os
+
+    from tgforge.base.kernel import kill_process_group
+
+    pid_file = tmp_path / "child.pid"
+
+    async def scenario():
+        proc = await asyncio.create_subprocess_shell(
+            f"sleep 30 & echo $! > {pid_file}; wait",
+            start_new_session=True,
+        )
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text().strip():
+                break
+            await asyncio.sleep(0.02)
+        child = int(pid_file.read_text())
+        os.kill(child, 0)  # alive before the kill
+        await kill_process_group(proc)
+        for _ in range(100):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return
+            with open(f"/proc/{child}/stat") as stat:
+                if stat.read().split()[2] == "Z":
+                    return
+            await asyncio.sleep(0.02)
+        raise AssertionError("the shell's child survived the group kill")
+
+    asyncio.run(scenario())
