@@ -34,7 +34,7 @@ The finalized reply is the BOTTOM-MOST of the turn's messages. Everything posted
 
 A message ack'd at/after the boundary is the next turn's and stays below the finalized reply (card above it).
 
-The background-jobs panel is not a turn message: it sits below everything, the finalized reply included. The kernel records the newest message id per thread (every `Transport._call` result and every inbound message); a panel paint that finds a newer id than the panel's re-sends the panel silently (`disable_notification`) and deletes the old one.
+The background-jobs panel is not a turn message: it sits below everything, the finalized reply included. The kernel records the newest message id per thread (every `Transport._call` result, every inbound message, and a successful topic rename, whose service message the bot never receives); a panel paint that finds a newer id than the panel's re-sends the panel silently (`disable_notification`) and droppably (under flood-wait the old panel stays and the next tick retries), then deletes the old one. The send, the id swap and the delete run as one task shielded from the painter's cancel, and every paint first waits for one still in flight.
 
 ### Finalized-turn format
 
@@ -49,9 +49,9 @@ Rules:
 
 ## Background jobs (`plugins/claude/background.py`)
 
-- A job is registered from its Bash launch result (`backgroundTaskId` + its `tasks/<id>.output` path). It ends when a completion event names it, or when a probe reads the exit marker the CLI appends to the output file (`[exited with code N]`, `[killed]`); with no marker, a job past its grace whose file nothing holds open ends as ◼.
+- A job is registered from its Bash launch result (`backgroundTaskId` + its `tasks/<id>.output` path). It ends when a completion event names it, when a Read of its output file finds the exit marker, or when a probe reads the exit marker the CLI appends to the output file (`[exited with code N]`, `[killed]`); with no marker, a job past its grace whose file nothing holds open ends as ◼.
 - The panel is its own message, placed per the message-ordering invariant. It lists running jobs, plus each finished job's ✓ / ✗ / ◼ for `FINISHED_LINGER` seconds.
-- `/kill <job>` stops a job through the CLI that owns it: a `stop_task` control request, which kills the job's whole process tree. With no live CLI, `kill_file_holders` (kernel) kills the processes holding the output file, their sessions and their descendants, and refuses a set that reaches the bot's own group or session. Its mid-turn note follows the message-ordering invariant.
+- `/kill <job>` stops a job through the CLI that owns it: a `stop_task` control request, which kills the job's whole process tree. With no live CLI, `kill_file_holders` (kernel) kills the processes holding the output file, every process in a session whose leader is one of them (the job's shell; a reader in another terminal brings only itself), and all their descendants, and refuses a set that reaches the bot's own group or session. Its mid-turn note follows the message-ordering invariant.
 
 ## Mid-session config switching
 

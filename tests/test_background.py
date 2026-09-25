@@ -159,3 +159,33 @@ def test_mark_orphans_keeps_grace_without_marker(tmp_path):
     s = _young_task(out)
     background.mark_orphans(s)
     assert s.background_tasks["bid"]["done"] is None
+
+
+def _read_result(path):
+    """The Read tool's result on a job's output file."""
+    return {
+        "type": "user",
+        "tool_use_result": {"type": "text", "file": {"filePath": str(path)}},
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "r1", "content": "…"}]},
+    }
+
+
+def test_read_of_a_running_jobs_output_leaves_it_running(tmp_path):
+    out = tmp_path / "tasks" / "bid.output"
+    out.parent.mkdir()
+    out.write_text("epoch 3/10\n")  # interim output, no exit marker yet
+    s = _session()
+    s.background_tasks["bid"] = {"path": str(out), "label": "train", "start": 0.0, "done": None}
+    assert background.mark_done(s, _read_result(out)) is None
+    assert s.background_tasks["bid"]["done"] is None
+
+
+@pytest.mark.parametrize(("code", "mark"), [("0", "✓"), ("1", "✗")])
+def test_read_of_a_finished_jobs_output_takes_the_marker(tmp_path, code, mark):
+    out = tmp_path / "tasks" / "bid.output"
+    out.parent.mkdir()
+    out.write_text(f"epoch 10/10\n\n[exited with code {code}]\n")
+    s = _session()
+    s.background_tasks["bid"] = {"path": str(out), "label": "train", "start": 0.0, "done": None}
+    assert background.mark_done(s, _read_result(out)) == "bid"
+    assert s.background_tasks["bid"]["done"] == mark

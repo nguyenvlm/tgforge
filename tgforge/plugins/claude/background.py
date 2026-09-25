@@ -237,13 +237,13 @@ def mark_done(session, ev: dict) -> str | None:
     f = tur.get("file") if isinstance(tur, dict) else None
     fp = f.get("filePath") if isinstance(f, dict) else None
     if fp and _TASK_FILE_RE.search(fp):
+        # a Read of the job's output file: also used to check interim output, so the
+        # job is done only once the file ends with its exit marker
         bid = fp.rsplit("/", 1)[-1][: -len(".output")]
-        if bid in session.background_tasks:
-            err = any(
-                isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error")
-                for b in (content if isinstance(content, list) else [])
-            )
-            session.background_tasks[bid]["done"] = "✗" if err else "✓"
-            session.background_tasks[bid]["done_at"] = time.monotonic()
+        task = session.background_tasks.get(bid)
+        mark = exit_mark(task["path"]) if task else None
+        if mark is not None and task["done"] is None:
+            task["done"] = mark
+            task["done_at"] = time.monotonic()
             return bid
     return None

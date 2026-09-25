@@ -236,15 +236,17 @@ def _process_table() -> dict[int, tuple[int, int, int]]:
 
 
 def _job_tree(path: str) -> set[int] | None:
-    """Every process of the job writing `path`: its holders, all processes in the
-    holders' sessions, and all their descendants (a child that left the group or
+    """Every process of the job writing `path`: its holders, every process in a session
+    whose leader is a holder, and all their descendants (a child that left the group or
     session via setpgid/setsid is still a descendant). None where there is no probe.
     Raises if the set would reach this process's own pid, group, or session."""
     holders = file_holders(path)
     if holders is None:
         return None
     table = _process_table()
-    sessions = {table[pid][2] for pid in holders if pid in table}
+    # a holder that leads its session (the job's shell) brings the whole session; a
+    # reader in someone else's session (a `tail -f` in a terminal) brings only itself
+    sessions = {pid for pid in holders if pid in table and table[pid][2] == pid}
     tree = holders | {pid for pid, (_, _, sid) in table.items() if sid in sessions}
     children: dict[int, list[int]] = {}
     for pid, (ppid, _, _) in table.items():
@@ -699,9 +701,15 @@ class Topic:
     async def edit_rich(self, msg_id, text):
         return await self._core.edit_rich(self._core.chat_id, msg_id, text)
 
-    async def send_md(self, md, plain, reply_to=None, silent=False):
+    async def send_md(self, md, plain, reply_to=None, silent=False, droppable=False):
         return await self._core.send_md(
-            self._core.chat_id, md, plain, self.thread_id, reply_to=reply_to, silent=silent
+            self._core.chat_id,
+            md,
+            plain,
+            self.thread_id,
+            reply_to=reply_to,
+            silent=silent,
+            droppable=droppable,
         )
 
     async def set_markup(self, msg_id, reply_markup):
@@ -830,7 +838,11 @@ class Transport:
         # within a chat, so any message above a given id landed below that message)
         self.latest_message_ids: dict[int | None, int] = {}
 
-    def note_message(self, thread_id: int | None, message_id: int) -> None:
+    def note_message(self, thread_id: int | None, message_id: int | None) -> None:
+        """Record `message_id` as seen in `thread_id`; a replayed message (a tapped
+        suggestion) may carry no id."""
+        if not isinstance(message_id, int):
+            return
         if message_id > self.latest_message_ids.get(thread_id, 0):
             self.latest_message_ids[thread_id] = message_id
 
@@ -931,11 +943,11 @@ class Transport:
         return mid
 
     async def send_md(
-        self, chat_id, md, plain, thread_id=None, reply_to=None, silent=False
+        self, chat_id, md, plain, thread_id=None, reply_to=None, silent=False, droppable=False
     ) -> int | None:
         """Send a pre-rendered MarkdownV2 body with a plain fallback (mirrors edit_md).
         The caller keeps `md`/`plain` within MAX_MSG — no chunking. `silent` sends
-        without a notification."""
+        without a notification; a `droppable` send returns None under flood-wait."""
         kw = {}
         if silent:
             kw["disable_notification"] = True
@@ -946,10 +958,15 @@ class Transport:
         msg = None
         if len(md) <= MAX_MSG:
             msg = await self._call(
-                lambda: self.bot.send_message(chat_id, _cap(md), parse_mode="MarkdownV2", **kw)
+                lambda: self.bot.send_message(chat_id, _cap(md), parse_mode="MarkdownV2", **kw),
+                droppable=droppable,
             )
         if msg is None:
-            msg = await self._call(lambda: self.bot.send_message(chat_id, _cap(plain), **kw))
+            msg = await self._call(
+                lambda: self.bot.send_message(chat_id, _cap(plain), **kw), droppable=droppable
+            )
+        if msg is _SKIPPED:
+            return None
         return msg.message_id if msg else None
 
     async def edit_rich(self, chat_id, msg_id, text) -> bool:
@@ -1541,6 +1558,9 @@ class Kernel(Transport):
             )
         )
         if ok is not None:
+            # the rename posts a service message we never receive: count it as newer
+            # than anything seen, so the next paint re-sends a panel it buried
+            self.note_message(thread_id, self.latest_message_ids.get(thread_id, 0) + 1)
             names = self._names()
             names[thread_id] = name
             self._save_names(names)

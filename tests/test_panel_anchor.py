@@ -5,9 +5,11 @@ owner's own message — the next panel paint moves the panel back under it."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramRetryAfter
 
 from tgforge.plugins.claude import ClaudeTopic
 from tgforge.testing import TestClient
@@ -131,5 +133,99 @@ def test_panel_sends_are_silent_and_replies_are_not(tmp_path, monkeypatch):
         assert t.background_panel_id != first_panel
         assert {first_panel, t.background_panel_id} <= c.bot.silent
         assert reply_id not in c.bot.silent and rich_id not in c.bot.silent
+
+    asyncio.run(scenario())
+
+
+class _Flood(TelegramRetryAfter):
+    def __init__(self, retry_after=25):
+        self.retry_after = retry_after
+
+
+def _live_panels(c) -> list[int]:
+    return [
+        mid
+        for mid, tid, text in c.bot.created
+        if tid == THREAD and "background ·" in text and mid not in c.bot.deleted
+    ]
+
+
+def test_a_flooded_re_anchor_keeps_the_old_panel_and_never_stalls(tmp_path, monkeypatch):
+    """The re-send is droppable: under a flood-wait the painter returns at once with the
+    old panel still up, and the next tick re-anchors."""
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        first_panel = t.background_panel_id
+        await t.send("a reply")  # buries the panel
+        real_send = c.bot.send_message
+        flood = {"on": True}
+
+        async def flooded(chat_id, text, **kw):
+            if flood["on"] and "background ·" in text:
+                raise _Flood()
+            return await real_send(chat_id, text, **kw)
+
+        c.bot.send_message = flooded
+        landed = await asyncio.wait_for(t._paint_panel(1), 1)  # a 25s sleep would time out
+        assert landed is False
+        assert t.background_panel_id == first_panel and first_panel not in c.bot.deleted
+
+        flood["on"] = False
+        assert await t._paint_panel(2) is True
+        assert _live_panels(c) == [t.background_panel_id] and _bottom(c) == t.background_panel_id
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_painter_mid_re_anchor_leaves_one_panel(tmp_path, monkeypatch):
+    """A turn opening or settling cancels the painter; a re-send already posted must
+    still be tracked and the old panel deleted — never two panels."""
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        await t.send("a reply")  # buries the panel
+        real_send = c.bot.send_message
+
+        async def slow_panel(chat_id, text, **kw):
+            msg = await real_send(chat_id, text, **kw)  # Telegram has posted it...
+            if "background ·" in text:
+                await asyncio.sleep(0.3)  # ...but the response is still on its way
+            return msg
+
+        c.bot.send_message = slow_panel
+        painter = asyncio.create_task(t._paint_panel(1))
+        await asyncio.sleep(0.05)
+        painter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await painter
+        await t._paint_panel(2)  # the next painter's first tick
+
+        assert _live_panels(c) == [t.background_panel_id]
+        assert _bottom(c) == t.background_panel_id
+
+    asyncio.run(scenario())
+
+
+def test_a_topic_rename_re_anchors_the_panel(tmp_path, monkeypatch):
+    """Telegram posts a "topic renamed" service message the bot never receives."""
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _topic(c, tmp_path, monkeypatch)
+        await t._paint_panel(0)
+        first_panel = t.background_panel_id
+        assert await c.core.rename_topic(THREAD, "a new title")
+        await t._paint_panel(1)
+        assert t.background_panel_id != first_panel and first_panel in c.bot.deleted
+
+        second_panel = t.background_panel_id
+        assert await c.core.rename_topic(THREAD, "a new title")  # unchanged: no API call
+        await t._paint_panel(2)
+        assert t.background_panel_id == second_panel  # nothing new, edited in place
 
     asyncio.run(scenario())

@@ -164,6 +164,7 @@ class ClaudeTopic(Topic):
         self.background_probe_at = 0.0
         self.background_updater_task: asyncio.Task | None = None
         self.background_panel_id: int | None = None  # the background-jobs panel's message
+        self.panel_reanchor_task: asyncio.Task | None = None  # an in-flight panel re-send
         self.mirror_holder: int | None = None
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
@@ -617,6 +618,9 @@ class ClaudeTopic(Topic):
         bottom-most message: buried under a later one, it is sent anew and the old one
         deleted. Nothing to show → retire the message (the mirror-holder retire pattern).
         Returns whether the paint landed (for the caller's adaptive cadence)."""
+        if self.panel_reanchor_task is not None:
+            # a re-send a cancelled painter left in flight: let it land and swap first
+            await asyncio.shield(self.panel_reanchor_task)
         panel = background.panel(self, spin)
         if panel is None:
             if self.background_panel_id is not None:
@@ -626,14 +630,23 @@ class ClaudeTopic(Topic):
         old = self.background_panel_id
         if old is not None and self.latest_message_id() <= old:
             return await self.edit_md(old, panel[0], panel[1], droppable=True)
-        # absent, or buried under a later message: send it anew at the bottom
-        new_id = await self.send_md(panel[0], panel[1], silent=True)  # a re-send never pings
-        if new_id is None:
-            return False  # keep the old panel (if any) until a paint lands
-        self.background_panel_id = new_id
-        if old is not None:
-            await self.delete(old)  # essential: a dropped delete strands a duplicate
-        return True
+        # absent, or buried under a later message: send it anew at the bottom. The send,
+        # the id swap and the delete run as one task a painter's cancel can't split.
+        self.panel_reanchor_task = asyncio.create_task(self._reanchor_panel(panel, old))
+        return await asyncio.shield(self.panel_reanchor_task)
+
+    async def _reanchor_panel(self, panel: tuple[str, str], old: int | None) -> bool:
+        try:
+            # droppable: a flood-wait never stalls the painter; the next tick retries
+            new_id = await self.send_md(panel[0], panel[1], silent=True, droppable=True)
+            if new_id is None:
+                return False  # keep the old panel (if any) until a paint lands
+            self.background_panel_id = new_id
+            if old is not None:
+                await self.delete(old)  # essential: a dropped delete strands a duplicate
+            return True
+        finally:
+            self.panel_reanchor_task = None
 
     def _ensure_background_updater(self):
         if self.background_updater_task is not None and not self.background_updater_task.done():

@@ -292,3 +292,63 @@ def test_match_jobs_prefers_an_exact_label():
     assert background.match_jobs(running, "tests e") == ["bx2"]
     assert background.match_jobs(running, "by") == ["by3"]  # an id prefix
     assert background.match_jobs(running, "zzz") == []
+
+
+class _StreamProc(_FakeProc):
+    """A CLI whose stdout the test feeds line by line; None ends the stream."""
+
+    def __init__(self, bot):
+        super().__init__(bot)
+        self.lines: asyncio.Queue = asyncio.Queue()
+        self.stdout = self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = await self.lines.get()
+        if line is None:
+            raise StopAsyncIteration
+        return (json.dumps(line) + "\n").encode()
+
+
+def _reading_topic(c, tmp_path, monkeypatch):
+    t = _topic(c, tmp_path, [("b1", "tests", None)])
+    t.proc = _StreamProc(c.bot)
+    t.turn_start = asyncio.get_event_loop().time()
+    monkeypatch.setattr(t, "_jsonl", lambda: tmp_path / "absent.jsonl")
+    monkeypatch.setattr(t, "_save", lambda: None)
+    return t
+
+
+def test_the_reader_routes_the_stop_answer_to_kill(tmp_path, monkeypatch):
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _reading_topic(c, tmp_path, monkeypatch)
+        reader = asyncio.create_task(t._reader())
+        kill = asyncio.create_task(t.kill_job(_ctx("tests")))
+        await _pump_until(lambda: t.proc.stdin.writes)
+        request_id = t.proc.stdin.writes[0][1]["request_id"]
+        response = {"subtype": "success", "request_id": request_id, "response": {}}
+        await t.proc.lines.put({"type": "control_response", "response": response})
+        await asyncio.wait_for(kill, 1)  # answered through the reader, not the 10s timeout
+        assert c.replies == ["stopping tests…"]
+        await t.proc.lines.put(None)
+        await asyncio.wait_for(reader, 5)
+
+    asyncio.run(scenario())
+
+
+def test_a_dying_cli_answers_a_waiting_kill_at_once(tmp_path, monkeypatch):
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        t = _reading_topic(c, tmp_path, monkeypatch)
+        reader = asyncio.create_task(t._reader())
+        kill = asyncio.create_task(t.kill_job(_ctx("tests")))
+        await _pump_until(lambda: t.proc.stdin.writes)
+        await t.proc.lines.put(None)  # the CLI exits before answering
+        await asyncio.wait_for(reader, 5)
+        await asyncio.wait_for(kill, 1)  # not the 10s timeout
+        assert c.replies[-1] == "couldn't stop tests: the Claude process ended"
+
+    asyncio.run(scenario())
