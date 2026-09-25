@@ -45,7 +45,9 @@ def test_cancel_idle_with_running_background_job_still_responds(tmp_path):
         t.proc = _FakeProc()  # process kept alive for the background job
         t.background_tasks = {"bid1": {"label": "job", "start": 0.0, "done": None}}
         await t.cancel(_CTX)
-        assert any("background job(s) still going" in r for r in c.replies)
+        assert c.replies[-1] == (
+            "no running turn to cancel — 1 background job(s) still going; /kill stops one"
+        )
 
     asyncio.run(scenario())
 

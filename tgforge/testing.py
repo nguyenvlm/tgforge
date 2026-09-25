@@ -32,6 +32,9 @@ class MockBot:
     def __init__(self):
         self._next = 1000
         self.sent: list[tuple[int | None, str]] = []  # (thread_id, text)
+        # every new message in chat order, the owner's included: (message_id, thread_id, text)
+        self.created: list[tuple[int, int | None, str]] = []
+        self.silent: set[int] = set()  # ids of messages sent with disable_notification
         self.edits: list[tuple[int, str]] = []  # (message_id, text)
         self.markup_cleared: list[int] = []
         self.deleted: list[int] = []  # message ids passed to delete_message
@@ -55,17 +58,24 @@ class MockBot:
     async def edit_forum_topic(self, chat_id, message_thread_id, name):
         return True
 
+    def _created(self, thread_id, text, kw) -> SimpleNamespace:
+        message_id = self._id()
+        self.created.append((message_id, thread_id, text))
+        if kw.get("disable_notification"):
+            self.silent.add(message_id)
+        return SimpleNamespace(message_id=message_id, message_thread_id=thread_id)
+
     async def send_message(self, chat_id, text, **kw):
         self.sent.append((kw.get("message_thread_id"), text))
         if kw.get("reply_markup") is not None:
             self.last_markup = kw["reply_markup"]
-        return SimpleNamespace(message_id=self._id())
+        return self._created(kw.get("message_thread_id"), text, kw)
 
     async def send_photo(self, chat_id, photo, **kw):
         self.sent.append((kw.get("message_thread_id"), "<photo>"))
         if kw.get("reply_markup") is not None:
             self.last_markup = kw["reply_markup"]
-        return SimpleNamespace(message_id=self._id())
+        return self._created(kw.get("message_thread_id"), "<photo>", kw)
 
     async def edit_message_media(self, media, **kw):
         self.edits.append((kw.get("message_id"), "<photo>"))
@@ -118,7 +128,11 @@ class TestClient:
 
     # ── Driving ────────────────────────────────────────────────────
     def _msg(self, text, thread_id):
+        """An owner message; it takes the next id in the chat, as in Telegram."""
+        message_id = self.bot._id()
+        self.bot.created.append((message_id, thread_id, text))
         return SimpleNamespace(
+            message_id=message_id,
             text=text,
             caption=None,
             photo=None,

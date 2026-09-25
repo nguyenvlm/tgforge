@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from tgforge.plugins.claude import background
 
@@ -80,3 +83,79 @@ def test_bg_panel_renders_rows(tmp_path):
     assert "background · 1 job" in plain
     assert "final line" in plain
     assert md.startswith("```")
+
+
+def _aged_task(path):
+    """A running task past the probe grace, due for a probe."""
+    s = _session()
+    s.background_probe_at = float("-inf")
+    s.background_tasks["bid"] = {
+        "path": str(path),
+        "label": "job",
+        "start": time.monotonic() - background.PROBE_GRACE - 1,
+        "done": None,
+    }
+    return s
+
+
+@pytest.mark.parametrize(
+    ("content", "mark"),
+    [
+        ("out\n\n[exited with code 0]\n", "✓"),
+        ("out\n\n[exited with code 3]\n", "✗"),
+        ("out\n[exited with code 144]", "✗"),
+        ("out\n\n[exited with code unknown]\n", "✗"),
+        ("out\n\n[killed]\n", "✗"),
+        ("out\nno marker\n", "◼"),
+        ("", "◼"),
+        ("[exited with code 0]\nlater output\n", "◼"),  # marker text is not the last line
+    ],
+)
+def test_mark_orphans_reads_exit_marker_of_closed_file(tmp_path, content, mark):
+    out = tmp_path / "bid.output"
+    out.write_text(content)
+    s = _aged_task(out)
+    background.mark_orphans(s)
+    assert s.background_tasks["bid"]["done"] == mark
+
+
+def test_mark_orphans_leaves_held_open_file_without_marker_running(tmp_path):
+    out = tmp_path / "bid.output"
+    out.write_text("still working\n")
+    s = _aged_task(out)
+    with open(out):  # this process holds it open, as a live job's shell would
+        background.mark_orphans(s)
+    assert s.background_tasks["bid"]["done"] is None
+
+
+def _young_task(path):
+    """A running task inside its probe grace."""
+    s = _aged_task(path)
+    s.background_tasks["bid"]["start"] = time.monotonic()
+    return s
+
+
+@pytest.mark.parametrize(("code", "mark"), [("0", "✓"), ("2", "✗")])
+def test_mark_orphans_reads_marker_inside_grace(tmp_path, code, mark):
+    out = tmp_path / "bid.output"
+    out.write_text(f"out\n\n[exited with code {code}]\n")
+    s = _young_task(out)
+    background.mark_orphans(s)
+    assert s.background_tasks["bid"]["done"] == mark
+
+
+def test_mark_orphans_marker_wins_over_held_open(tmp_path):
+    out = tmp_path / "bid.output"
+    out.write_text("out\n\n[exited with code 0]\n")
+    s = _aged_task(out)
+    with open(out):  # a leftover holder does not undo a written marker
+        background.mark_orphans(s)
+    assert s.background_tasks["bid"]["done"] == "✓"
+
+
+def test_mark_orphans_keeps_grace_without_marker(tmp_path):
+    out = tmp_path / "bid.output"
+    out.write_text("no marker yet\n")  # nothing holds it, but the task is young
+    s = _young_task(out)
+    background.mark_orphans(s)
+    assert s.background_tasks["bid"]["done"] is None

@@ -27,22 +27,31 @@ Turn boundary (the invariant that ordering hangs on):
 
 ### Message-ordering invariant
 
-The finalized reply is the BOTTOM-MOST message of a turn. Everything the turn produced stays ABOVE it:
-- the user's mid-turn messages (the turn folds their acks and reorders the card below them), and
+The finalized reply is the BOTTOM-MOST of the turn's messages. Everything posted while the turn runs stays ABOVE it:
+- the user's mid-turn messages (the turn folds their acks and reorders the card below them),
+- a command's mid-turn note (e.g. `/kill`'s "stopping…": sent under `self.lock`, then the card is re-sent below it), and
 - the turn's timeline/events.
 
 A message ack'd at/after the boundary is the next turn's and stays below the finalized reply (card above it).
+
+The background-jobs panel is not a turn message: it sits below everything, the finalized reply included. The kernel records the newest message id per thread (every `Transport._call` result and every inbound message); a panel paint that finds a newer id than the panel's re-sends the panel silently (`disable_notification`) and deletes the old one.
 
 ### Finalized-turn format
 
 At settle, a turn renders as:
 - the timeline FOLDED into a collapsed expandable bubble (`ui.expandable` — only the header line `🔧 · 💬 · duration · tokens` shown, details hidden until tapped), ABOVE
-- the REPLY, which is the finalized message (bottom-most, carries the suggestion buttons).
+- the REPLY, which is the finalized message (the bottom-most of the turn's messages, carries the suggestion buttons).
 
 Rules:
 - Never leave the live expanded timeline frame (the heartbeat's inline working view) as the finalized card — always replace it with the folded expandable.
 - Fits one Telegram message → one card (folded bubble on top, reply below). Overflows → split into sequential messages in that order (folded timeline above, reply below); the reply stays the bottom finalized message.
 - Truncating the folded timeline body is fine (it's collapsed anyway).
+
+## Background jobs (`plugins/claude/background.py`)
+
+- A job is registered from its Bash launch result (`backgroundTaskId` + its `tasks/<id>.output` path). It ends when a completion event names it, or when a probe reads the exit marker the CLI appends to the output file (`[exited with code N]`, `[killed]`); with no marker, a job past its grace whose file nothing holds open ends as ◼.
+- The panel is its own message, placed per the message-ordering invariant. It lists running jobs, plus each finished job's ✓ / ✗ / ◼ for `FINISHED_LINGER` seconds.
+- `/kill <job>` stops a job through the CLI that owns it: a `stop_task` control request, which kills the job's whole process tree. With no live CLI, `kill_file_holders` (kernel) kills the processes holding the output file, their sessions and their descendants, and refuses a set that reaches the bot's own group or session. Its mid-turn note follows the message-ordering invariant.
 
 ## Mid-session config switching
 

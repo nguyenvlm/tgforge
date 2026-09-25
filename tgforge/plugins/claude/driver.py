@@ -29,6 +29,7 @@ from tgforge.base.kernel import (
     Topic,
     action,
     command,
+    kill_file_holders,
     kill_process_group,
     launch,
     on_message,
@@ -82,6 +83,7 @@ MAX_OUTPUT_MSGS = 8
 ANSWER_SEND_ATTEMPTS = 5  # the turn's answer is essential — retry across flood windows
 ALBUM_DEBOUNCE = 2.0
 RELEASE_IDLE_SEC = 1800
+CONTROL_TIMEOUT = 10.0  # seconds to wait for the CLI's answer to a control request
 UPDATER_INTERVAL = 5.0
 MIRROR_INTERVAL = 3.0
 SHELL_TIMEOUT = 120
@@ -154,13 +156,14 @@ class ClaudeTopic(Topic):
         self.turn_seq = 0  # boundary counter: bumped once per result; stamps each ack's turn
         self.cancel_requested = False
         self.cancel_msg_id: int | None = None  # the "cancelling…" bubble, settled at turn end
+        self.control_waiters: dict[str, asyncio.Future] = {}  # request_id → its response
         self.turn = TurnState()
         self.release_task: asyncio.Task | None = None
         self.background_tasks: dict[str, dict] = {}
         self.background_labels: dict[str, str] = {}
         self.background_probe_at = 0.0
         self.background_updater_task: asyncio.Task | None = None
-        self.background_panel_id: int | None = None  # the running-jobs panel's own message
+        self.background_panel_id: int | None = None  # the background-jobs panel's message
         self.mirror_holder: int | None = None
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
@@ -508,6 +511,9 @@ class ClaudeTopic(Topic):
                     self.release_task.cancel()
                     self.release_task = None
                 t = ev.get("type")
+                if t == "control_response":
+                    self._resolve_control(ev)
+                    continue
                 if not self.busy and not self.pending_writes and t in ("assistant", "stream_event"):
                     await self._open_holder()
                 if t == "rate_limit_event":
@@ -580,6 +586,7 @@ class ClaudeTopic(Topic):
             await self._stop_background_updater()
             await self._warn_interrupted()
             await self._settle_cancel_note()  # a cancel that ended via a dead proc
+            self._fail_control_waiters()
             if self._jsonl().exists():
                 self.mirror_offset = self._jsonl().stat().st_size
             self.proc = None
@@ -604,24 +611,29 @@ class ClaudeTopic(Topic):
                 pass
             self.proc.kill()
 
-    def _running_bg(self) -> bool:
-        return any(t["done"] is None for t in self.background_tasks.values())
-
     async def _paint_panel(self, spin: int) -> bool:
-        """Render the running-jobs panel as its OWN message, never part of the turn's
-        main card, so panel size can never trim the main text. No running jobs → retire
-        the message (the mirror-holder retire pattern). Returns whether the paint landed
-        (for the caller's adaptive cadence)."""
+        """Render the background-jobs panel as its OWN message, never part of the turn's
+        main card, so panel size can never trim the main text. It stays the window's
+        bottom-most message: buried under a later one, it is sent anew and the old one
+        deleted. Nothing to show → retire the message (the mirror-holder retire pattern).
+        Returns whether the paint landed (for the caller's adaptive cadence)."""
         panel = background.panel(self, spin)
         if panel is None:
             if self.background_panel_id is not None:
                 await self.delete(self.background_panel_id, droppable=True)
                 self.background_panel_id = None
             return True
-        if self.background_panel_id is None:
-            self.background_panel_id = await self.send_md(panel[0], panel[1])
-            return self.background_panel_id is not None
-        return await self.edit_md(self.background_panel_id, panel[0], panel[1], droppable=True)
+        old = self.background_panel_id
+        if old is not None and self.latest_message_id() <= old:
+            return await self.edit_md(old, panel[0], panel[1], droppable=True)
+        # absent, or buried under a later message: send it anew at the bottom
+        new_id = await self.send_md(panel[0], panel[1], silent=True)  # a re-send never pings
+        if new_id is None:
+            return False  # keep the old panel (if any) until a paint lands
+        self.background_panel_id = new_id
+        if old is not None:
+            await self.delete(old)  # essential: a dropped delete strands a duplicate
+        return True
 
     def _ensure_background_updater(self):
         if self.background_updater_task is not None and not self.background_updater_task.done():
@@ -642,8 +654,9 @@ class ClaudeTopic(Topic):
                 await asyncio.sleep(wait)
                 spin += 1
                 background.mark_orphans(self)
+                background.prune_finished(self, time.monotonic())
                 landed = await self._paint_panel(spin)
-                if not self._running_bg():
+                if not background.visible_tasks(self, time.monotonic()):
                     break  # _paint_panel already retired the panel message
                 # adaptive cadence (B): back off on a dropped edit, decay back on success
                 if landed:
@@ -848,15 +861,12 @@ class ClaudeTopic(Topic):
         if self._jsonl().exists():
             self.mirror_offset = self._jsonl().stat().st_size
         self.turn = TurnState()
-        # Prune finished jobs: this turn's content already reported their completion, so
-        # they must never linger in the panel or grow the tracking dict without bound.
-        for bid in [b for b, t in self.background_tasks.items() if t["done"] is not None]:
-            del self.background_tasks[bid]
+        background.prune_finished(self, time.monotonic())
         self.background_labels = {}
         # repaint (or retire) the panel as its own message; keep the between-turn updater
-        # running while jobs still run so its elapsed clock and pruning stay live
+        # running while it shows rows so its clock, lingering rows and pruning stay live
         await self._paint_panel(self.spin)
-        if self._running_bg():
+        if background.visible_tasks(self, time.monotonic()):
             self._ensure_background_updater()
         self._save()
 
@@ -888,10 +898,11 @@ class ClaudeTopic(Topic):
                 # skip a no-op repaint when nothing meaningful changed (B): saves edits
                 # during silent tool calls, so we don't spend the per-message rate budget
                 # on a spinner tick. A slow keepalive still advances the elapsed clock.
-                # The running-jobs flag forces a paint when the set toggles (so the panel
-                # message appears/retires promptly); the panel is its own message below.
-                sig = (tokens, tuple(lines), thinking, answer, self._running_bg())
+                # The panel's row outcomes force a paint when a row appears, finishes, or
+                # lingers out (so the panel keeps up promptly); it is its own message below.
                 now = time.monotonic()
+                shown = tuple(t["done"] for t in background.visible_tasks(self, now))
+                sig = (tokens, tuple(lines), thinking, answer, shown)
                 if sig == self._last_paint_sig and now - self._last_paint_at < PANEL_KEEPALIVE:
                     continue
                 head = status_head(self.word_seed, self.spin, elapsed, tokens)
@@ -905,7 +916,7 @@ class ClaudeTopic(Topic):
                 if len(base) > MAX_MSG:  # the main card is bounded by MAX_MSG alone now
                     base = f"{head}\n\n…{base[-(MAX_MSG - len(head) - 5) :]}"
                 landed = await self.edit(self.holder_id, base, droppable=True)
-                await self._paint_panel(self.spin)  # the running-jobs panel, its own message
+                await self._paint_panel(self.spin)  # the background-jobs panel, its own message
                 # adaptive cadence (B): a dropped repaint means we're over the ceiling —
                 # back off multiplicatively; a landed one decays the interval back down
                 if landed:
@@ -1317,20 +1328,46 @@ class ClaudeTopic(Topic):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-    async def _interrupt(self):
+    async def _control(self, subtype: str, **fields) -> str | None:
+        """Write a control request to the live CLI; returns its request_id, or None when
+        no live CLI took it. Its response lands in `control_waiters[request_id]`, which
+        the caller pops."""
         if not (self.proc and self.proc.returncode is None):
-            return
+            return None
+        request_id = uuid.uuid4().hex[:8]
         ctrl = {
             "type": "control_request",
-            "request_id": uuid.uuid4().hex[:8],
-            "request": {"subtype": "interrupt"},
+            "request_id": request_id,
+            "request": {"subtype": subtype, **fields},
         }
+        # registered before the write: the reader may resolve it while drain() yields
+        self.control_waiters[request_id] = asyncio.get_running_loop().create_future()
         try:
             self.proc.stdin.write((json.dumps(ctrl) + "\n").encode())
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, RuntimeError):
-            pass
-        self.cancel_requested = True
+            self.control_waiters.pop(request_id, None)
+            return None
+        return request_id
+
+    def _resolve_control(self, ev: dict) -> None:
+        response = ev.get("response") or {}
+        waiter = self.control_waiters.get(response.get("request_id"))
+        if waiter is not None and not waiter.done():
+            waiter.set_result(response)
+
+    def _fail_control_waiters(self) -> None:
+        """The CLI is gone: every unanswered control request gets an error response."""
+        waiters, self.control_waiters = self.control_waiters, {}
+        for waiter in waiters.values():
+            if not waiter.done():
+                waiter.set_result({"subtype": "error", "error": "the Claude process ended"})
+
+    async def _interrupt(self):
+        request_id = await self._control("interrupt")
+        if request_id is not None:
+            self.control_waiters.pop(request_id, None)  # nobody awaits the answer
+            self.cancel_requested = True
 
     async def _settle_cancel_note(self):
         """Settle the '/cancel' bubble so it never sticks at 'cancelling…'. Bound to
@@ -1365,10 +1402,86 @@ class ClaudeTopic(Topic):
         if running:
             await self.send(
                 f"no running turn to cancel — {running} background job(s) still going; "
-                "they finish on their own"
+                "/kill stops one"
             )
         else:
             await self.send("nothing to cancel — no turn is running")
+
+    @command("/kill", "stop a running background job", icon="🛑")
+    async def kill_job(self, ctx):
+        running = {b: t for b, t in self.background_tasks.items() if t["done"] is None}
+        if not running:
+            await self.send("no running background jobs")
+            return
+        name = (ctx.args or "").strip() if ctx else ""
+        if not name:
+            now = time.monotonic()
+            options = [
+                (f"{t['label'][:40]} · {fmt_duration(int(now - t['start']))}", b)
+                for b, t in running.items()
+            ]
+            bid = await self.menu("🛑 Stop which background job?", options)
+            if bid is None:
+                return
+        else:
+            matches = background.match_jobs(running, name)
+            if len(matches) != 1:
+                labels = ", ".join(running[b]["label"] for b in (matches or running))
+                if matches:
+                    await self.send(f"'{name}' matches several jobs: {labels} — name one")
+                else:
+                    await self.send(f"no running job matches '{name}' — running: {labels}")
+                return
+            bid = matches[0]
+        await self._stop_job(bid)
+
+    async def _stop_job(self, bid: str):
+        """Stop one background job through the CLI that owns it (`stop_task` kills the
+        job's whole process tree); with no live CLI, kill the processes holding its
+        output file instead."""
+        task = self.background_tasks.get(bid)
+        if task is None or task["done"] is not None:
+            await self.send("that job already ended")
+            return
+        label = task["label"]
+        request_id = await self._control("stop_task", task_id=bid)
+        if request_id is not None:
+            waiter = self.control_waiters[request_id]
+            task["stopping"] = True
+            await self._send_turn_note(f"stopping {label}…")
+            try:
+                response = await asyncio.wait_for(waiter, CONTROL_TIMEOUT)
+            except TimeoutError:
+                response = {"subtype": "error", "error": "no answer from Claude"}
+            finally:
+                self.control_waiters.pop(request_id, None)
+            if response.get("subtype") != "success":
+                task["stopping"] = False
+                await self.send(
+                    f"couldn't stop {label}: {response.get('error') or 'unknown error'}"
+                )
+            return
+        try:
+            signalled = await kill_file_holders(task["path"])
+        except RuntimeError as exc:
+            LOGGER.error("kill (%s): refused for %s: %s", self.name, bid, exc)
+            await self.send(f"refused to stop {label}: {exc}")
+            return
+        if signalled is None:
+            await self.send(f"can't stop {label} — no live Claude session to ask")
+        elif signalled == 0:
+            await self.send(f"{label} has no running processes left")
+        else:
+            task["stopping"] = True
+            await self.send(f"stopping {label}… ({signalled} process(es))")
+
+    async def _send_turn_note(self, text: str):
+        """Send a note from a command; mid-turn, move the live card below it so the
+        turn's finalized reply stays the bottom-most of the turn's messages."""
+        async with self.lock:  # atomic vs the finalize boundary
+            await self.send(text)
+            if self.busy and self.holder_id is not None:
+                await self._reorder_holder()
 
     def _fresh_session(self) -> str:
         """Reset to a brand-new session id (old transcript stays resumable); returns
