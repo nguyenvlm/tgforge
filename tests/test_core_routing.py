@@ -395,3 +395,15 @@ def test_general_ignores_unmentioned(tmp_path):
         assert len(core.bot.sent) == before
 
     asyncio.run(scenario())
+
+
+def test_replayed_message_without_an_id_still_routes(tmp_path):
+    """A tapped suggestion whose ☑️ record send failed replays with no message id."""
+
+    async def scenario():
+        core = _core(tmp_path)
+        inst = await core.open_window(100, ShellTopic, "work")
+        await core.route_as_user(inst.thread_id, "hello", reply_to=None)
+        assert ("msg", "hello") in EVENTS
+
+    asyncio.run(scenario())

@@ -206,3 +206,33 @@ def test_updater_retires_the_panel_once_the_last_row_lingers_out(tmp_path, monke
         assert t.background_tasks == {}  # and forgotten
 
     asyncio.run(scenario())
+
+
+def test_heartbeat_repaints_the_panel_when_a_row_finishes(tmp_path, monkeypatch):
+    """Nothing else in the turn changes, yet a job's ✓ must reach the panel now, not
+    at the next keepalive."""
+
+    async def scenario():
+        import tgforge.plugins.claude.driver as drv
+
+        monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.01)
+        c = TestClient(home=str(tmp_path))
+        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t.busy = True
+        t.holder_id = await t.send("⠋ working…")
+        t.turn_start = t.last_reader_event = asyncio.get_event_loop().time()
+        out = tmp_path / "job.output"
+        out.write_text("working\n")
+        t.background_tasks = {
+            "j": {"done": None, "start": time.monotonic(), "label": "job", "path": str(out)}
+        }
+        t.heartbeat_task = asyncio.create_task(t._heartbeat())
+        await asyncio.sleep(0.1)  # the first paint lands; later ticks are no-ops
+        t.background_tasks["j"].update(done="✓", done_at=time.monotonic())
+        await asyncio.sleep(0.1)
+        await t._stop_heartbeat()
+
+        panel_paints = [txt for _mid, txt in c.bot.edits] + c.replies
+        assert any("✓ job" in txt for txt in panel_paints)
+
+    asyncio.run(scenario())
