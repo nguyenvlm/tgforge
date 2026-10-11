@@ -25,6 +25,17 @@ def claude_bin() -> str:
     return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
 
 
+def system_prompt_file(workspace: Path) -> Path | None:
+    """The nearest system_prompt.txt at or above the workspace — the same lookup
+    the interactive shell wrapper (setup.py) does, so bot turns and CLI sessions
+    run under one system prompt."""
+    for directory in (workspace, *workspace.parents):
+        candidate = directory / "system_prompt.txt"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 # ── Workspace roots ────────────────────────────────────────────────
 
 
