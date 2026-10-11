@@ -56,6 +56,7 @@ from tgforge.plugins.claude.config import (
     claude_bin,
     claude_dir,
     resolve_roots,
+    system_prompt_file,
 )
 from tgforge.plugins.claude.events import (
     has_background_launch,
@@ -340,6 +341,9 @@ class ClaudeTopic(Topic):
             cmd += ["--effort", self.effort]
         cmd += ["--session-id", self.session_id] if is_new else ["--resume", self.session_id]
         cmd += ["--permission-mode", self.plugin.permission_mode]
+        prompt_file = system_prompt_file(Path(self.workspace))
+        if prompt_file is not None:
+            cmd += ["--system-prompt-file", str(prompt_file)]
         env = self._login_env(self._session_config_dir())
         env["TELEGRAM_THREAD_ID"] = str(self.thread_id or 0)
         env["TELEGRAM_BOT_DRIVEN"] = "1"
