@@ -66,13 +66,14 @@ def test_kill_process_group_kills_what_the_shell_started(tmp_path):
         os.kill(child, 0)  # alive before the kill
         await kill_process_group(proc)
         for _ in range(100):
+            # gone = no /proc entry (reaped) or a zombie; a reap can land between
+            # any two reads, so one read decides
             try:
-                os.kill(child, 0)
-            except ProcessLookupError:
+                with open(f"/proc/{child}/stat") as stat:
+                    if stat.read().split()[2] == "Z":
+                        return
+            except FileNotFoundError:
                 return
-            with open(f"/proc/{child}/stat") as stat:
-                if stat.read().split()[2] == "Z":
-                    return
             await asyncio.sleep(0.02)
         raise AssertionError("the shell's child survived the group kill")
 
