@@ -150,3 +150,22 @@ def test_a_mid_turn_fold_moves_the_card_below_the_message(tmp_path):
         await asyncio.wait_for(reader, 5)
 
     asyncio.run(scenario())
+
+
+def test_a_failed_card_move_keeps_the_old_card(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        t._open_holder()
+        await drain(c, t)
+        card = t.turn.card_id
+
+        async def rejected(chat_id, text, **kw):
+            return None  # an API error: no new card
+
+        t._core._call = lambda make_coro, **kw: rejected(None, None)
+        await asyncio.wait_for(t._reorder_holder(), 2)
+        assert t.turn.card_id == card  # still the live card
+        assert card not in c.bot.deleted  # never deleted without a replacement
+
+    asyncio.run(scenario())

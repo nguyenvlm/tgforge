@@ -107,10 +107,20 @@ def test_the_shell_offers_the_agents_workspace_roots(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
     write_roots(tmp_path, [str(root)])  # what the wizard / `tgforge workspaces` write
-    assert Shell().workspace_roots(tmp_path) == [root.resolve()]
-    assert Shell(roots=[str(tmp_path)]).workspace_roots(tmp_path) == [root.resolve()]
+    alone = TestClient(Shell(), home=str(tmp_path))  # no claude plugin in the app
+    assert alone.core.plugin_by_id["shell"].workspace_roots(alone.core) == [root.resolve()]
     write_roots(tmp_path, [])
-    assert Shell(roots=[str(root)]).workspace_roots(tmp_path) == [root.resolve()]
+    own = TestClient(Shell(roots=[str(root)]), home=str(tmp_path))
+    assert own.core.plugin_by_id["shell"].workspace_roots(own.core) == [root.resolve()]
+
+
+def test_the_shell_offers_a_configured_claude_plugins_roots(tmp_path):
+    from tgforge.plugins.claude import Claude
+
+    root = tmp_path / "project"
+    root.mkdir()
+    c = TestClient(Claude(roots=[str(root)]), Shell(), home=str(tmp_path))  # nothing saved
+    assert c.core.plugin_by_id["shell"].workspace_roots(c.core) == [root.resolve()]
 
 
 def test_the_shell_window_starts_in_the_agents_root(tmp_path):

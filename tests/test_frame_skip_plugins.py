@@ -161,3 +161,21 @@ def test_an_explicit_rename_skips_the_rename_spacing(tmp_path, monkeypatch):
         assert c.core._names()[THREAD] == "🤖 My topic"
 
     asyncio.run(scenario())
+
+
+def test_a_chatty_one_shot_command_finishes_well_inside_the_timeout(tmp_path, monkeypatch):
+    """200k short lines: the pump renders at most one frame per interval, so the
+    command's own speed decides, not rendering on the event loop."""
+    monkeypatch.setattr(drv, "SHELL_TIMEOUT", 5)
+
+    async def scenario():
+        c = client(tmp_path)
+        window(c, tmp_path)
+        started = time.monotonic()
+        await c.send("!seq 1 200000", thread_id=THREAD)
+        await asyncio.wait_for(c.settle(), 30)
+        final = c.edits[-1]
+        assert "exit 0" in final and "200000" in final
+        assert time.monotonic() - started < 5
+
+    asyncio.run(scenario())

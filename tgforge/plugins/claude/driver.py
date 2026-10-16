@@ -11,6 +11,7 @@ render/events/session/background modules.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import json
 import logging
@@ -85,6 +86,7 @@ UPDATER_INTERVAL = 5.0
 MIRROR_INTERVAL = 3.0
 SHELL_TIMEOUT = 120
 SHELL_KEEP_CHARS = 2 * MAX_MSG  # the ! output tail kept (the view shows a MAX_MSG tail)
+SHELL_READ_SIZE = 65536  # bytes per read of the ! output pipe
 PANEL_FRAME = "background"  # the bottom frame holding the background-jobs panel
 
 # Claude CLI --permission-mode values, passed on every spawn. The app default is
@@ -376,7 +378,7 @@ class ClaudeTopic(Topic):
         """Run `step` (a zero-arg coroutine factory that sends/deletes this window's
         messages) after every step queued before it, as its own task, and return the
         task. Every message of the window goes through here (directly, or via the
-        `send`/`delete` family and `_in_order`), so the order on screen is the order of
+        `send`/`delete` family and `run_message_call`), so the order on screen is the order of
         the queue and no reader or loop ever waits on Telegram."""
         previous = self.send_chain
 
@@ -394,10 +396,10 @@ class ClaudeTopic(Topic):
         task.add_done_callback(self.send_steps.discard)
         return task
 
-    async def _in_order(self, call):
-        """Run `call` (a Telegram call that creates or deletes a message) as a send step
-        and return its result; directly when already inside one (a step never waits on
-        a later step). Every message call of this window funnels here."""
+    async def run_message_call(self, call):
+        """Every message this window posts or deletes (its `send` family, and the
+        kernel's menus and prompts) runs as a send step, returning its result; directly
+        when already inside one (a step never waits on a later step)."""
         if asyncio.current_task() in self.send_steps:
             return await call()
         done = asyncio.get_running_loop().create_future()
@@ -412,32 +414,6 @@ class ClaudeTopic(Topic):
         # a step cancelled (the window closed), even before it started, releases its caller
         task.add_done_callback(lambda _task: done.done() or done.cancel())
         return await done
-
-    async def send(self, text, reply_to=None):
-        return await self._in_order(lambda: Topic.send(self, text, reply_to=reply_to))
-
-    async def send_rich(self, text, reply_to=None, reply_markup=None):
-        return await self._in_order(
-            lambda: Topic.send_rich(self, text, reply_to=reply_to, reply_markup=reply_markup)
-        )
-
-    async def send_md(self, md, plain, reply_to=None, silent=False, reply_markup=None):
-        return await self._in_order(
-            lambda: Topic.send_md(
-                self, md, plain, reply_to=reply_to, silent=silent, reply_markup=reply_markup
-            )
-        )
-
-    async def send_file(self, path):
-        return await self._in_order(lambda: Topic.send_file(self, path))
-
-    async def send_photo(self, media_type, b64, reply_markup=None):
-        return await self._in_order(
-            lambda: Topic.send_photo(self, media_type, b64, reply_markup=reply_markup)
-        )
-
-    async def delete(self, msg_id) -> None:
-        await self._in_order(lambda: Topic.delete(self, msg_id))
 
     async def _sent(self) -> None:
         """Wait until every queued send step has run."""
@@ -575,20 +551,17 @@ class ClaudeTopic(Topic):
         lines, _, _ = render_timeline(turn.timeline, drop_last_text=False)
         pages = expandable_pages(self._summary(turn, time.monotonic()), lines)
         md, plain = pages[0]
-        await self.show_frame(
-            turn.card_id, f"{plain}\n\n{note}", f"{md}\n\n{mdv2_escape(note)}", must_land=True
-        )
+        await self.land_frame(turn.card_id, f"{plain}\n\n{note}", f"{md}\n\n{mdv2_escape(note)}")
 
     def _warn_interrupted(self):
         """Flag a turn cut short by a dead process — but stay silent on a graceful
         bot restart, which re-adopts the session (nothing was lost, no alarm needed)."""
         card_id = self.turn.card_id
         if self.turn_open and card_id is not None and not self._core.shutting_down:
-            self.show_frame(
+            self.land_frame(
                 card_id,
                 "⚠️ the session process exited mid-turn — nothing on disk was lost. "
                 "Send your message again to retry, or /cli to resume on the PC.",
-                must_land=True,
             )
 
     async def _reader(self):
@@ -808,9 +781,6 @@ class ClaudeTopic(Topic):
     async def _stop_heartbeat(self):
         await self._quiesce("heartbeat_task")
 
-    async def _stop_background_updater(self):
-        await self._quiesce("background_updater_task")
-
     # ── Turn boundary + settle ─────────────────────────────────────
     async def _finalize_turn(
         self, result_text, subtype="success", is_error=False, context_window=None
@@ -871,7 +841,7 @@ class ClaudeTopic(Topic):
         md, plain = pages[0]
         landed = False
         if card_id is not None:
-            landed = await self.show_frame(card_id, plain, md, must_land=True)
+            landed = await self.land_frame(card_id, plain, md)
             if not landed:
                 await self.delete(card_id)
         if not landed:
@@ -2002,17 +1972,21 @@ class Claude(Plugin):
             )
 
             async def pump():
-                # only reads and records: the view is a frame, never waited on
-                kept = 0
+                # only reads and records: a frame at most every EDIT_INTERVAL, never
+                # waited on; the output is read in whatever chunks the pipe holds
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                kept, last = 0, 0.0
                 while True:
-                    ln = await proc.stdout.readline()
-                    if not ln:
+                    data = await proc.stdout.read(SHELL_READ_SIZE)
+                    if not data:
                         break
-                    buf.append(ln.decode(errors="replace"))
+                    buf.append(decoder.decode(data))
                     kept += len(buf[-1])
-                    while kept - len(buf[0]) >= SHELL_KEEP_CHARS:
+                    while len(buf) > 1 and kept - len(buf[0]) >= SHELL_KEEP_CHARS:
                         kept -= len(buf.pop(0))
-                    if hid is not None:
+                    now = time.monotonic()
+                    if hid is not None and now - last >= EDIT_INTERVAL:
+                        last = now
                         topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
 
             await asyncio.wait_for(pump(), timeout=SHELL_TIMEOUT)
@@ -2032,7 +2006,7 @@ class Claude(Plugin):
                 await reap(proc)  # never leave the shell child running on any exit path
         result = shell_view(cmd, buf, status)
         if hid is not None:
-            await topic.show_frame(hid, result, shell_md(cmd, buf, status), must_land=True)
+            await topic.land_frame(hid, result, shell_md(cmd, buf, status))
         payload = f"[shell result]\n{result}"
         if chain:
             await topic.submit(payload)

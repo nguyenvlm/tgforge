@@ -106,3 +106,44 @@ def test_closing_the_window_releases_a_waiting_send(tmp_path):
             await asyncio.wait_for(waiting, 2)  # released, not hung
 
     asyncio.run(scenario())
+
+
+def test_a_kill_menu_opened_during_a_settle_waits_for_it(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        t.background_tasks = {
+            "b1": {
+                "path": str(tmp_path / "b1.output"),
+                "label": "a job",
+                "start": 0.0,
+                "done": None,
+            }
+        }
+        release = await _settling(c, t)
+        menu = asyncio.create_task(t.kill_job(None))  # no name: the job picker menu
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.sleep(0.05)
+        await drain(c, t)
+        assert _below_every_answer(c, "🛑 Stop which background job?")
+        menu.cancel()
+        await asyncio.gather(menu, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_the_help_reply_in_a_claude_window_waits_for_the_settle(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        release = await _settling(c, t)
+        task = asyncio.create_task(c.core._unhandled(c.core.chat_id, THREAD))
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.wait_for(task, 5)
+        await drain(c, t)
+        help_text = c.core.help_text(THREAD)
+        assert _below_every_answer(c, help_text)
+
+    asyncio.run(scenario())

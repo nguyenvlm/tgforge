@@ -172,8 +172,7 @@ class ShellTopic(PtyWindow):
         await self._kill()
 
     async def _pick_cwd(self) -> str:
-        home = self._core.config.home_path
-        roots = self.plugin.workspace_roots(home) if self.plugin else []
+        roots = self.plugin.workspace_roots(self._core) if self.plugin else []
         if not roots:
             return str(self._core.config.home_path)
         if len(roots) == 1:
@@ -345,10 +344,12 @@ class Shell(Plugin):
     def __init__(self, roots=None):
         self._roots = list(roots) if roots else []
 
-    def workspace_roots(self, home: Path) -> list[Path]:
-        """The agent's workspace roots — the ones the install wizard, `tgforge
-        workspaces` and `/workspace` write (the claude plugin's store in the bot home's
-        state.db) — else the roots this plugin was built with; empty means the window
-        falls back to home."""
-        globs = read_roots(home) or self._roots
-        return resolve_roots(globs)
+    def workspace_roots(self, core) -> list[Path]:
+        """The agent's workspace roots: the live claude plugin's (saved edits or its
+        `Claude(roots=[...])`), else the ones the install wizard / `tgforge workspaces`
+        saved in the bot home's state.db, else the roots this plugin was built with;
+        empty means the window falls back to home."""
+        agent = core.plugin_by_id.get("claude")
+        if agent is not None and agent.workspaces:
+            return list(agent.workspaces)
+        return resolve_roots(read_roots(core.config.home_path) or self._roots)

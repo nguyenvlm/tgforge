@@ -45,3 +45,23 @@ def test_finished_job_drops_off_after_the_linger(tmp_path):
     assert "background · 1 job" in plain and "finished" not in plain
     background.prune_finished(s, time.monotonic())
     assert list(s.background_tasks) == ["run"]
+
+
+def test_many_jobs_trim_the_oldest_rows_to_fit_one_message(tmp_path):
+    from tgforge.base.ui import MAX_MSG
+
+    out = tmp_path / "bid.output"
+    out.write_text("x" * 50 + "\n")
+    now = time.monotonic()
+    session = SimpleNamespace(
+        background_tasks={
+            f"b{i}": {"path": str(out), "label": f"job {i:03d}", "start": now, "done": None}
+            for i in range(200)
+        },
+        background_labels={},
+        background_probe_at=0.0,
+    )
+    md, plain = background.panel(session, 0)
+    assert len(md) <= MAX_MSG
+    assert "older job(s) hidden" in plain
+    assert "job 199" in plain and "job 000" not in plain  # the oldest go first

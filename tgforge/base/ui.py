@@ -98,7 +98,22 @@ def expandable_pages(
     """Fold `entries` into as few collapsed expandable messages as fit, nothing cut:
     page 1 shows `header`, the rest `↳ i/n`; an entry too long for one message is split
     across messages. Returns (md, plain) per page, each within `limit`."""
-    cont = "↳ 99/99"  # the longest continuation header, so packing never overflows
+    count = 1
+    while True:  # pack against the longest `↳ i/n` the page count needs, until it holds
+        cont = f"↳ {count}/{count}"
+        pages = _pack_pages(header, cont, entries, limit)
+        if len(pages) <= count:
+            break
+        count = len(pages)
+    out = []
+    for i, page in enumerate(pages):
+        head = header if i == 0 else f"↳ {i + 1}/{len(pages)}"
+        body = "\n\n".join(page)
+        out.append((expandable(head, body), head + (f"\n\n{body}" if body else "")))
+    return out
+
+
+def _pack_pages(header: str, cont: str, entries: list[str], limit: int) -> list[list[str]]:
     parts: list[str] = []
     for entry in entries:
         parts.extend(_split_to_fit(entry, max(header, cont, key=len), limit))
@@ -108,12 +123,7 @@ def expandable_pages(
         if pages[-1] and len(expandable(head, "\n\n".join([*pages[-1], part]))) > limit:
             pages.append([])
         pages[-1].append(part)
-    out = []
-    for i, page in enumerate(pages):
-        head = header if i == 0 else f"↳ {i + 1}/{len(pages)}"
-        body = "\n\n".join(page)
-        out.append((expandable(head, body), head + (f"\n\n{body}" if body else "")))
-    return out
+    return pages
 
 
 def _split_to_fit(entry: str, head: str, limit: int) -> list[str]:

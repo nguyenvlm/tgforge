@@ -118,9 +118,9 @@ def test_a_frame_future_reports_landed_and_rejected():
     async def scenario():
         bot = _Bot()
         t = Transport(bot=bot)
-        assert await t.show_frame(1, 50, "ok") is True
+        assert await t.land_frame(1, 50, "ok") is True
         bot.reject.add("edit")
-        assert await t.show_frame(1, 51, "gone") is False  # Telegram rejected the edit
+        assert await t.land_frame(1, 51, "gone") is False  # Telegram rejected the edit
 
     asyncio.run(scenario())
 
@@ -131,7 +131,7 @@ def test_a_must_land_frame_survives_a_flood_and_is_pushed_first():
         t = Transport(bot=bot)
         bot.flood["edit"] = [0.05]
         t.show_frame(1, 50, "spinner")
-        final = t.show_frame(1, 60, "final", must_land=True)
+        final = t.land_frame(1, 60, "final")
         assert await final is True  # pending through the flood-wait until it landed
         assert bot.texts("edit")[0] == "final"  # ahead of the older live frame
 
@@ -142,7 +142,7 @@ def test_deleting_a_message_drops_its_pending_frame():
     async def scenario():
         bot = _Bot()
         t = Transport(bot=bot)
-        waiter = t.show_frame(1, 50, "never shown")
+        waiter = t.land_frame(1, 50, "never shown")
         await t.delete_msg(1, 50)
         await t.flush_frames()
         assert bot.texts("edit") == []
@@ -292,5 +292,182 @@ def test_closing_a_window_forgets_its_frames_and_title(tmp_path):
         await c.core.close_window(inst.thread_id)
         assert inst.bottom_frame_id("panel") is None
         assert inst.thread_id not in c.core._titles
+
+    asyncio.run(scenario())
+
+
+# ── Review round 2 ─────────────────────────────────────────────────
+
+
+class _SlowEditBot(_Bot):
+    async def edit_message_text(self, text, **kw):
+        await asyncio.sleep(0.05)  # the HTTP round trip
+        return await super().edit_message_text(text, **kw)
+
+
+def test_a_flood_recorded_during_the_slot_wait_holds_the_essential_call():
+    """A frame push takes the only slot and gets a flood-wait while an essential send
+    sleeps in the pacer: the send re-checks the deadline and waits it out."""
+
+    async def scenario():
+        bot = _SlowEditBot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=1)  # refill every 0.1 s
+        bot.flood["edit"] = [0.5]
+        t.show_frame(1, 50, "frame")  # the frame push takes the only token
+        await asyncio.sleep(0.01)
+        await asyncio.wait_for(t.send(1, "reply", thread_id=7), 5)
+        sent_at = next(at for at, method, _ in bot.calls if method == "send")
+        assert sent_at >= t.flood_until - 0.01  # not inside the flood window
+
+    asyncio.run(scenario())
+
+
+def test_a_flood_recorded_during_a_frames_slot_wait_holds_the_frame():
+    """The frame task sleeps for a spare slot; a flood recorded meanwhile (set here
+    directly: the deadline is all the check reads) holds the push until it ends."""
+
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=1)  # refill every 0.1 s
+        t._pacer.tokens = 0  # the frame must wait for a slot
+        t.show_frame(1, 50, "frame")
+        await asyncio.sleep(0.02)  # the frame task is in its slot wait
+        t.flood_until = time.monotonic() + 0.4
+        await asyncio.wait_for(t.flush_frames(), 5)
+        pushed_at = next(at for at, method, _ in bot.calls if method == "edit")
+        assert pushed_at >= t.flood_until - 0.01
+
+    asyncio.run(scenario())
+
+
+def test_a_must_land_frame_keeps_its_priority_after_a_flood():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        bot.flood["edit"] = [0.2]
+        t.show_frame(1, 60, "live view A")
+        t.show_frame(1, 70, "live view B")
+        final = t.land_frame(1, 50, "final")  # pushed first, flood-waited
+        assert await asyncio.wait_for(final, 5) is True
+        assert bot.texts("edit")[:2] == ["final", "final"]  # retried before A and B
+
+    asyncio.run(scenario())
+
+
+def test_a_live_frame_creates_no_future():
+    async def scenario():
+        t = Transport(bot=_Bot())
+        assert t.show_frame(1, 50, "live") is None
+        assert t._frames[("msg", 1, 50)].waiters == []  # nothing accumulates per frame
+        await t.flush_frames()
+
+    asyncio.run(scenario())
+
+
+def test_a_window_closed_with_a_pending_message_frame_pushes_nothing(tmp_path):
+    from tgforge.base.kernel import _CoreTopic
+    from tgforge.testing import TestClient
+
+    async def scenario():
+        c = TestClient(home=str(tmp_path))
+        inst = await c.core.open_window(c.core.chat_id, _CoreTopic, "w")
+        c.core.flood_until = time.monotonic() + 0.2  # hold the frame task
+        inst.show_frame(4242, "a view never shown")
+        await c.core.close_window(inst.thread_id)
+        await asyncio.wait_for(c.core.flush_frames(), 2)
+        assert all(mid != 4242 for mid, _ in c.bot.edits)
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_bottom_re_send_is_retried_without_a_later_update():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        failures = {"left": 1}
+        real_send = bot.send_message
+
+        async def send(chat_id, text, **kw):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise _Rejected("Bad Request: something transient")
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send
+        t.show_bottom_frame(1, 7, "panel", "rows")  # one record, no later tick
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert t.bottom_frame_id("panel") is not None
+
+    asyncio.run(scenario())
+
+
+def test_a_lasting_bottom_re_send_failure_stops_retrying():
+    from tgforge.base.kernel import BOTTOM_RESEND_ATTEMPTS
+
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        bot.reject.add("send")
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await asyncio.wait_for(t.flush_frames(), 2)  # returns: no endless retry
+        assert len(bot.texts("send")) == BOTTOM_RESEND_ATTEMPTS
+        assert t.bottom_frame_id("panel") is None
+
+    asyncio.run(scenario())
+
+
+def test_a_flood_waited_delete_of_the_buried_panel_copy_is_retried():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        bot.flood["delete"] = [0.05]
+        await t.send(1, "a later message", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.texts("delete").count(first) == 2  # flooded, then deleted
+
+    asyncio.run(scenario())
+
+
+def test_a_flood_waited_retire_delete_is_retried():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        sent = t.bottom_frame_id("panel")
+        bot.flood["delete"] = [0.05]
+        t.show_bottom_frame(1, 7, "panel", None)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.texts("delete") == [sent, sent]
+        assert t.bottom_frame_id("panel") is None
+
+    asyncio.run(scenario())
+
+
+def test_a_markdown_rejected_panel_re_sends_plain_through_a_flood():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        calls = []
+        real_send = bot.send_message
+        floods = {"plain": 1}
+
+        async def send(chat_id, text, **kw):
+            calls.append(kw.get("parse_mode"))
+            if kw.get("parse_mode") == "MarkdownV2":
+                raise _Rejected("Bad Request: can't parse entities")
+            if floods["plain"]:
+                floods["plain"] -= 1
+                raise _Flood(0.05)
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send
+        t.show_bottom_frame(1, 7, "panel", "rows", "*rows*")
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert t.bottom_frame_id("panel") is not None  # the plain copy landed
+        assert calls[:2] == ["MarkdownV2", None]  # md refused, plain flooded, then retried
 
     asyncio.run(scenario())

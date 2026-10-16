@@ -125,3 +125,10 @@ def screen(c: TestClient, thread: int = THREAD) -> list[tuple[int, str]]:
 
 def texts(c: TestClient, thread: int = THREAD) -> list[str]:
     return [text for _mid, text in screen(c, thread)]
+
+
+async def cancel_task(task) -> None:
+    """Stop a background task (the updater, a painter) and let it unwind."""
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

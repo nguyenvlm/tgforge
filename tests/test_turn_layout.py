@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from claude_fakes import (
     FakeProc,
     assistant_text,
+    cancel_task,
     client,
     drain,
     replay,
@@ -244,7 +245,7 @@ def test_order_is_folds_then_answer_then_attachments_then_panel(tmp_path):
         assert kinds[-3:] == ["answer", "file", "panel"]
         assert kinds[: kinds.index("answer")] == ["fold"] * kinds.index("answer")
         assert kinds.count("panel") == 1
-        await t._stop_background_updater()
+        await cancel_task(t.background_updater_task)
 
     asyncio.run(scenario())
 
@@ -423,3 +424,16 @@ def test_a_late_settle_keeps_the_next_turns_launch_labels(tmp_path):
         assert t.background_labels == {"t9": "the next turn's job"}
 
     asyncio.run(scenario())
+
+
+def test_a_hundred_page_timeline_keeps_every_page_within_a_message():
+    """Entries sized to fill a page exactly under a 2-digit `↳ 99/99` header: past 99
+    pages the 3-digit header must still fit, so packing sizes it on the real count."""
+    from tgforge.base.ui import expandable, expandable_pages
+
+    size = next(n for n in range(MAX_MSG, 0, -1) if len(expandable("↳ 99/99", "x" * n)) <= MAX_MSG)
+    pages = expandable_pages("🔧 120", ["x" * size] * 120)
+    assert len(pages) >= 100
+    assert all(len(md) <= MAX_MSG for md, _plain in pages)  # 3-digit headers fit too
+    assert sum(md.count("x") for md, _plain in pages) == 120 * size  # nothing lost
+    assert pages[-1][1].startswith(f"↳ {len(pages)}/{len(pages)}")

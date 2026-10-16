@@ -9,7 +9,7 @@ import asyncio
 import time
 
 from aiogram.exceptions import TelegramRetryAfter
-from claude_fakes import FakeProc, client, drain, result, screen, window
+from claude_fakes import FakeProc, cancel_task, client, drain, result, screen, window
 
 from tgforge.plugins.claude import background
 from tgforge.plugins.claude import driver as drv
@@ -52,7 +52,7 @@ def test_a_later_message_re_anchors_the_panel_after_the_cli_process_ended(tmp_pa
         t.pending_writes = []
         await asyncio.wait_for(t._reader(), 5)  # idle → the CLI process is ended
         await drain(c, t)
-        await t._stop_background_updater()
+        await cancel_task(t.background_updater_task)
         assert t.proc is None and t.heartbeat_task is None
 
         reply = await t.send("a command reply, after the turn")
@@ -70,7 +70,7 @@ def test_the_cli_process_ending_leaves_the_updater_running(tmp_path):
         t.proc = FakeProc([])  # the process ends with no turn to settle
         await asyncio.wait_for(t._reader(), 5)
         assert t.background_updater_task is not None  # the panel's clock keeps ticking
-        await t._stop_background_updater()
+        await cancel_task(t.background_updater_task)
 
     asyncio.run(scenario())
 
@@ -195,6 +195,6 @@ def test_a_registered_job_starts_the_updater_mid_turn(tmp_path):
         assert "background · 1 job" in dict(screen(c))[_panel_id(t)]
         hold.set()
         await asyncio.wait_for(reader, 5)
-        await t._stop_background_updater()
+        await cancel_task(t.background_updater_task)
 
     asyncio.run(scenario())

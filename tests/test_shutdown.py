@@ -61,7 +61,7 @@ def test_broadcast_shutdown_flags_settles_and_flushes(tmp_path):
         c = TestClient(Claude(), home=str(tmp_path))
         t = _topic(c)
         c.core.instances[t.thread_id] = t
-        pending = c.core.show_frame(c.core.chat_id, 77, "a live view")
+        pending = c.core.land_frame(c.core.chat_id, 77, "a final view")
         await c.core.broadcast_shutdown()
         assert c.core.shutting_down is True
         assert t.turn_open is False  # on_shutdown ran

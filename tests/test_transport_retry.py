@@ -8,9 +8,14 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 
-from tgforge.base.kernel import Transport
+from tgforge.base.kernel import TRANSIENT_BACKOFF, TRANSIENT_RETRIES, Transport
 
 
 class _Flood(TelegramRetryAfter):
@@ -32,6 +37,22 @@ def _flooding(n, retry_after=0):
     return attempt, state
 
 
+def _fake_clock(monkeypatch, start=1000.0):
+    """A clock that advances only when the code sleeps; returns the recorded sleeps."""
+    clock = {"t": start}
+    monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: clock["t"])
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        clock["t"] += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return slept
+
+
 def test_call_reissues_after_flood_wait():
     async def scenario():
         t = Transport(bot=SimpleNamespace())
@@ -48,23 +69,20 @@ def test_essential_waits_the_full_retry_after_then_lands_once(monkeypatch):
     fails again and loses the message after an extra API hit."""
 
     async def scenario():
-        slept = []
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: slept.append(s) or real_sleep(0))
+        slept = _fake_clock(monkeypatch)
         t = Transport(bot=SimpleNamespace())
         attempt, state = _flooding(1, retry_after=45)
         out = await t._call(lambda: attempt())
         assert out == "sent"
         assert state["calls"] == 2  # one flooded attempt, one that landed
-        assert len(slept) == 1 and slept[0] > 44  # the full 45 s, not a 30 s cap
+        assert slept == [45]  # the full 45 s in one wait, not a 30 s cap
 
     asyncio.run(scenario())
 
 
 def test_essential_retries_until_it_lands(monkeypatch):
     async def scenario():
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+        _fake_clock(monkeypatch)
         t = Transport(bot=SimpleNamespace())
         attempt, state = _flooding(4, retry_after=1)
         assert await t._call(lambda: attempt()) == "sent"  # never given up on
@@ -78,8 +96,7 @@ def test_essential_calls_go_out_in_issue_order(monkeypatch):
     in order, never ahead of it."""
 
     async def scenario():
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+        _fake_clock(monkeypatch)
         order = []
         floods = {"first": 1}
 
@@ -124,12 +141,85 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
 
 def test_flood_records_the_exact_deadline(monkeypatch):
     async def scenario():
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
-        monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: 1000.0)
+        _fake_clock(monkeypatch)
         t = Transport(bot=SimpleNamespace())
         attempt, _ = _flooding(1, retry_after=300)
         assert await t._call(lambda: attempt()) == "sent"
         assert t.flood_until == 1300.0  # the exact retry_after deadline
+
+    asyncio.run(scenario())
+
+
+class _ServerError(TelegramServerError):
+    def __init__(self):
+        self.message = "Internal Server Error"
+
+    def __str__(self):
+        return self.message
+
+
+class _NetworkError(TelegramNetworkError):
+    def __init__(self):
+        self.message = "connection reset"
+
+    def __str__(self):
+        return self.message
+
+
+class _BadRequest(TelegramBadRequest):
+    def __init__(self):
+        self.message = "Bad Request: chat not found"
+
+    def __str__(self):
+        return self.message
+
+
+def _failing(errors):
+    """A factory raising each error in turn, then returning 'sent'."""
+    state = {"calls": 0}
+
+    async def attempt():
+        state["calls"] += 1
+        if errors:
+            raise errors.pop(0)
+        return "sent"
+
+    return attempt, state
+
+
+def test_a_5xx_or_network_error_is_retried_with_backoff(monkeypatch, caplog):
+    import logging
+
+    async def scenario():
+        slept = _fake_clock(monkeypatch)
+        t = Transport(bot=SimpleNamespace())
+        attempt, state = _failing([_ServerError(), _NetworkError()])
+        with caplog.at_level(logging.WARNING, logger="tgforge"):
+            assert await t._call(lambda: attempt()) == "sent"
+        assert state["calls"] == 3
+        assert slept == [TRANSIENT_BACKOFF, 2 * TRANSIENT_BACKOFF]
+        assert sum("retry in" in r.getMessage() for r in caplog.records) == 2
+
+    asyncio.run(scenario())
+
+
+def test_a_lasting_5xx_gives_up_after_the_bound(monkeypatch):
+    async def scenario():
+        _fake_clock(monkeypatch)
+        t = Transport(bot=SimpleNamespace())
+        attempt, state = _failing([_ServerError() for _ in range(10)])
+        assert await t._call(lambda: attempt()) is None
+        assert state["calls"] == TRANSIENT_RETRIES + 1
+
+    asyncio.run(scenario())
+
+
+def test_a_4xx_gets_one_try(monkeypatch):
+    async def scenario():
+        _fake_clock(monkeypatch)
+        t = Transport(bot=SimpleNamespace())
+        attempt, state = _failing([_BadRequest()])
+        assert await t._call(lambda: attempt()) is None
+        assert state["calls"] == 1
 
     asyncio.run(scenario())
