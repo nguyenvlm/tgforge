@@ -37,15 +37,17 @@ class Gcloud(Plugin):
             if choice is None:
                 return
             adc = choice == "adc"
-        cmd = "env -u DISPLAY -u WAYLAND_DISPLAY gcloud auth login --no-launch-browser"
+        cmd = ["env", "-u", "DISPLAY", "-u", "WAYLAND_DISPLAY", "gcloud", "auth", "login"]
+        cmd.append("--no-launch-browser")
         if adc:
-            cmd += " --update-adc"
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
+            cmd.append("--update-adc")
+        proc = await ctx.spawn(  # reaped with the window if it closes mid-sign-in
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=_login_env(),
+            start_new_session=True,  # a reap kills whatever gcloud started too
         )
         buf = ""
         try:

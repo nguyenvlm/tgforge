@@ -54,6 +54,9 @@ class _FlowIO:
     async def ask_text(self, prompt, timeout=None):
         return self._answers.pop(0) if self._answers else None
 
+    async def spawn(self, *args, **kwargs):
+        return await asyncio.create_subprocess_exec(*args, **kwargs)
+
 
 def _write_ok(dir_path):
     now = int(time.time() * 1000)
@@ -84,6 +87,9 @@ class _FakeCtx:
     async def menu(self, title, options):
         self.menu_calls.append((title, options))
         return self._choice
+
+    async def spawn(self, *args, **kwargs):
+        return await asyncio.create_subprocess_exec(*args, **kwargs)
 
 
 def _plugin(tmp_path):

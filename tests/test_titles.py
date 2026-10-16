@@ -1,5 +1,6 @@
-"""Per-plugin title suffixes (`<ClassLabel> · <suffix>`), the flood-safe rename
-guard (unchanged title → no API call), and localfs bookmark storage."""
+"""Per-plugin title suffixes (`<ClassLabel> · <suffix>`), the rename guard
+(unchanged title → no API call), and localfs bookmark storage. A rename is a
+frame-skip title, so each check flushes the frame task first."""
 
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ def test_localfs_suffix_is_folder_name(tmp_path):
         t = _instantiate(c, LocalfsTopic, "localfs")
         t.saved["cwd"] = "/srv/data/myproj"
         await t.refresh_title()
+        await c.core.flush_frames()
         assert c.core._names()[555] == "📁 Files · myproj"
 
     asyncio.run(scenario())
@@ -66,6 +68,7 @@ def test_claude_session_title_becomes_the_topic_name(tmp_path):
         t.title = "Fix the login bug"
         t.saved["base_name"] = t.title
         await t.refresh_title()
+        await c.core.flush_frames()
         assert c.core._names()[555] == "🤖 Fix the login bug"
 
     asyncio.run(scenario())
@@ -90,6 +93,7 @@ def test_sync_title_renames_topic_to_the_ai_title(tmp_path):
         t = _instantiate(c, ClaudeTopic, "claude")
         _write_jsonl(t, tmp_path, [{"type": "ai-title", "aiTitle": "Retry bug hunt"}])
         await t._sync_title()
+        await c.core.flush_frames()
         assert c.core._names()[555] == "🤖 Retry bug hunt"
 
     asyncio.run(scenario())
@@ -111,6 +115,7 @@ def test_sync_title_custom_outranks_ai(tmp_path):
             ],
         )
         await t._sync_title()
+        await c.core.flush_frames()
         assert c.core._names()[555] == "🤖 My name"
 
     asyncio.run(scenario())
@@ -124,7 +129,9 @@ def test_unchanged_title_skips_the_api_call(tmp_path):
         t = _instantiate(c, LocalfsTopic, "localfs")
         t.saved["cwd"] = "/srv/data/myproj"
         await t.refresh_title()
+        await c.core.flush_frames()
         await t.refresh_title()  # same suffix → no second edit_forum_topic
+        await c.core.flush_frames()
         assert calls == ["📁 Files · myproj"]
 
     asyncio.run(scenario())

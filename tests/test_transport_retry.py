@@ -1,7 +1,7 @@
 """_call re-issues the request after a flood-wait via its factory, instead of
-re-awaiting a spent coroutine (which used to raise RuntimeError and propagate); and it
-never lets a flood-wait freeze a live turn — droppable calls skip, essential calls cap
-the wait. Guards the panel-freeze fix."""
+re-awaiting a spent coroutine (which used to raise RuntimeError and propagate); an
+essential call waits the full retry_after (never retried early) and retries until it
+lands."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from aiogram.exceptions import TelegramRetryAfter
 
-from tgforge.base.kernel import _SKIPPED, FLOOD_WAIT_CAP, Transport
+from tgforge.base.kernel import Transport
 
 
 class _Flood(TelegramRetryAfter):
@@ -43,65 +43,56 @@ def test_call_reissues_after_flood_wait():
     asyncio.run(scenario())
 
 
-def test_droppable_skips_without_sleeping(monkeypatch):
+def test_essential_waits_the_full_retry_after_then_lands_once(monkeypatch):
+    """A retry_after past the old 30 s cap is waited out in full: no early retry that
+    fails again and loses the message after an extra API hit."""
+
     async def scenario():
         slept = []
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: slept.append(s) or real_sleep(0))
         t = Transport(bot=SimpleNamespace())
-        attempt, state = _flooding(1, retry_after=300)
-        out = await t._call(lambda: attempt(), droppable=True)
-        assert out is _SKIPPED  # dropped, not delivered
-        assert slept == []  # never blocks the reader
-        assert state["calls"] == 1  # no retry — one attempt, then bail
-
-    asyncio.run(scenario())
-
-
-def test_essential_caps_the_sleep_then_retries(monkeypatch):
-    async def scenario():
-        slept = []
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: slept.append(s) or real_sleep(0))
-        t = Transport(bot=SimpleNamespace())
-        attempt, _ = _flooding(1, retry_after=300)
+        attempt, state = _flooding(1, retry_after=45)
         out = await t._call(lambda: attempt())
         assert out == "sent"
-        assert slept == [FLOOD_WAIT_CAP]  # 300s capped to the ceiling
+        assert state["calls"] == 2  # one flooded attempt, one that landed
+        assert len(slept) == 1 and slept[0] > 44  # the full 45 s, not a 30 s cap
 
     asyncio.run(scenario())
 
 
-def test_droppable_flood_records_deadline_and_reports_not_landed(monkeypatch):
-    """A flooded droppable edit reports False (not landed) and stamps flood_until, so the
-    heartbeat can back off and skip the closed window instead of hammering it."""
-
+def test_essential_retries_until_it_lands(monkeypatch):
     async def scenario():
-        t = Transport(bot=SimpleNamespace())
-        t.bot.edit_message_text = lambda *a, **k: (_ for _ in ()).throw(_Flood(300))
-        monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: 1000.0)
-
-        landed = await t.edit(7, 42, "hi", droppable=True)
-        assert landed is False  # dropped, not a phantom success
-        assert t.flood_until == 1300.0  # exact retry_after deadline recorded
-
-        # edit_md must also report not-landed and NOT fall back to a plain edit that floods
-        landed_md = await t.edit_md(7, 42, "*hi*", "hi", droppable=True)
-        assert landed_md is False
-
-    asyncio.run(scenario())
-
-
-def test_essential_gives_up_after_two_floods(monkeypatch):
-    async def scenario():
-        slept = []
         real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: slept.append(s) or real_sleep(0))
+        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
         t = Transport(bot=SimpleNamespace())
-        attempt, _ = _flooding(2, retry_after=300)
-        out = await t._call(lambda: attempt())
-        assert out is None  # one wait, one retry, then done — no unbounded loop
-        assert slept == [FLOOD_WAIT_CAP]
+        attempt, state = _flooding(4, retry_after=1)
+        assert await t._call(lambda: attempt()) == "sent"  # never given up on
+        assert state["calls"] == 5
+
+    asyncio.run(scenario())
+
+
+def test_essential_calls_go_out_in_issue_order(monkeypatch):
+    """A flood-waited call holds back the calls issued after it: they go out after it,
+    in order, never ahead of it."""
+
+    async def scenario():
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
+        order = []
+        floods = {"first": 1}
+
+        async def send(tag):
+            if floods.get(tag):
+                floods[tag] -= 1
+                raise _Flood(5)
+            order.append(tag)
+            return tag
+
+        t = Transport(bot=SimpleNamespace())
+        await asyncio.gather(*[t._call(lambda tag=tag: send(tag)) for tag in ("first", "second")])
+        assert order == ["first", "second"]
 
     asyncio.run(scenario())
 
@@ -131,18 +122,14 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
     asyncio.run(scenario())
 
 
-def test_essential_flood_records_deadline_for_callers(monkeypatch):
-    """An essential (non-droppable) flood must also stamp flood_until, so the turn's
-    answer-delivery retry can honor the exact window instead of a blind backoff."""
-
+def test_flood_records_the_exact_deadline(monkeypatch):
     async def scenario():
         real_sleep = asyncio.sleep
         monkeypatch.setattr(asyncio, "sleep", lambda s: real_sleep(0))
         monkeypatch.setattr("tgforge.base.kernel.time.monotonic", lambda: 1000.0)
         t = Transport(bot=SimpleNamespace())
-        attempt, _ = _flooding(2, retry_after=300)  # floods both attempts, then None
-        out = await t._call(lambda: attempt())
-        assert out is None
-        assert t.flood_until == 1300.0  # recorded on the essential path too
+        attempt, _ = _flooding(1, retry_after=300)
+        assert await t._call(lambda: attempt()) == "sent"
+        assert t.flood_until == 1300.0  # the exact retry_after deadline
 
     asyncio.run(scenario())

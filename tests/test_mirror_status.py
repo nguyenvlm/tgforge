@@ -1,15 +1,14 @@
-"""The mirror spinner is cosmetic and droppable: a Telegram flood-wait on the
-"working…" holder edit must not block the mirror loop (which also delivers the real
-mirrored messages), so `_mirror_status` returns at once instead of sleeping the flood cap."""
+"""The mirror loop only reads the transcript: its spinner is a frame and its messages
+go out as send steps, so a Telegram flood-wait never blocks it."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 
 from aiogram.exceptions import TelegramRetryAfter
-
-from tgforge.plugins.claude import ClaudeTopic
-from tgforge.testing import TestClient
+from claude_fakes import client, drain, texts, window
 
 
 class _Flood(TelegramRetryAfter):
@@ -17,22 +16,51 @@ class _Flood(TelegramRetryAfter):
         self.retry_after = retry_after
 
 
-def test_mirror_spinner_edit_is_droppable(tmp_path, monkeypatch):
+def test_the_mirror_spinner_never_blocks_on_a_flood(tmp_path):
     async def scenario():
-        slept = []
-        real_sleep = asyncio.sleep
-        monkeypatch.setattr(asyncio, "sleep", lambda s: slept.append(s) or real_sleep(0))
-        c = TestClient(home=str(tmp_path))
-        # the spinner holder edit floods
-        monkeypatch.setattr(
-            c.bot, "edit_message_text", lambda *a, **k: (_ for _ in ()).throw(_Flood(300))
-        )
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        t.mirror_holder = 77  # holder already exists → straight to the spinner edit
-        t.mirror_start = asyncio.get_event_loop().time()
+        c = client(tmp_path)
 
-        await t._mirror_status(["Read"], in_flight=True)  # must not raise or block
+        async def flood(*a, **k):
+            raise _Flood(300)
 
-        assert slept == []  # dropped, not the 300s→cap sleep that stalls the loop
+        c.bot.edit_message_text = flood
+        t = window(c, tmp_path)
+        t.mirror_holder = 77  # holder already exists → straight to the spinner frame
+        t.mirror_start = time.time()
+        started = time.monotonic()
+        painted = t._mirror_status(["Read"], in_flight=True)  # records, returns
+        if asyncio.iscoroutine(painted):  # holds on an implementation that awaits here
+            await asyncio.wait_for(painted, 5)
+        assert time.monotonic() - started < 0.1
+
+    asyncio.run(scenario())
+
+
+def test_mirrored_texts_are_sent_by_send_steps_in_order(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        jsonl = tmp_path / "session.jsonl"
+        t._jsonl = lambda: jsonl
+        jsonl.write_text("")
+        t.mirror_offset = 0
+        release = asyncio.Event()
+        real_send = c.bot.send_message
+
+        async def slow_send(chat_id, text, **kw):
+            await release.wait()
+            return await real_send(chat_id, text, **kw)
+
+        c.bot.send_message = slow_send
+        lines = [
+            {"type": "user", "message": {"content": "first from the PC"}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "an answer"}]}},
+        ]
+        jsonl.write_text("".join(json.dumps(ev) + "\n" for ev in lines))
+        assert await asyncio.wait_for(t._mirror_once(), 1)  # returns while sends are stuck
+        release.set()
+        await drain(c, t)
+        shown = [text.replace("\\", "") for text in texts(c)]
+        assert shown == ["[user] first from the PC", "[cli] an answer"]
 
     asyncio.run(scenario())

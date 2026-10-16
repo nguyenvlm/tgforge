@@ -130,13 +130,21 @@ def test_panel_skips_no_op_render(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
         inst = await core.open_window(100, ShellTopic, "work")
-        inst.msg_id = 500  # the panel message already exists
-        inst.acc = "hello output"
-        core.bot.edits = 0
-        await inst._render()
-        await inst._render()  # identical content → skipped, so no plain-fallback flip
-        assert core.bot.edits == 1
-        await inst._kill()
+        try:
+            inst._flush_task.cancel()  # only the renders below paint
+            # detach the PTY reader: the live bash would append its prompt to `acc`
+            # between the two renders, making the second frame genuinely new
+            asyncio.get_event_loop().remove_reader(inst.master_fd)
+            await core.flush_frames()
+            inst.acc = "hello output"
+            core.bot.edits = 0
+            inst._render()
+            await core.flush_frames()
+            inst._render()  # identical content → the kernel skips it, no plain-fallback flip
+            await core.flush_frames()
+            assert core.bot.edits == 1
+        finally:
+            await inst._kill()
 
     asyncio.run(scenario())
 

@@ -194,9 +194,10 @@ def detached_restart(
     service: str, home: Path | None = None, announce_thread: int | None = None
 ) -> None:
     """Restart the service from inside a bot-driven turn without self-waiting.
-    Single-instance: a systemd transient unit / a macOS lock dir drops a second
-    concurrent restart. `home` is required on macOS (the lock lives under it) and to
-    carry `announce_thread` — the topic the fresh process pings when it comes back."""
+    Single-instance: on Linux a second restart replaces the waiting one (the
+    transient unit is stopped, then started anew); on macOS a lock dir drops it.
+    `home` is required on macOS (the lock lives under it) and to carry
+    `announce_thread` — the topic the fresh process pings when it comes back."""
     if announce_thread is not None and home is not None:
         try:
             (Path(home) / ".restart_announce").write_text(str(announce_thread))

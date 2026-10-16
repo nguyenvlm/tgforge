@@ -24,13 +24,13 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import (
+    SHUTDOWN_FLUSH,
     STALL_WARN,
     Plugin,
     Topic,
     action,
     command,
     kill_file_holders,
-    kill_process_group,
     launch,
     on_message,
     on_unknown,
@@ -42,13 +42,11 @@ from tgforge.base.kernel import (
 from tgforge.base.service import service_manager
 from tgforge.base.ui import (
     MAX_MSG,
-    chunks,
-    expandable,
+    expandable_pages,
     fmt_duration,
     mdv2_escape,
     shell_md,
     shell_view,
-    to_md,
 )
 from tgforge.plugins.claude import background, setup
 from tgforge.plugins.claude.config import (
@@ -63,10 +61,15 @@ from tgforge.plugins.claude.events import (
     is_prompt_replay,
     mirror_parse,
     prompt_block_count,
+    rate_limit_windows,
+    result_context_window,
 )
 from tgforge.plugins.claude.render import (
     WORDS,
+    context_part,
+    default_context_window,
     fmt_tokens,
+    quota_part,
     render_timeline,
     status_head,
 )
@@ -74,21 +77,15 @@ from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answ
 
 LOGGER = logging.getLogger("tgforge")
 
-MAX_BLOCK_BODY = 1500
-EDIT_INTERVAL = 2.5  # base seconds between live-panel repaints
-EDIT_INTERVAL_MAX = 30.0  # cap the adaptive backoff so the panel still repaints
-EDIT_BACKOFF = 2.0  # multiply the interval on each dropped (flooded) repaint
-EDIT_DECAY_STEP = 0.5  # shrink it back this many seconds per landed repaint
-PANEL_KEEPALIVE = 10.0  # repaint at least this often even with no new content
-MAX_OUTPUT_MSGS = 8
-ANSWER_SEND_ATTEMPTS = 5  # the turn's answer is essential — retry across flood windows
+EDIT_INTERVAL = 2.5  # seconds between live-card frames (the kernel skips what it can't show)
 ALBUM_DEBOUNCE = 2.0
 RELEASE_IDLE_SEC = 1800
 CONTROL_TIMEOUT = 10.0  # seconds to wait for the CLI's answer to a control request
 UPDATER_INTERVAL = 5.0
 MIRROR_INTERVAL = 3.0
 SHELL_TIMEOUT = 120
-QUOTA_THRESHOLDS = (0.25, 0.50, 0.75, 0.90, 0.95)
+SHELL_KEEP_CHARS = 2 * MAX_MSG  # the ! output tail kept (the view shows a MAX_MSG tail)
+PANEL_FRAME = "background"  # the bottom frame holding the background-jobs panel
 
 # Claude CLI --permission-mode values, passed on every spawn. The app default is
 # `auto` (a bot has no human to answer prompts); set it on the plugin or via /mode.
@@ -135,22 +132,20 @@ class ClaudeTopic(Topic):
         self.workspace = ""
         self.title: str | None = None  # the session name shown as the title suffix
         self.mirror_offset = -1
+        self.context_window: int | None = None  # the model's, from the last result
         # runtime
         self.owned = False
         self.busy = False
+        self.turn_open = False  # a turn is running: from its open to its result
         self.proc: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
         self.reader_task: asyncio.Task | None = None
         self.heartbeat_task: asyncio.Task | None = None
         self.mirror_task: asyncio.Task | None = None
-        self.holder_id: int | None = None
-        self.cur_reply_to: int | None = None
-        self.turn_start = 0.0
+        self.send_chain: asyncio.Task | None = None  # the newest queued send step
+        self.send_steps: set[asyncio.Task] = set()  # every queued send step not done
         self.last_reader_event = 0.0
         self._stall_warned = False
-        self._edit_interval = EDIT_INTERVAL  # adaptive; grows on flood, decays on success
-        self._last_paint_sig: tuple | None = None
-        self._last_paint_at = 0.0
         self.word_seed = 0
         self.spin = 0
         self.pending_writes: list[dict] = []
@@ -164,17 +159,14 @@ class ClaudeTopic(Topic):
         self.background_labels: dict[str, str] = {}
         self.background_probe_at = 0.0
         self.background_updater_task: asyncio.Task | None = None
-        self.background_panel_id: int | None = None  # the background-jobs panel's message
-        self.panel_reanchor_task: asyncio.Task | None = None  # an in-flight panel re-send
-        self.stale_panel_ids: list[int] = []  # replaced panels whose delete was dropped
         self.mirror_holder: int | None = None
+        self.mirror_holder_queued = False  # the "working…" send is queued, not sent yet
         self.mirror_tools = 0
         self.mirror_recent: list[str] = []
         self.mirror_start = 0.0
         self.mirror_tick = 0
         self._suggested: dict[str, dict] = {}
         self._albums: dict[str, dict] = {}
-        self._quota_alerts: dict[tuple, dict] = {}
 
     # ── Convenience ────────────────────────────────────────────────
     @property
@@ -237,6 +229,7 @@ class ClaudeTopic(Topic):
         self.config_dir = data.get("config_dir")
         self.workspace = data.get("workspace") or self._default_workspace()
         self.title = data.get("title")
+        self.context_window = data.get("context_window")
         self.mirror_offset = data.get("mirror_offset", -1)
         self.mirror_holder = data.get("mirror_holder")
         self.mirror_tools = data.get("mirror_tools", 0)
@@ -250,6 +243,7 @@ class ClaudeTopic(Topic):
             self.mirror_task,
             self.background_updater_task,
             self.release_task,
+            *self.send_steps,
         ):
             if t is not None:
                 t.cancel()
@@ -265,6 +259,7 @@ class ClaudeTopic(Topic):
             **({"model": self.model} if self.model else {}),
             **({"effort": self.effort} if self.effort else {}),
             **({"config_dir": self.config_dir} if self.config_dir else {}),
+            **({"context_window": self.context_window} if self.context_window else {}),
             **(
                 {
                     "mirror_holder": self.mirror_holder,
@@ -302,12 +297,12 @@ class ClaudeTopic(Topic):
 
     # ── Turn driving ───────────────────────────────────────────────
     def _arm_heartbeat(self) -> bool:
-        """Start the live-panel painter if it isn't running; return whether it was
+        """Start the live-card painter if it isn't running; return whether it was
         (re)armed. Idempotent — the singleton guarantee — so every turn-open path can
         arm without risking a second painter. Armed at the turn-open boundary
         (`_open_holder`), the one point all entry paths share, not at proc creation:
         a turn triggered by a background-task completion reuses a live proc and never
-        calls `_ensure_proc`, so arming there left its panel frozen at frame one."""
+        calls `_ensure_proc`, so arming there left its card frozen at frame one."""
         if self.heartbeat_task is None or self.heartbeat_task.done():
             self.heartbeat_task = asyncio.create_task(self._heartbeat())
             return True
@@ -334,7 +329,7 @@ class ClaudeTopic(Topic):
             "--include-partial-messages",
             "--replay-user-messages",
         ]
-        model = self.model or self.plugin.default_model
+        model = self._model_id()
         if model:
             cmd += ["--model", model]
         if self.effort:
@@ -377,44 +372,128 @@ class ClaudeTopic(Topic):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    async def _open_holder(self, reply_to=None, reuse_id=None):
-        # quiesce the between-turn panel updater so the heartbeat is the sole painter of
-        # the panel message during this turn (single writer, no stale timer edit)
-        await self._stop_background_updater()
-        self.turn = TurnState()
-        self.turn_start = time.monotonic()
-        self.last_reader_event = self.turn_start
+    def _send_in_order(self, step) -> asyncio.Task:
+        """Run `step` (a zero-arg coroutine factory that sends/deletes this window's
+        messages) after every step queued before it, as its own task, and return the
+        task. Every message of the window goes through here (directly, or via the
+        `send`/`delete` family and `_in_order`), so the order on screen is the order of
+        the queue and no reader or loop ever waits on Telegram."""
+        previous = self.send_chain
+
+        async def run():
+            if previous is not None:
+                await asyncio.wait([previous])
+            try:
+                await step()
+            except Exception:
+                LOGGER.exception("send step failed (%s)", self.name)
+
+        task = asyncio.create_task(run())
+        self.send_chain = task
+        self.send_steps.add(task)
+        task.add_done_callback(self.send_steps.discard)
+        return task
+
+    async def _in_order(self, call):
+        """Run `call` (a Telegram call that creates or deletes a message) as a send step
+        and return its result; directly when already inside one (a step never waits on
+        a later step). Every message call of this window funnels here."""
+        if asyncio.current_task() in self.send_steps:
+            return await call()
+        done = asyncio.get_running_loop().create_future()
+
+        async def step():
+            try:
+                done.set_result(await call())
+            except Exception as exc:
+                done.set_exception(exc)
+
+        task = self._send_in_order(step)
+        # a step cancelled (the window closed), even before it started, releases its caller
+        task.add_done_callback(lambda _task: done.done() or done.cancel())
+        return await done
+
+    async def send(self, text, reply_to=None):
+        return await self._in_order(lambda: Topic.send(self, text, reply_to=reply_to))
+
+    async def send_rich(self, text, reply_to=None, reply_markup=None):
+        return await self._in_order(
+            lambda: Topic.send_rich(self, text, reply_to=reply_to, reply_markup=reply_markup)
+        )
+
+    async def send_md(self, md, plain, reply_to=None, silent=False, reply_markup=None):
+        return await self._in_order(
+            lambda: Topic.send_md(
+                self, md, plain, reply_to=reply_to, silent=silent, reply_markup=reply_markup
+            )
+        )
+
+    async def send_file(self, path):
+        return await self._in_order(lambda: Topic.send_file(self, path))
+
+    async def send_photo(self, media_type, b64, reply_markup=None):
+        return await self._in_order(
+            lambda: Topic.send_photo(self, media_type, b64, reply_markup=reply_markup)
+        )
+
+    async def delete(self, msg_id) -> None:
+        await self._in_order(lambda: Topic.delete(self, msg_id))
+
+    async def _sent(self) -> None:
+        """Wait until every queued send step has run."""
+        if self.send_chain is not None:
+            await asyncio.wait([self.send_chain])
+
+    def _open_holder(self, reply_to=None, ack=None):
+        """Open a turn: fresh turn state, then queue its live card behind the previous
+        turn's output, so the card always lands below that turn's last message. `ack` is
+        the queued message this turn starts from: its "queued ✓" bubble is deleted and
+        the card replies to the user's message instead."""
+        self.turn = TurnState(reply_to=reply_to, started=time.monotonic())
+        self.turn_open = True
+        self.busy = True
+        self.last_reader_event = self.turn.started
         self._stall_warned = False
         self.word_seed = random.randrange(len(WORDS))
-        self.busy = True
-        self.cur_reply_to = reply_to
         self.spin = 0
-        head = status_head(self.word_seed, 0, 0, 0)
-        if reuse_id is not None:
-            await self.edit(reuse_id, head)
-            self.holder_id = reuse_id
-        else:
-            self.holder_id = await self.send(head, reply_to=reply_to)
-        # arm the painter for THIS turn now that busy+holder are set. Every turn-open
-        # path lands here (submit, a background-completion opened by the reader, a
-        # prompt replay, the result fallback); the prior turn's settle left it dead.
+        turn = self.turn
+
+        async def send_card():
+            if ack is not None and ack.get("bubble_id") is not None:
+                await self.delete(ack["bubble_id"])
+            turn.card_id = await self.send(self._live_view(turn), reply_to=turn.reply_to)
+
+        self._send_in_order(send_card)
+        # arm the painter for THIS turn. Every turn-open path lands here (submit, a
+        # background-completion opened by the reader, a prompt replay, the result
+        # fallback); the prior turn's close let it exit.
         revived = self._arm_heartbeat()
         LOGGER.info("turn start (%s): live panel %s", self.name, "revived" if revived else "alive")
 
-    async def _reorder_holder(self):
-        old = self.holder_id
-        elapsed = int(time.monotonic() - self.turn_start)
-        self.spin += 1
-        tokens = self.turn.tok_base + self.turn.tok_latest
-        head = status_head(self.word_seed, self.spin, elapsed, tokens)
-        new_id = await self.send(head, reply_to=self.cur_reply_to, droppable=True)
-        if new_id is None:  # dropped under flood-wait — keep the old holder in place
-            return
-        self.holder_id = new_id
-        if old is not None:
-            # essential, not droppable: once the new card is up, a dropped delete would
-            # strand the old card as a duplicate (and the reorder would look like a no-op)
+    def _reorder_holder(self) -> asyncio.Task:
+        """Queue a move of the live card to the bottom: send it anew, delete the old."""
+        turn = self.turn
+
+        async def move():
+            old = turn.card_id
+            if old is None:
+                return
+            new_id = await self.send(self._live_view(turn), reply_to=turn.reply_to)
+            if new_id is None:
+                return
+            turn.card_id = new_id
             await self.delete(old)
+
+        return self._send_in_order(move)
+
+    def _delete_ack(self, entry: dict) -> None:
+        """Queue the delete of a folded message's "queued ✓" bubble."""
+
+        async def delete():
+            if entry.get("bubble_id") is not None:
+                await self.delete(entry["bubble_id"])
+
+        self._send_in_order(delete)
 
     async def submit(self, prompt, reply_to=None):
         """The single prompt entry point (on_message, a skill slash, the ! chain,
@@ -422,12 +501,13 @@ class ClaudeTopic(Topic):
         async with self.lock:
             if self.busy and (self.proc is None or self.proc.returncode is not None):
                 self.busy = False
-                self.holder_id = None
+                self.turn_open = False
                 self.pending_writes = []
             try:
                 await self._ensure_proc()
             except Exception as exc:
-                await self.send(f"failed to launch: {exc}")
+                note = f"failed to launch: {exc}"  # `exc` is unbound once the block ends
+                self._send_in_order(lambda: self.send(note))
                 return
             if not prompt.startswith("/"):
                 brief = f"{self._env_tag()} {SESSION_BRIEF}"
@@ -435,32 +515,36 @@ class ClaudeTopic(Topic):
                 prompt = f"{prompt}\n\n{brief}" + (f"\n{extra}" if extra else "")
             proc_alive = self.proc is not None and self.proc.returncode is None
             LOGGER.info(
-                "submit (%s): busy=%s proc_alive=%s pending=%d holder=%s seq=%d :: %r",
+                "submit (%s): busy=%s proc_alive=%s pending=%d card=%s seq=%d :: %r",
                 self.name,
                 self.busy,
                 proc_alive,
                 len(self.pending_writes),
-                self.holder_id,
+                self.turn.card_id,
                 self.turn_seq,
                 prompt[:40],
             )
             if self.busy:
-                ack = await self.send("queued ✓", reply_to=reply_to)
-                LOGGER.info("submit (%s): QUEUED mid-turn (ack bubble=%s)", self.name, ack)
-                self.pending_writes.append(
-                    {
-                        "is_initiator": False,
-                        "bubble_id": ack,
-                        "reply_to": reply_to,
-                        "turn_seq": self.turn_seq,
-                    }
-                )
+                entry = {
+                    "is_initiator": False,
+                    "bubble_id": None,
+                    "reply_to": reply_to,
+                    "turn_seq": self.turn_seq,
+                }
+                self.pending_writes.append(entry)
+
+                async def send_ack():
+                    entry["bubble_id"] = await self.send("queued ✓", reply_to=reply_to)
+                    LOGGER.info(
+                        "submit (%s): QUEUED (ack bubble=%s)", self.name, entry["bubble_id"]
+                    )
+
+                self._send_in_order(send_ack)
                 await self._write_prompt(prompt)
             else:
                 LOGGER.info("submit (%s): NEW turn (busy was False)", self.name)
-                self.busy = True
                 self.cancel_requested = False
-                await self._open_holder(reply_to=reply_to)
+                self._open_holder(reply_to=reply_to)
                 self.pending_writes.append(
                     {
                         "is_initiator": True,
@@ -477,28 +561,34 @@ class ClaudeTopic(Topic):
         await self.submit("🔄 Bot restarted and is back online — continue where you left off.")
 
     async def on_shutdown(self):
-        """A graceful restart: settle a live turn holder into a final bubble (drop the
-        spinner, keep the timeline) so nothing is left mid-render; the session revives
-        and re-mirrors after the restart."""
-        if self.holder_id is None:
+        """A graceful restart: let queued output land, then settle a live turn card into a
+        final bubble (drop the spinner, keep the timeline) so nothing is left mid-render;
+        the session revives and re-mirrors after the restart."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._sent(), SHUTDOWN_FLUSH)
+        turn = self.turn
+        if not self.turn_open or turn.card_id is None:
             return
-        await self._stop_heartbeat()  # own the holder before settling it
+        self.turn_open = False  # the painter stops at its next tick
+        await self._stop_heartbeat()
         note = "⏸ interrupted by a restart — resuming shortly"
-        events = self._events_block(drop_last_text=False)
-        if events:
-            await self.edit_md(self.holder_id, f"{events[0]}\n\n{note}", f"{events[1]}\n\n{note}")
-        else:
-            await self.edit(self.holder_id, note)
-        self.holder_id = None
+        lines, _, _ = render_timeline(turn.timeline, drop_last_text=False)
+        pages = expandable_pages(self._summary(turn, time.monotonic()), lines)
+        md, plain = pages[0]
+        await self.show_frame(
+            turn.card_id, f"{plain}\n\n{note}", f"{md}\n\n{mdv2_escape(note)}", must_land=True
+        )
 
-    async def _warn_interrupted(self):
+    def _warn_interrupted(self):
         """Flag a turn cut short by a dead process — but stay silent on a graceful
         bot restart, which re-adopts the session (nothing was lost, no alarm needed)."""
-        if self.holder_id is not None and not self._core.shutting_down:
-            await self.edit(
-                self.holder_id,
+        card_id = self.turn.card_id
+        if self.turn_open and card_id is not None and not self._core.shutting_down:
+            self.show_frame(
+                card_id,
                 "⚠️ the session process exited mid-turn — nothing on disk was lost. "
                 "Send your message again to retry, or /cli to resume on the PC.",
+                must_land=True,
             )
 
     async def _reader(self):
@@ -520,41 +610,45 @@ class ClaudeTopic(Topic):
                 if t == "control_response":
                     self._resolve_control(ev)
                     continue
-                if not self.busy and not self.pending_writes and t in ("assistant", "stream_event"):
-                    await self._open_holder()
+                if (
+                    not self.turn_open
+                    and not self.pending_writes
+                    and t in ("assistant", "stream_event")
+                ):
+                    self._open_holder()
                 if t == "rate_limit_event":
-                    await self._quota_alert(ev)
+                    self._note_quota(ev)
                 if t == "assistant":
                     self.background_labels.update(background.launch_labels(ev))
                 if t == "user":
                     background.register_task(self, ev)
                     background.mark_done(self, ev)
+                    if self.background_tasks:
+                        self._ensure_background_updater()
                 apply_event(self.turn, ev)
                 if t == "user" and is_prompt_replay(ev) and self.pending_writes:
                     folded = False
                     n = min(prompt_block_count(ev), len(self.pending_writes))
                     for _ in range(n):
                         entry = self.pending_writes.pop(0)
-                        if self.holder_id is None:
-                            await self._open_holder(
-                                reply_to=entry["reply_to"], reuse_id=entry["bubble_id"]
-                            )
+                        if not self.turn_open:
+                            self._open_holder(reply_to=entry["reply_to"], ack=entry)
                         elif not entry["is_initiator"]:
-                            if entry["bubble_id"] is not None:
-                                await self.delete(entry["bubble_id"])
+                            self._delete_ack(entry)
                             folded = True
                     if folded:
-                        await self._reorder_holder()
+                        self._reorder_holder()
                 elif t == "result":
-                    if self.holder_id is None:
-                        await self._open_holder(reply_to=self.cur_reply_to)
+                    if not self.turn_open:
+                        self._open_holder(reply_to=self.turn.reply_to)
                     await self._finalize_turn(
                         ev.get("result", ""),
                         subtype=ev.get("subtype", "success"),
                         is_error=bool(ev.get("is_error")),
+                        context_window=result_context_window(ev, self._model_id()),
                     )
-                    # Clear busy + decide kill/keep atomically vs submit(): a message in the
-                    # settle window either queued here (busy was still True → pending_writes)
+                    # Clear busy + decide kill/keep atomically vs submit(): a message after
+                    # the boundary either queued here (busy was still True → pending_writes)
                     # or, if we kill, respawns a fresh proc — never writes to a proc we kill.
                     async with self.lock:
                         if self.pending_writes:
@@ -588,18 +682,16 @@ class ClaudeTopic(Topic):
             if self.release_task is not None:
                 self.release_task.cancel()
                 self.release_task = None
-            await self._stop_heartbeat()  # own the holder before warn_interrupted paints
-            await self._stop_background_updater()
-            await self._warn_interrupted()
+            await self._stop_heartbeat()  # own the card before warn_interrupted paints it
+            self._warn_interrupted()
             await self._settle_cancel_note()  # a cancel that ended via a dead proc
             self._fail_control_waiters()
             if self._jsonl().exists():
                 self.mirror_offset = self._jsonl().stat().st_size
             self.proc = None
             self.busy = False
-            self.holder_id = None
+            self.turn_open = False
             self.pending_writes = []
-            self.cur_reply_to = None
             self.owned = False
             self.reader_task = None
             self._save()
@@ -617,145 +709,95 @@ class ClaudeTopic(Topic):
                 pass
             self.proc.kill()
 
-    async def _paint_panel(self, spin: int) -> bool:
-        """Render the background-jobs panel as its OWN message, never part of the turn's
-        main card, so panel size can never trim the main text. It stays the window's
-        bottom-most message: buried under a later one, it is sent anew and the old one
-        deleted. Nothing to show → retire the message (the mirror-holder retire pattern).
-        Returns whether the paint landed (for the caller's adaptive cadence)."""
-        if self.panel_reanchor_task is not None:
-            # a re-send a cancelled painter left in flight: let it land and swap first
-            await asyncio.shield(self.panel_reanchor_task)
-        await self._delete_stale_panels()
-        panel = background.panel(self, spin)
-        if panel is None:
-            if self.background_panel_id is not None:
-                self.stale_panel_ids.append(self.background_panel_id)
-                self.background_panel_id = None
-                await self._delete_stale_panels()
-            return True
-        old = self.background_panel_id
-        if old is not None and self.latest_message_id() <= old:
-            return await self.edit_md(old, panel[0], panel[1], droppable=True)
-        # absent, or buried under a later message: send it anew at the bottom. The send,
-        # the id swap and the delete run as one task a painter's cancel can't split.
-        self.panel_reanchor_task = asyncio.create_task(self._reanchor_panel(panel, old))
-        return await asyncio.shield(self.panel_reanchor_task)
+    # ── Usage: context + quota ─────────────────────────────────────
+    def _model_id(self) -> str:
+        return self.model or self.plugin.default_model or ""
 
-    async def _reanchor_panel(self, panel: tuple[str, str], old: int | None) -> bool:
-        try:
-            # droppable: a flood-wait never stalls the painter; the next tick retries
-            new_id = await self.send_md(panel[0], panel[1], silent=True, droppable=True)
-            if new_id is None:
-                return False  # keep the old panel (if any) until a paint lands
-            self.background_panel_id = new_id
-            if old is not None:
-                self.stale_panel_ids.append(old)
-                await self._delete_stale_panels()
-            return True
-        finally:
-            self.panel_reanchor_task = None
+    def _account_key(self) -> str:
+        return str(self._session_config_dir())
 
-    async def _delete_stale_panels(self):
-        """Delete replaced panels droppably, so the painter never waits on a flood-wait;
-        a dropped delete stays queued for the next paint (never a stranded duplicate)."""
-        for panel_id in list(self.stale_panel_ids):
-            if await self.delete(panel_id, droppable=True):
-                self.stale_panel_ids.remove(panel_id)
+    def _note_quota(self, ev: dict) -> None:
+        """Keep the newest rate-limit windows per account, shared by its windows."""
+        quota = self.plugin.quota.setdefault(self._account_key(), {})
+        quota.update(rate_limit_windows(ev))
 
-    def _ensure_background_updater(self):
-        if self.background_updater_task is not None and not self.background_updater_task.done():
-            self.background_updater_task.cancel()
-        self.background_updater_task = asyncio.create_task(self._background_updater())
+    def _usage_parts(self, context_tokens: int) -> list[str]:
+        """The context and quota parts of a status or summary line."""
+        window = self.context_window or default_context_window(self._model_id())
+        parts = [
+            context_part(context_tokens, window),
+            quota_part(self.plugin.quota.get(self._account_key())),
+        ]
+        return [p for p in parts if p]
 
-    async def _background_updater(self):
-        spin = 0
-        interval = UPDATER_INTERVAL  # adaptive, same as the heartbeat: grow on flood
-        try:
-            while True:
-                # honor the exact flood deadline on top of the adaptive interval (A),
-                # so a long background job's panel never hammers a closed edit window
-                wait = interval
-                slack = self._core.flood_until - time.monotonic()
-                if slack > 0:
-                    wait = max(wait, slack)
-                await asyncio.sleep(wait)
-                spin += 1
-                background.mark_orphans(self)
-                background.prune_finished(self, time.monotonic())
-                landed = await self._paint_panel(spin)
-                shown = background.visible_tasks(self, time.monotonic())
-                if not shown and not self.stale_panel_ids:
-                    break  # the panel is retired and no replaced panel awaits its delete
-                # adaptive cadence (B): back off on a dropped edit, decay back on success
-                if landed:
-                    interval = max(UPDATER_INTERVAL, interval - EDIT_DECAY_STEP)
-                else:
-                    interval = min(EDIT_INTERVAL_MAX, interval * EDIT_BACKOFF)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self.background_updater_task = None
-
-    def _events_block(self, drop_last_text=True):
-        tokens = self.turn.tok_base + self.turn.tok_latest
-        lines, n_tools, n_narr = render_timeline(self.turn.timeline, drop_last_text)
-        if not lines and tokens == 0:
-            return None
-        dur = fmt_duration(int(time.monotonic() - self.turn_start))
+    def _summary(self, turn: TurnState, ended: float, drop_last_text: bool = False) -> str:
+        """`🔧 N · 💬 N · duration · tokens · ctx P% (T) · 5h P% · 7d P%`."""
+        _, n_tools, n_narr = render_timeline(turn.timeline, drop_last_text)
         parts = []
         if n_tools:
             parts.append(f"🔧 {n_tools}")
         if n_narr:
             parts.append(f"💬 {n_narr}")
-        parts += [dur, f"{fmt_tokens(tokens)} tokens"]
-        header = " · ".join(parts)
-        body = "\n\n".join(lines)
-        if len(body) > MAX_BLOCK_BODY:
-            body = "…" + body[-MAX_BLOCK_BODY:]
-        return expandable(header, body), (header + ("\n\n" + body if body else ""))
+        parts.append(fmt_duration(int(ended - turn.started)))
+        parts.append(f"{fmt_tokens(turn.tok_base + turn.tok_latest)} tokens")
+        return " · ".join(parts + self._usage_parts(turn.context_tokens))
 
-    async def _quota_alert(self, ev):
+    def _live_view(self, turn: TurnState) -> str:
+        """The live card: the status line over the tail of the running timeline."""
+        elapsed = int(time.monotonic() - turn.started)
+        tokens = turn.tok_base + turn.tok_latest
+        head = status_head(
+            self.word_seed, self.spin, elapsed, tokens, self._usage_parts(turn.context_tokens)
+        )
+        lines, _, _ = render_timeline(turn.timeline, drop_last_text=False)
+        thinking = "".join(turn.thinking_parts).strip()
+        answer = "".join(turn.preview_parts).strip()
+        if thinking:
+            lines.append(f"🧠 {thinking}")
+        if answer:
+            lines.append(f"💬 {answer}")
+        interim = "\n\n".join(lines)
+        base = f"{head}\n\n{interim}" if interim else head
+        if len(base) > MAX_MSG:  # the live card shows the tail only
+            base = f"{head}\n\n…{base[-(MAX_MSG - len(head) - 5) :]}"
+        return base
+
+    # ── Background-jobs panel ──────────────────────────────────────
+    def _paint_panel(self, spin: int) -> None:
+        """Record the background-jobs panel: its own message, kept by the kernel as the
+        window's bottom-most (re-sent below any newer message); nothing to show →
+        deleted."""
+        panel = background.panel(self, spin)
+        if panel is None:
+            self.show_bottom_frame(PANEL_FRAME, None)
+        else:
+            self.show_bottom_frame(PANEL_FRAME, panel[1], panel[0])
+
+    def _ensure_background_updater(self):
+        if self.background_updater_task is None or self.background_updater_task.done():
+            self.background_updater_task = asyncio.create_task(self._background_updater())
+
+    async def _background_updater(self):
+        """The panel's clock and pruning ticks, while it shows rows — independent of the
+        turn, the heartbeat and the CLI process."""
+        spin = 0
         try:
-            info = ev.get("rate_limit_info") or {}
-            kind = info.get("rateLimitType")
-            util = info.get("utilization")
-            resets = info.get("resetsAt")
-            if kind not in ("five_hour", "seven_day"):
-                return
-            if not isinstance(util, (int, float)):
-                return
-            key = (self.config_dir or "default", kind)
-            st = self._quota_alerts.get(key)
-            if st is None or st.get("resets") != resets:
-                st = {"resets": resets, "max": 0.0}
-                self._quota_alerts[key] = st
-            crossed = [x for x in QUOTA_THRESHOLDS if util >= x > st["max"]]
-            if not crossed:
-                return
-            st["max"] = max(crossed)
-            label = "5-hour" if kind == "five_hour" else "weekly"
-            when = ""
-            if isinstance(resets, (int, float)):
-                mins = max(0, int((resets - time.time()) / 60))
-                when = (
-                    f" · resets in ~{mins // 60}h{mins % 60:02d}m"
-                    if mins >= 60
-                    else f" · resets in ~{mins}m"
-                )
-            over = " (overage)" if info.get("isUsingOverage") else ""
-            await self.send(
-                f"⚠️ {label} quota {round(util * 100)}% used"
-                f" — crossed {round(max(crossed) * 100)}%{over}{when}"
-            )
-        except Exception as exc:
-            LOGGER.warning("quota alert failed: %r", exc)
+            while True:
+                now = time.monotonic()
+                background.mark_orphans(self)
+                background.prune_finished(self, now)
+                self._paint_panel(spin)
+                if not background.visible_tasks(self, now):
+                    break  # the panel is retired
+                await asyncio.sleep(UPDATER_INTERVAL)
+                spin += 1
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.background_updater_task = None
 
     async def _quiesce(self, name: str):
-        """Cancel a periodic painter task and wait for it to fully unwind, so no
-        in-flight timer edit lands after the reader writes the holder — the reader
-        owns the message and must quiesce the one live painter before it paints
-        (else a stale timer edit reverts the card to a running frame or a dead id)."""
+        """Cancel a periodic painter task and wait for it to fully unwind."""
         t = getattr(self, name)
         setattr(self, name, None)
         if t is not None:
@@ -769,206 +811,118 @@ class ClaudeTopic(Topic):
     async def _stop_background_updater(self):
         await self._quiesce("background_updater_task")
 
-    async def _send_answer(self, chunk):
-        """Deliver a turn-answer chunk, retrying across flood windows. Unlike a
-        live-panel repaint, the reply is the turn's product — a drop loses it and
-        strands the events-summary holder, so retry, then log loudly if it still fails."""
-        for attempt in range(ANSWER_SEND_ATTEMPTS):
-            mid = await self.send_rich(chunk)
-            if mid is not None:
-                return mid
-            if attempt == ANSWER_SEND_ATTEMPTS - 1:
-                break
-            slack = self._core.flood_until - time.monotonic()
-            await asyncio.sleep(min(max(slack, EDIT_INTERVAL), EDIT_INTERVAL_MAX))
-        LOGGER.error(
-            "turn answer chunk dropped after %d attempts (%s)", ANSWER_SEND_ATTEMPTS, self.name
-        )
-        return None
-
-    async def _settle_events(self, holder_id, md, plain):
-        """Fold the timeline into the holder, retrying across flood windows. A single
-        dropped edit would otherwise leave the live working frame as the finalized card
-        (the reply already gets this via _send_answer); log loudly if it still fails."""
-        for attempt in range(ANSWER_SEND_ATTEMPTS):
-            if await self.edit_md(holder_id, md, plain):
-                return True
-            if attempt == ANSWER_SEND_ATTEMPTS - 1:
-                break
-            slack = self._core.flood_until - time.monotonic()
-            await asyncio.sleep(min(max(slack, EDIT_INTERVAL), EDIT_INTERVAL_MAX))
-        LOGGER.error(
-            "folded-timeline edit dropped after %d attempts (%s)", ANSWER_SEND_ATTEMPTS, self.name
-        )
-        return False
-
-    async def _finalize_turn(self, result_text, subtype="success", is_error=False):
-        async with self.lock:  # the boundary is atomic vs submit()'s ack+queue
-            holder_id = self.holder_id
-            # busy stays True through the whole settle (reply send included); the reader
-            # clears it atomically with the kill/keep decision. A message in the settle
-            # window then queues (busy path) rather than opening a new-turn card mid-send.
+    # ── Turn boundary + settle ─────────────────────────────────────
+    async def _finalize_turn(
+        self, result_text, subtype="success", is_error=False, context_window=None
+    ):
+        """The turn boundary, atomic vs submit()'s ack+queue: close the turn and queue
+        its settle (`_settle_turn`) as a send step. No Telegram call under the lock."""
+        async with self.lock:
+            # busy stays True; the reader clears it atomically with the kill/keep
+            # decision, so a message right after the boundary queues for the next turn
             boundary = self.turn_seq
             self.turn_seq += 1  # the result closes this turn; later acks belong to the next
-            LOGGER.info(
-                "finalize (%s): boundary seq %d→%d, pending=%d (busy held until settled)",
-                self.name,
-                boundary,
-                self.turn_seq,
-                len(self.pending_writes),
-            )
-            # Mid-turn messages this turn acknowledged sit below the live card (their
-            # "queued ✓" acks). The finalized reply must stay below them, so fold those acks
-            # and reorder the card to the bottom — under the lock, so a next-turn ack can't
-            # land between the card and those messages. A message ack'd at/after this point
-            # is stamped with the bumped turn_seq and stays for the next turn (card above it).
             mine = [e for e in self.pending_writes if e.get("turn_seq", 0) <= boundary]
             self.pending_writes = [
                 e for e in self.pending_writes if e.get("turn_seq", 0) > boundary
             ]
-            acks = [e["bubble_id"] for e in mine if not e["is_initiator"] and e.get("bubble_id")]
-            if holder_id is not None and acks:
-                for bid in acks:
-                    await self.delete(bid)
-                await self._reorder_holder()
-                holder_id = self.holder_id
-            self.holder_id = None
-        LOGGER.info(
-            "turn end (%s): %.0fs, %s tokens, %s",
-            self.name,
-            time.monotonic() - self.turn_start,
-            self.turn.tok_base + self.turn.tok_latest,
-            subtype,
-        )
-        await self._stop_heartbeat()
-        ans = finalize_answer(
-            self.turn,
-            result_text,
-            subtype=subtype,
-            is_error=is_error,
-            cancel_requested=self.cancel_requested,
-        )
-        events = self._events_block(drop_last_text=ans.completed)
-        md_answer = to_md(ans.text)
-        combined_md = f"{events[0]}\n\n{md_answer}" if events else md_answer
-        combined_plain = f"{events[1]}\n\n{ans.text}" if events else ans.text
-        # The panel is its own message (painted below), never part of the final card, so
-        # the main text is bounded by MAX_MSG alone — panel size can never trim it.
-        last_id = holder_id
-        if len(combined_md) <= MAX_MSG:
-            if not await self.edit_md(holder_id, combined_md, combined_plain):
-                sent = await self._send_answer(ans.text)
-                last_id = sent or last_id
-        elif events:
-            await self._settle_events(holder_id, events[0], events[1])
-            for i, chunk in enumerate(chunks(ans.text)):
-                if i >= MAX_OUTPUT_MSGS:
-                    await self.send("(output truncated)")
-                    break
-                sent = await self._send_answer(chunk)
-                last_id = sent or last_id
-        else:
-            for i, chunk in enumerate(chunks(ans.text)):
-                if i >= MAX_OUTPUT_MSGS:
-                    await self.send("(output truncated)")
-                    break
-                if i == 0:
-                    if not await self.edit_rich(holder_id, chunk):
-                        last_id = await self._send_answer(chunk) or last_id
-                else:
-                    sent = await self._send_answer(chunk)
-                    last_id = sent or last_id
+            turn, ended = self.turn, time.monotonic()
+            self.turn = TurnState()
+            self.turn_open = False
+            self.background_labels = {}  # here, not in the settle: the next turn's go on
+            if context_window:
+                self.context_window = context_window
+            ans = finalize_answer(
+                turn,
+                result_text,
+                subtype=subtype,
+                is_error=is_error,
+                cancel_requested=self.cancel_requested,
+            )
+            # this turn's mid-turn messages whose replay never came: their acks sit
+            # below the card, so the settle moves the turn's output below them
+            acks = [e for e in mine if not e["is_initiator"]]
+            self._send_in_order(lambda: self._settle_turn(turn, ans, acks, ended))
+            LOGGER.info(
+                "turn end (%s): seq %d→%d, %.0fs, %s tokens, %s, pending=%d",
+                self.name,
+                boundary,
+                self.turn_seq,
+                ended - turn.started,
+                turn.tok_base + turn.tok_latest,
+                subtype,
+                len(self.pending_writes),
+            )
+
+    async def _settle_turn(self, turn: TurnState, ans, acks: list[dict], ended: float):
+        """Render a closed turn: the timeline folded into collapsed expandable messages
+        (the first carries the summary line) above the answer messages (suggestion
+        buttons on the last), then attachments. Every piece lands, in order."""
+        card_id = turn.card_id
+        if acks:
+            for entry in acks:
+                if entry.get("bubble_id") is not None:
+                    await self.delete(entry["bubble_id"])
+            if card_id is not None:  # message 1 goes below those mid-turn messages
+                await self.delete(card_id)
+                card_id = None
+        lines, _, _ = render_timeline(turn.timeline, drop_last_text=ans.completed)
+        pages = expandable_pages(self._summary(turn, ended, ans.completed), lines)
+        md, plain = pages[0]
+        landed = False
+        if card_id is not None:
+            landed = await self.show_frame(card_id, plain, md, must_land=True)
+            if not landed:
+                await self.delete(card_id)
+        if not landed:
+            await self.send_md(md, plain, reply_to=turn.reply_to)
+        for md, plain in pages[1:]:
+            await self.send_md(md, plain)
+        markup = self._suggestion_markup(ans.options) if ans.options else None
+        await self.send_rich(ans.text, reply_markup=markup)
         for p in ans.attachments:
             try:
                 await self.send_file(Path(p).expanduser())
             except (RuntimeError, OSError) as e:
                 await self.send(f"⚠️ could not attach {p}: {e}")
-        if ans.options and last_id is not None:
-            await self._attach_suggestions(last_id, ans.options)
         await self._sync_title()
         await self._settle_cancel_note()  # settle a '/cancel' bubble at the turn boundary
         if self._jsonl().exists():
             self.mirror_offset = self._jsonl().stat().st_size
-        self.turn = TurnState()
         background.prune_finished(self, time.monotonic())
-        self.background_labels = {}
-        # repaint (or retire) the panel as its own message; keep the between-turn updater
-        # running while it shows rows so its clock, lingering rows and pruning stay live
-        await self._paint_panel(self.spin)
-        if background.visible_tasks(self, time.monotonic()) or self.stale_panel_ids:
+        if background.visible_tasks(self, time.monotonic()):
             self._ensure_background_updater()
         self._save()
 
     async def _heartbeat(self):
         try:
             while True:
-                # sleep the adaptive interval, but never inside a known flood window —
-                # honor the exact retry_after deadline the transport recorded (A)
-                wait = self._edit_interval
-                slack = self._core.flood_until - time.monotonic()
-                if slack > 0:
-                    wait = max(wait, slack)
-                await asyncio.sleep(wait)
-                if not self.busy or self.holder_id is None:
-                    self._edit_interval = EDIT_INTERVAL  # reset between turns
-                    self._last_paint_sig = None
-                    continue
+                await asyncio.sleep(EDIT_INTERVAL)
+                if not self.turn_open:
+                    return  # the turn closed; the next turn's open re-arms
+                turn = self.turn
+                if turn.card_id is None:
+                    continue  # the card is still queued behind earlier output
                 quiet = time.monotonic() - self.last_reader_event
                 if quiet > STALL_WARN and not self._stall_warned:
                     self._stall_warned = True
                     LOGGER.warning("reader quiet %.0fs on a live turn (%s)", quiet, self.name)
-                elapsed = int(time.monotonic() - self.turn_start)
                 self.spin += 1
-                tokens = self.turn.tok_base + self.turn.tok_latest
-                lines, _, _ = render_timeline(self.turn.timeline, drop_last_text=False)
-                thinking = "".join(self.turn.thinking_parts).strip()
-                answer = "".join(self.turn.preview_parts).strip()
-                background.mark_orphans(self)
-                # skip a no-op repaint when nothing meaningful changed (B): saves edits
-                # during silent tool calls, so we don't spend the per-message rate budget
-                # on a spinner tick. A slow keepalive still advances the elapsed clock.
-                # The panel's row outcomes force a paint when a row appears, finishes, or
-                # lingers out (so the panel keeps up promptly); it is its own message below.
-                now = time.monotonic()
-                shown = tuple(t["done"] for t in background.visible_tasks(self, now))
-                sig = (tokens, tuple(lines), thinking, answer, shown)
-                if sig == self._last_paint_sig and now - self._last_paint_at < PANEL_KEEPALIVE:
-                    continue
-                head = status_head(self.word_seed, self.spin, elapsed, tokens)
-                lines2 = list(lines)
-                if thinking:
-                    lines2.append(f"🧠 {thinking}")
-                if answer:
-                    lines2.append(f"💬 {answer}")
-                interim = "\n\n".join(lines2)
-                base = f"{head}\n\n{interim}" if interim else head
-                if len(base) > MAX_MSG:  # the main card is bounded by MAX_MSG alone now
-                    base = f"{head}\n\n…{base[-(MAX_MSG - len(head) - 5) :]}"
-                landed = await self.edit(self.holder_id, base, droppable=True)
-                await self._paint_panel(self.spin)  # the background-jobs panel, its own message
-                # adaptive cadence (B): a dropped repaint means we're over the ceiling —
-                # back off multiplicatively; a landed one decays the interval back down
-                if landed:
-                    self._last_paint_sig = sig
-                    self._last_paint_at = time.monotonic()
-                    self._edit_interval = max(EDIT_INTERVAL, self._edit_interval - EDIT_DECAY_STEP)
-                else:
-                    self._edit_interval = min(EDIT_INTERVAL_MAX, self._edit_interval * EDIT_BACKOFF)
+                # a frame: the kernel shows the newest one when a slot is spare
+                self.show_frame(turn.card_id, self._live_view(turn))
         except asyncio.CancelledError:
-            pass  # normal stop: the reader owns the holder at settle
+            pass  # normal stop
         except Exception:
-            # the painter died mid-turn (not a clean cancel) — the panel freezes at its
+            # the painter died mid-turn (not a clean cancel) — the card freezes at its
             # last frame, the exact fault behind a "spinner stuck on one number" report
             LOGGER.exception("heartbeat died mid-turn (%s): panel frozen", self.name)
 
-    async def _attach_suggestions(self, message_id, options):
+    def _suggestion_markup(self, options):
         token = uuid.uuid4().hex[:8]
         self._suggested[token] = {"options": options}
         while len(self._suggested) > 20:  # bounded — only recent turns' buttons stay live
             self._suggested.pop(next(iter(self._suggested)))
-        kb = ui.suggestion_buttons(options, token)
-        await self.set_markup(message_id, kb)
-        return kb
+        return ui.suggestion_buttons(options, token)
 
     @action("sug")
     async def _on_suggestion(self, ctx, arg):
@@ -1016,23 +970,33 @@ class ClaudeTopic(Topic):
             chunk = chunk[: last_nl + 1]
         self.mirror_offset += len(chunk)
         texts, tools, images, in_flight = mirror_parse(chunk.decode("utf-8", errors="replace"))
+        # the loop only reads the transcript; the messages go out as send steps
         for text in texts:
-            await self.send_rich(text)
+            self._send_in_order(lambda text=text: self.send_rich(text))
         for media_type, b64 in images:
-            await self.send_photo(media_type, b64)
-        await self._mirror_status(tools, in_flight)
+            self._send_in_order(lambda m=media_type, b=b64: self.send_photo(m, b))
+        self._mirror_status(tools, in_flight)
         await self._sync_title()
         return True
 
-    async def _mirror_status(self, tools, in_flight):
+    def _mirror_status(self, tools, in_flight):
         if tools:
             self.mirror_tools += len(tools)
             self.mirror_recent = (self.mirror_recent + tools)[-5:]
         if in_flight:
             now = time.time()
-            if self.mirror_holder is None:
+            if self.mirror_holder is None and not self.mirror_holder_queued:
                 self.mirror_start = now
-                self.mirror_holder = await self.send("working…")
+                self.mirror_holder_queued = True
+
+                async def send_holder():
+                    self.mirror_holder = await self.send("working…")
+                    self.mirror_holder_queued = False
+                    self._save()
+
+                self._send_in_order(send_holder)
+            if self.mirror_holder is None:
+                return
             self.mirror_tick += 1
             frame = "✶✸✹✺✹✸"[self.mirror_tick % 6]
             word = WORDS[(self.thread_id + self.mirror_tick // 8) % len(WORDS)]
@@ -1041,12 +1005,13 @@ class ClaudeTopic(Topic):
             plural = "s" if n != 1 else ""
             head = f"{frame} {word}… ({fmt_duration(elapsed)} · {n} tool call{plural})"
             body = "\n".join(self.mirror_recent) or "thinking"
-            # droppable: the spinner is cosmetic — a flood-wait must never block the mirror
-            # loop (which also delivers the real mirrored messages); the next poll retries
-            await self.edit(self.mirror_holder, f"{head}\n{body}", droppable=True)
+            view = f"{head}\n{body}"
+            if len(view) > MAX_MSG:  # tool lines are uncut; the spinner shows the tail
+                view = f"{head}\n…{view[-(MAX_MSG - len(head) - 5) :]}"
+            self.show_frame(self.mirror_holder, view)
         elif self.mirror_holder is not None:
-            await self.delete(self.mirror_holder)
-            self.mirror_holder = None
+            holder, self.mirror_holder = self.mirror_holder, None
+            self._send_in_order(lambda: self.delete(holder))
             self.mirror_tools = 0
             self.mirror_recent = []
             self.mirror_tick = 0
@@ -1320,6 +1285,7 @@ class ClaudeTopic(Topic):
         if not choice:
             return
         self.model = None if choice == "__default__" else choice
+        self.context_window = None  # the next result reports the new model's window
         self._save()
         await self.send(f"🧠 model → {self.model or 'default'}")
         self._respawn_idle()
@@ -1506,22 +1472,25 @@ class ClaudeTopic(Topic):
 
     async def _send_turn_note(self, text: str):
         """Send a note from a command; mid-turn, move the live card below it so the
-        turn's finalized reply stays the bottom-most of the turn's messages."""
+        turn's finalized reply stays the bottom-most of the turn's messages. Returns
+        once both are sent."""
         async with self.lock:  # atomic vs the finalize boundary
-            await self.send(text)
-            if self.busy and self.holder_id is not None:
-                await self._reorder_holder()
+            last = self._send_in_order(lambda: self.send(text))
+            if self.turn_open:
+                last = self._reorder_holder()
+        await asyncio.wait([last])
 
     def _fresh_session(self) -> str:
-        """Reset to a brand-new session id (old transcript stays resumable); returns
-        the old id. The next turn respawns the CLI against the new session."""
+        """Reset to a brand-new session id (old transcript stays resumable) and drop an
+        idle CLI process, so the next turn spawns against the new session; returns the
+        old id. Callers refuse while a turn runs."""
         old = self.session_id
         self.session_id = str(uuid.uuid4())
         self.mirror_offset = -1
         self.mirror_holder = None
-        self.holder_id = None
         self.pending_writes = []
         self.turn = TurnState()
+        self._respawn_idle()
         return old
 
     @command("/clear", "start a fresh session (old one stays resumable)", icon="🧹")
@@ -1552,7 +1521,7 @@ class ClaudeTopic(Topic):
         self.saved["base_name"] = title  # the session title becomes the topic name
         self._write_title(title)
         self._save()
-        await self.refresh_title()
+        await self.refresh_title(immediate=True)  # an explicit rename: no rename spacing
 
     @command("/account", "switch this topic's Claude account", icon="👤")
     async def account(self, ctx):
@@ -1677,6 +1646,8 @@ class Claude(Plugin):
         self.permission_mode = self._init_permission_mode  # --permission-mode on every spawn
         self.accounts: dict[str, str] = {}
         self.models: list[list[str]] = [list(m) for m in (models or DEFAULT_MODELS)]
+        # account config dir → its newest rate-limit windows, shared by its windows
+        self.quota: dict[str, dict] = {}
         self.roots: list[str] = list(self._init_roots)
         self.workspaces = resolve_roots(self.roots)
 
@@ -1747,7 +1718,7 @@ class Claude(Plugin):
 
     async def _run_login(self, io, name: str, cfg: Path) -> bool:
         """Run `claude auth login --claudeai` into `cfg` (new or existing). `io` is a
-        topic or ctx — anything with send/ask_text. True on a credentialed result."""
+        topic or ctx — anything with send/ask_text/spawn. True on a credentialed result."""
         cfg.mkdir(parents=True, exist_ok=True)
         await io.send(f"starting login for '{name}'…")
         env = {
@@ -1758,7 +1729,7 @@ class Claude(Plugin):
         }
         env.pop("DISPLAY", None)
         env.pop("WAYLAND_DISPLAY", None)
-        proc = await asyncio.create_subprocess_exec(
+        proc = await io.spawn(  # reaped with the window if it closes mid-login
             self.claude_bin,
             "auth",
             "login",
@@ -1767,6 +1738,7 @@ class Claude(Plugin):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            start_new_session=True,  # a reap kills whatever the login started too
         )
         buf = ""
         try:
@@ -1887,7 +1859,8 @@ class Claude(Plugin):
         return None
 
     def reset_models(self) -> None:
-        self.models = [list(m) for m in DEFAULT_MODELS]
+        """Back to the app's `Claude(models=[...])` list (the library default if none)."""
+        self.models = [list(m) for m in (self._init_models or DEFAULT_MODELS)]
         self._save()
 
     def models_text(self) -> str:
@@ -2017,7 +1990,9 @@ class Claude(Plugin):
         status = ""
         proc = None
         try:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await topic.spawn(  # reaped with the window if it closes mid-run
+                "/bin/sh",
+                "-c",
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -2027,23 +2002,25 @@ class Claude(Plugin):
             )
 
             async def pump():
-                last = 0.0
+                # only reads and records: the view is a frame, never waited on
+                kept = 0
                 while True:
                     ln = await proc.stdout.readline()
                     if not ln:
                         break
                     buf.append(ln.decode(errors="replace"))
-                    now = time.monotonic()
-                    if hid is not None and now - last >= EDIT_INTERVAL:
-                        last = now
-                        await topic.edit_md(hid, shell_md(cmd, buf, ""), shell_view(cmd, buf, "…"))
+                    kept += len(buf[-1])
+                    while kept - len(buf[0]) >= SHELL_KEEP_CHARS:
+                        kept -= len(buf.pop(0))
+                    if hid is not None:
+                        topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
 
             await asyncio.wait_for(pump(), timeout=SHELL_TIMEOUT)
             await proc.wait()
             status = f"exit {proc.returncode}"
         except TimeoutError:
             if proc is not None:
-                await kill_process_group(proc)
+                await reap(proc)  # the command's whole process group
             status = (
                 f"timed out after {SHELL_TIMEOUT}s — stopped: the command and every process "
                 "it started were killed; for a longer run, detach it (nohup … &) and watch its log"
@@ -2055,7 +2032,7 @@ class Claude(Plugin):
                 await reap(proc)  # never leave the shell child running on any exit path
         result = shell_view(cmd, buf, status)
         if hid is not None:
-            await topic.edit_md(hid, shell_md(cmd, buf, status), result)
+            await topic.show_frame(hid, result, shell_md(cmd, buf, status), must_land=True)
         payload = f"[shell result]\n{result}"
         if chain:
             await topic.submit(payload)

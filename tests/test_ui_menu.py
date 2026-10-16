@@ -188,7 +188,8 @@ def test_open_window_and_rename_keep_the_icon():
         core = _kernel_with_shell()
         inst = await core.open_window(100, _ShellTopic, None)
         opened = core._names()[inst.thread_id]
-        await core.rename_topic(inst.thread_id, "deploy logs")
+        core.rename_topic(inst.thread_id, "deploy logs")
+        await core.flush_frames()
         return opened, core._names()[inst.thread_id]
 
     opened, renamed = asyncio.run(scenario())

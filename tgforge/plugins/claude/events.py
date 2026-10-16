@@ -111,3 +111,36 @@ def extract_tool_status(ev: dict) -> str | None:
             if block.get("type") == "tool_use":
                 return tool_line(block.get("name", "tool"), block.get("input"))
     return None
+
+
+def rate_limit_windows(ev: dict) -> dict:
+    """A `rate_limit_event` → {"status", "five_hour", "seven_day"} with each window's
+    utilization (0–1) from `rate_limit_info.unifiedWindows`; absent fields are left out."""
+    info = ev.get("rate_limit_info") or {}
+    out: dict = {}
+    if isinstance(info.get("status"), str):
+        out["status"] = info["status"]
+    windows = info.get("unifiedWindows") or {}
+    for key in ("five_hour", "seven_day"):
+        util = (windows.get(key) or {}).get("utilization")
+        if isinstance(util, (int, float)):
+            out[key] = util
+    return out
+
+
+def result_context_window(ev: dict, model: str) -> int | None:
+    """The context window a `result` reports in `modelUsage`: the entry naming the
+    window's model (any `[1m]` tag and date suffix aside), else the largest one."""
+    usage = ev.get("modelUsage") or {}
+    windows = {
+        name: entry["contextWindow"]
+        for name, entry in usage.items()
+        if isinstance(entry, dict) and isinstance(entry.get("contextWindow"), int)
+    }
+    if not windows:
+        return None
+    wanted = model.removesuffix("[1m]")
+    for name, window in windows.items():
+        if wanted and (wanted.startswith(name) or name.startswith(wanted)):
+            return window
+    return max(windows.values())

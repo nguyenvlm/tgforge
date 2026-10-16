@@ -77,6 +77,10 @@ class MockBot:
             self.last_markup = kw["reply_markup"]
         return self._created(kw.get("message_thread_id"), "<photo>", kw)
 
+    async def send_document(self, chat_id, document, **kw):
+        self.sent.append((kw.get("message_thread_id"), "<document>"))
+        return self._created(kw.get("message_thread_id"), "<document>", kw)
+
     async def edit_message_media(self, media, **kw):
         self.edits.append((kw.get("message_id"), "<photo>"))
         if kw.get("reply_markup") is not None:

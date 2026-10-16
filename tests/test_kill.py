@@ -192,40 +192,39 @@ def test_kill_without_a_name_offers_running_jobs_only(tmp_path):
 
 
 def test_kill_mid_turn_keeps_the_card_below_the_note(tmp_path, monkeypatch):
-    """Mid-turn, the note goes above the live card, so the finalized reply (the card,
-    edited in place) stays the bottom-most message; the turn's bookkeeping is untouched."""
+    """Mid-turn, the note goes above the live card (the card is re-sent below it), so the
+    turn's finalized output stays below the note; the turn's bookkeeping is untouched and
+    the job panel sits below everything."""
 
     async def scenario():
-        c = TestClient(home=str(tmp_path))
-        ids = _track_ids(c.bot)
+        from claude_fakes import drain, screen
+
+        c = TestClient(driver_module.Claude(), home=str(tmp_path))
         t = _topic(c, tmp_path, [("b1", "tests", None)])
+        t.workspace = str(tmp_path)
+        monkeypatch.setattr(t, "_jsonl", lambda: tmp_path / "absent.jsonl")
         t.proc = _FakeProc(c.bot)
-        t.busy = True
-        t.turn_start = asyncio.get_event_loop().time()
-        t.holder_id = await t.send("⠋ working…")
+        t._open_holder()
+        t._paint_panel(0)
+        await drain(c, t)
         t.pending_writes = [{"turn_seq": 0, "bubble_id": None, "is_initiator": True}]
         seq = t.turn_seq
 
-        async def _noop():
-            return None
-
-        monkeypatch.setattr(t, "_sync_title", _noop)
-        monkeypatch.setattr(t, "_jsonl", lambda: tmp_path / "absent.jsonl")
-        monkeypatch.setattr(t, "_save", lambda: None)
-
         task = asyncio.create_task(t.kill_job(_ctx("tests")))
-        await _pump_until(lambda: t.proc.stdin.writes and "stopping tests…" in ids.values())
+        await _pump_until(lambda: t.proc.stdin.writes and "stopping tests…" in c.replies)
         assert t.turn_seq == seq and len(t.pending_writes) == 1  # turn bookkeeping untouched
         _respond(t, t.proc.stdin.writes[0][1])
         await task
 
-        final_card = t.holder_id
         await t._finalize_turn("all done")
-        note_id = next(i for i, text in ids.items() if text == "stopping tests…")
-        turn_messages = [i for i in ids if i not in c.bot.deleted and i != t.background_panel_id]
-        assert note_id in turn_messages
-        assert max(turn_messages) == final_card  # the finalized reply stays below the note
-        assert t.background_panel_id > final_card  # the job panel sits below the turn
+        await drain(c, t)
+        shown = screen(c, 555)
+        ids = [mid for mid, _text in shown]
+        note_id = next(mid for mid, text in shown if text == "stopping tests…")
+        answer_id = next(mid for mid, text in shown if text == "all done")
+        panel_id = t.bottom_frame_id(driver_module.PANEL_FRAME)
+        assert ids.index(note_id) < ids.index(answer_id)  # the reply stays below the note
+        assert ids[-1] == panel_id  # the job panel sits below the turn
 
     asyncio.run(scenario())
 
@@ -315,7 +314,6 @@ class _StreamProc(_FakeProc):
 def _reading_topic(c, tmp_path, monkeypatch):
     t = _topic(c, tmp_path, [("b1", "tests", None)])
     t.proc = _StreamProc(c.bot)
-    t.turn_start = asyncio.get_event_loop().time()
     monkeypatch.setattr(t, "_jsonl", lambda: tmp_path / "absent.jsonl")
     monkeypatch.setattr(t, "_save", lambda: None)
     return t

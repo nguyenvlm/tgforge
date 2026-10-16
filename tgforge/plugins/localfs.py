@@ -1,6 +1,8 @@
 """Local-filesystem browser: `/localfs` opens a tap-to-navigate window over the
-whole filesystem. Each tap edits the window's panel in place; the current dir /
-file view persists in the window store, so a restart re-renders where it left off.
+whole filesystem. Each tap records the window's view as a frame (edited in place when a
+slot is free) and the title as a frame-skip rename, so taps never wait on Telegram; the
+current dir / file view persists in the window store, so a restart re-renders where it
+left off.
 """
 
 from __future__ import annotations
@@ -62,12 +64,12 @@ class LocalfsTopic(Topic):
         self.saved["view"] = None
         self.saved["page"] = 0
         self.msg_id = await self.send("opening…")
-        await self._redraw()
+        self._redraw()
         await self.refresh_title()
 
     async def on_revive(self):
         self.msg_id = await self.send("↻ browser restored")
-        await self._redraw()
+        self._redraw()
         await self.refresh_title()
 
     # ── Listing + views ────────────────────────────────────────────
@@ -154,15 +156,17 @@ class LocalfsTopic(Topic):
         dl = ui.act("⬇ download", "fs", "dl")
         return _code(content), content, ui.keyboard([[dl], [back, close]])
 
-    async def _redraw(self):
+    def _redraw(self):
+        """Record the view's newest frame and return at once: a burst of taps shows the
+        last view, never waiting on Telegram."""
         if self.msg_id is None:
             return
         if self.saved.get("view"):
             md, plain, markup = self._file_view()
-            await self.edit_md(self.msg_id, md, plain, reply_markup=markup)
+            self.show_frame(self.msg_id, plain, md, reply_markup=markup)
         else:
             text, markup = self._dir_view()
-            await self.edit(self.msg_id, text, reply_markup=markup)
+            self.show_frame(self.msg_id, text, reply_markup=markup)
 
     # ── Button routing ─────────────────────────────────────────────
     @action("fs")
@@ -199,7 +203,7 @@ class LocalfsTopic(Topic):
             self.saved["page"] = int(idx)
         elif act == "back":
             self.saved["view"] = None
-        await self._redraw()
+        self._redraw()
         if act in ("cd", "up"):
             await self.refresh_title()
 
@@ -223,7 +227,7 @@ class LocalfsTopic(Topic):
                 self.saved["cwd"] = pick
                 self.saved["page"] = 0
                 self.saved["view"] = None
-                await self._redraw()
+                self._redraw()
                 await self.refresh_title()
         elif choice == "add":
             n = self.plugin.add_bookmark(self.saved["cwd"])

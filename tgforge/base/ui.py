@@ -92,6 +92,49 @@ def expandable(header: str, body: str) -> str:
     return "\n".join(rows) + "||"
 
 
+def expandable_pages(
+    header: str, entries: list[str], limit: int = MAX_MSG
+) -> list[tuple[str, str]]:
+    """Fold `entries` into as few collapsed expandable messages as fit, nothing cut:
+    page 1 shows `header`, the rest `↳ i/n`; an entry too long for one message is split
+    across messages. Returns (md, plain) per page, each within `limit`."""
+    cont = "↳ 99/99"  # the longest continuation header, so packing never overflows
+    parts: list[str] = []
+    for entry in entries:
+        parts.extend(_split_to_fit(entry, max(header, cont, key=len), limit))
+    pages: list[list[str]] = [[]]
+    for part in parts:
+        head = header if len(pages) == 1 else cont
+        if pages[-1] and len(expandable(head, "\n\n".join([*pages[-1], part]))) > limit:
+            pages.append([])
+        pages[-1].append(part)
+    out = []
+    for i, page in enumerate(pages):
+        head = header if i == 0 else f"↳ {i + 1}/{len(pages)}"
+        body = "\n\n".join(page)
+        out.append((expandable(head, body), head + (f"\n\n{body}" if body else "")))
+    return out
+
+
+def _split_to_fit(entry: str, head: str, limit: int) -> list[str]:
+    """Split one entry into pieces that each fit an expandable message under `head`,
+    cutting at a newline (else a space) when one is near."""
+    pieces = []
+    while len(expandable(head, entry)) > limit:
+        cut = min(len(entry), limit)
+        while cut > 1 and len(expandable(head, entry[:cut])) > limit:
+            cut = cut * 9 // 10
+        for sep in ("\n", " "):
+            at = entry.rfind(sep, cut // 2, cut)
+            if at > 0:
+                cut = at
+                break
+        pieces.append(entry[:cut].rstrip())
+        entry = entry[cut:].lstrip()
+    pieces.append(entry)
+    return pieces
+
+
 def fmt_duration(seconds: int) -> str:
     """Largest-unit-first duration across y/mo/d/h/m/s (30d month, 365d year),
     zero units dropped."""

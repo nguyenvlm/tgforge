@@ -91,17 +91,46 @@ def tool_line(name: str, tool_input) -> str:
     else:
         detail = next((v for v in tool_input.values() if isinstance(v, str) and v.strip()), "")
     detail = " ".join(str(detail).split())
-    if len(detail) > 80:
-        detail = detail[:77] + "..."
     return f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
 
 
-def status_head(seed: int, spin: int, elapsed: int, tokens: int) -> str:
+def status_head(seed: int, spin: int, elapsed: int, tokens: int, usage: list[str] = ()) -> str:
     """The one live-status line — initial ack and heartbeat share it. spin
-    advances the frame per holder edit; the word drifts on wall clock."""
+    advances the frame per holder edit; the word drifts on wall clock; `usage` adds the
+    context and quota parts."""
     frame = SPINNER[spin % len(SPINNER)]
     word = WORDS[(seed + elapsed // 20) % len(WORDS)]
-    return f"{frame} {word}… ({fmt_duration(elapsed)} · ↓ {fmt_tokens(tokens)} tokens)"
+    parts = [fmt_duration(elapsed), f"↓ {fmt_tokens(tokens)} tokens", *usage]
+    return f"{frame} {word}… ({' · '.join(parts)})"
+
+
+def default_context_window(model: str) -> int:
+    """The context window assumed before a result reports one: 1M for a `[1m]` model
+    id, else 200k."""
+    return 1_000_000 if model.endswith("[1m]") else 200_000
+
+
+def context_part(tokens: int, window: int) -> str | None:
+    """`ctx 21% (42.4k)`, or None before the first model call."""
+    if not tokens or not window:
+        return None
+    return f"ctx {round(100 * tokens / window)}% ({fmt_tokens(tokens)})"
+
+
+def quota_part(quota: dict | None) -> str | None:
+    """`5h 3% · 7d 0%` from an account's newest rate-limit windows, ⚠️-led when the
+    status is not `allowed`; None when no window is known."""
+    if not quota:
+        return None
+    parts = [
+        f"{label} {round(quota[key] * 100)}%"
+        for key, label in (("five_hour", "5h"), ("seven_day", "7d"))
+        if isinstance(quota.get(key), (int, float))
+    ]
+    if not parts:
+        return None
+    text = " · ".join(parts)
+    return f"⚠️ {text}" if quota.get("status") not in (None, "allowed") else text
 
 
 def render_timeline(
