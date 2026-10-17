@@ -1,8 +1,9 @@
 """Local-filesystem browser: `/localfs` opens a tap-to-navigate window over the
 whole filesystem. Each tap records the window's view as a frame (edited in place when a
-slot is free) and the title as a frame-skip rename, so taps never wait on Telegram; the
-current dir / file view persists in the window store, so a restart re-renders where it
-left off.
+slot is free) and the title as a frame-skip rename held until navigation stops for
+TITLE_QUIET seconds, so taps never wait on Telegram; a typed path jumps to that folder.
+The current dir / file view persists in the window store, so a restart re-renders where
+it left off.
 """
 
 from __future__ import annotations
@@ -11,12 +12,14 @@ import os
 from pathlib import Path
 
 from tgforge.base import ui
-from tgforge.base.kernel import Plugin, Topic, action, command, launch
+from tgforge.base.kernel import Plugin, Topic, action, command, launch, on_message
 from tgforge.base.ui import MAX_MSG
 
 PAGE = 10  # dir entries per page
 PREVIEW_BYTES = 3000
 PREVIEW_LINES = 40
+TITLE_QUIET = 30.0  # s without navigation before the title follows the folder
+NOTE_LIFETIME = 30.0  # s before a bad-path notice is deleted
 
 
 def _human_size(n: int) -> str:
@@ -205,7 +208,36 @@ class LocalfsTopic(Topic):
             self.saved["view"] = None
         self._redraw()
         if act in ("cd", "up"):
-            await self.refresh_title()
+            await self.refresh_title(quiet=TITLE_QUIET)
+
+    @on_message
+    async def goto(self, ctx):
+        """A typed path jumps to that folder (relative to the current one, `~` expanded);
+        anything else gets a brief notice. The typed message is deleted either way."""
+        raw = ctx.text.strip()
+        if ctx.message is not None:
+            await ctx.delete(ctx.message.message_id)  # the view shows where it went
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = Path(self.saved["cwd"]) / target
+        target = Path(os.path.normpath(target))
+        try:
+            if target.is_dir():
+                reason = None
+            elif target.exists():
+                reason = "not a folder"
+            else:
+                reason = "no such folder"
+        except (OSError, ValueError) as e:  # too long, no permission to look, a NUL byte
+            reason = f"can't open ({e.__class__.__name__})"
+        if reason is not None:
+            await self.send_temporary(f"⚠️ {reason}: {raw}", NOTE_LIFETIME)
+            return
+        self.saved["cwd"] = str(target)
+        self.saved["page"] = 0
+        self.saved["view"] = None
+        self._redraw()
+        await self.refresh_title(quiet=TITLE_QUIET)
 
     # ── Bookmarks ──────────────────────────────────────────────────
     @command("/bookmarks", "go to or edit bookmarked folders", icon="⭐")
@@ -228,7 +260,7 @@ class LocalfsTopic(Topic):
                 self.saved["page"] = 0
                 self.saved["view"] = None
                 self._redraw()
-                await self.refresh_title()
+                await self.refresh_title(quiet=TITLE_QUIET)
         elif choice == "add":
             n = self.plugin.add_bookmark(self.saved["cwd"])
             await self.send(f"⭐ bookmarked {Path(self.saved['cwd']).name} — {n} bookmark(s)")

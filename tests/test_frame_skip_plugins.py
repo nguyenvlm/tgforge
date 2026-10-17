@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from claude_fakes import THREAD, client, window
 
 from tgforge.base import kernel
+from tgforge.plugins import localfs
 from tgforge.plugins.claude import driver as drv
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.testing import TestClient
@@ -98,6 +99,7 @@ async def _click(c, inst, arg):
 
 def test_files_clicks_during_a_flood_return_at_once_and_show_the_last_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
+    monkeypatch.setattr(localfs, "TITLE_QUIET", 0)
 
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
@@ -115,6 +117,7 @@ def test_files_clicks_during_a_flood_return_at_once_and_show_the_last_folder(tmp
 
 def test_five_quick_folder_clicks_give_one_rename_to_the_last_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0.3)
+    monkeypatch.setattr(localfs, "TITLE_QUIET", 0.1)
 
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
@@ -236,5 +239,115 @@ def test_a_cut_off_utf8_character_at_the_end_is_kept(tmp_path):
         await c.send("!printf 'ok\\342\\202'", thread_id=THREAD)  # 2 of €'s 3 bytes
         await asyncio.wait_for(c.settle(), 10)
         assert "ok�" in c.edits[-1]  # flushed as a replacement, not dropped
+
+    asyncio.run(scenario())
+
+
+def test_a_folder_rename_waits_until_navigation_stops(tmp_path, monkeypatch):
+    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
+    monkeypatch.setattr(localfs, "TITLE_QUIET", 0.3)
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        inst = await _files_window(c, root)
+        renames = []
+        real = c.bot.edit_forum_topic
+
+        async def rename(*args, **kwargs):
+            renames.append((time.monotonic(), kwargs["name"]))
+            return await real(*args, **kwargs)
+
+        c.bot.edit_forum_topic = rename
+        for _ in range(3):  # clicks 0.2 s apart: each restarts the quiet period
+            await _click(c, inst, "cd:0")
+            last_click = time.monotonic()
+            await asyncio.sleep(0.2)
+        assert renames == []  # nothing yet: 0.2 s since the last click
+        await c.core.flush_frames()
+        assert [name for _t, name in renames] == ["📁 browse · d2"]
+        assert renames[0][0] - last_click >= 0.29
+
+    asyncio.run(scenario())
+
+
+def test_a_typed_path_jumps_to_that_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(localfs, "TITLE_QUIET", 0)
+    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        inst = await _files_window(c, root)
+        cases = [
+            (str(root / "d0" / "d1"), root / "d0" / "d1"),  # absolute
+            ("d2/d3", root / "d0" / "d1" / "d2" / "d3"),  # relative to the current folder
+            ("..", root / "d0" / "d1" / "d2"),
+            ("~/root", root),  # ~ expanded
+        ]
+        for typed, expected in cases:
+            sent_before = len(c.bot.sent)
+            await c.send(typed, thread_id=inst.thread_id)
+            await c.settle()
+            await c.core.flush_frames()
+            typed_id = c.bot.created[-1][0] if c.bot.created[-1][2] == typed else None
+            assert inst.saved["cwd"] == str(expected), typed
+            assert c.edits[-1].startswith(f"📂 {expected}"), typed  # the view shows it
+            assert len(c.bot.sent) == sent_before  # no reply message
+            assert typed_id is not None and typed_id in c.bot.deleted  # the typed path goes
+
+    asyncio.run(scenario())
+
+
+def test_a_bad_typed_path_gets_a_brief_notice_deleted_later(tmp_path, monkeypatch):
+    monkeypatch.setattr(localfs, "NOTE_LIFETIME", 0.2)
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        (root / "a.txt").write_text("x")
+        inst = await _files_window(c, root)
+        for typed, reason in [("nope", "no such folder"), ("a.txt", "not a folder")]:
+            await c.send(typed, thread_id=inst.thread_id)
+            await c.settle()
+            typed_id = next(mid for mid, _t, text in c.bot.created if text == typed)
+            note_id, note = next(
+                (mid, text) for mid, _t, text in reversed(c.bot.created) if text.startswith("⚠️")
+            )
+            assert note == f"⚠️ {reason}: {typed}"
+            assert inst.saved["cwd"] == str(root)  # stayed put
+            assert typed_id in c.bot.deleted
+            assert note_id not in c.bot.deleted  # still showing
+            await asyncio.sleep(0.3)
+            assert note_id in c.bot.deleted  # gone after NOTE_LIFETIME
+
+    asyncio.run(scenario())
+
+
+def test_a_typed_path_that_cannot_be_checked_gets_a_notice(tmp_path):
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        inst = await _files_window(c, root)
+        await c.send("x" * 5000, thread_id=inst.thread_id)  # longer than any path
+        await c.settle()
+        assert any(text.startswith("⚠️ ") for _t, text in c.bot.sent)
+        assert inst.saved["cwd"] == str(root)
+
+    asyncio.run(scenario())
+
+
+def test_a_graceful_stop_sends_a_held_rename_at_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)  # the real 30 s quiet period stays
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        inst = await _files_window(c, root)
+        renames = _flood_once(c.bot, "edit_forum_topic", 0, times=0)
+        await _click(c, inst, "cd:0")
+        await asyncio.wait_for(c.core.broadcast_shutdown(), 2)  # not held 30 s
+        assert renames["calls"] == ["📁 browse · d0"]
 
     asyncio.run(scenario())

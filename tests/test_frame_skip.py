@@ -507,3 +507,22 @@ def test_each_frame_push_logs_its_delay_and_replaced_count(caplog):
     assert "2 replaced, 1 still pending" in lines[0]
     assert lines[1].startswith("frame push title thread 7: ")
     assert "0 replaced, 0 still pending" in lines[1]
+
+
+def test_a_quiet_title_waits_until_no_newer_name_came(monkeypatch):
+    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
+
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        for name in ("a", "b", "c"):  # each newer name restarts the quiet period
+            t.show_title(1, 7, name, quiet=0.3)
+            last = time.monotonic()
+            await asyncio.sleep(0.15)
+        assert bot.texts("title") == []
+        await t.flush_frames()
+        assert bot.texts("title") == ["c"]
+        landed = next(at for at, method, _ in bot.calls if method == "title")
+        assert landed - last >= 0.29
+
+    asyncio.run(scenario())

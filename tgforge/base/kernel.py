@@ -631,6 +631,7 @@ class Topic:
         self.saved = saved
         self.plugin = None  # the owning Plugin (set by the kernel); for its store/roots
         self._procs: set = set()  # every subprocess this window spawned; reaped on close
+        self._timed_deletes: set[asyncio.Task] = set()  # pending send_temporary deletes
 
     # ── Subprocess ownership ───────────────────────────────────────
     async def spawn(self, *args, **kwargs):
@@ -654,12 +655,13 @@ class Topic:
         None → the bare class label. Override, and call `refresh_title()` on change."""
         return None
 
-    async def refresh_title(self, immediate: bool = False) -> None:
+    async def refresh_title(self, immediate: bool = False, quiet: float = 0.0) -> None:
         """Recompose the topic title from the current `title_suffix()` and return at
         once: the rename is a frame-skip title (see `Transport.show_title`), skipped
-        when unchanged, so a burst of state changes gives one rename. `immediate` (an
+        when unchanged, so a burst of state changes gives one rename. `quiet` holds it
+        until the state stopped changing for that many seconds; `immediate` (an
         explicit rename) skips the spacing between renames."""
-        self._core.refresh_title(self.thread_id, immediate=immediate)
+        self._core.refresh_title(self.thread_id, immediate=immediate, quiet=quiet)
 
     # ── Lifecycle hooks (override as needed) ───────────────────────
     async def on_open(self) -> None:
@@ -705,6 +707,19 @@ class Topic:
         return await self.run_message_call(
             lambda: self._core.send(chat_id, text, self.thread_id, reply_to=reply_to)
         )
+
+    async def send_temporary(self, text, lifetime: float) -> int | None:
+        """Send a brief notice and delete it `lifetime` seconds later."""
+        msg_id = await self.send(text)
+        if msg_id is not None:
+            task = asyncio.get_running_loop().create_task(self._delete_after(msg_id, lifetime))
+            self._timed_deletes.add(task)
+            task.add_done_callback(self._timed_deletes.discard)
+        return msg_id
+
+    async def _delete_after(self, msg_id: int, lifetime: float) -> None:
+        await asyncio.sleep(lifetime)
+        await self.delete(msg_id)
 
     async def send_rich(self, text, reply_to=None, reply_markup=None):
         chat_id = self._core.chat_id
@@ -922,6 +937,7 @@ class _Title:
     thread_id: int
     name: str
     immediate: bool = False  # an explicit rename: no TITLE_MIN_INTERVAL wait
+    quiet_until: float = 0.0  # monotonic time before which it waits (no newer name meanwhile)
 
 
 class Transport:
@@ -1116,13 +1132,23 @@ class Transport:
         frame = self._frames.get(("bottom", key))
         return frame.message_id if frame else None
 
-    def show_title(self, chat_id, thread_id: int, name: str, immediate=False) -> None:
+    def show_title(
+        self, chat_id, thread_id: int, name: str, immediate=False, quiet: float = 0.0
+    ) -> None:
         """Record a topic's newest wanted name and return at once; renames of one topic
         land at least TITLE_MIN_INTERVAL apart (each posts a "topic renamed" service
-        message), so a burst gives one rename to the last name. `immediate` skips that
-        wait (an explicit rename)."""
-        self._titles[thread_id] = _Title(chat_id, thread_id, name, immediate)
+        message), so a burst gives one rename to the last name. `quiet` holds the rename
+        until no newer name came for that many seconds. `immediate` skips both waits
+        (an explicit rename)."""
+        quiet_until = time.monotonic() + quiet
+        self._titles[thread_id] = _Title(chat_id, thread_id, name, immediate, quiet_until)
         self._mark_dirty(("title", thread_id))
+
+    def end_title_quiet(self) -> None:
+        """Let every rename held by its quiet period go out now (a graceful stop)."""
+        for title in self._titles.values():
+            title.quiet_until = 0.0
+        self._frame_wakeup.set()
 
     def drop_title(self, thread_id: int) -> None:
         """Forget a recorded rename (the wanted name is already the topic's)."""
@@ -1178,21 +1204,23 @@ class Transport:
                 return key
         now = time.monotonic()
         for key in self._dirty:
-            if key[0] != "title":
-                return key
-            title = self._titles.get(key[1])
-            if title is None or title.immediate:
-                return key
-            if now >= self._title_landed_at.get(key[1], -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL:
+            if key[0] != "title" or now >= self._title_ready_at(key[1]):
                 return key
         return None
+
+    def _title_ready_at(self, thread_id: int) -> float:
+        """When a topic's recorded rename may go out: TITLE_MIN_INTERVAL after its last
+        rename and past its quiet period (an immediate one: now)."""
+        title = self._titles.get(thread_id)
+        if title is None or title.immediate:
+            return 0.0
+        spaced = self._title_landed_at.get(thread_id, -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL
+        return max(spaced, title.quiet_until)
 
     def _title_wait(self) -> float | None:
         """Seconds until the earliest waiting title is ready (None when none waits)."""
         waits = [
-            self._title_landed_at.get(key[1], -TITLE_MIN_INTERVAL)
-            + TITLE_MIN_INTERVAL
-            - time.monotonic()
+            self._title_ready_at(key[1]) - time.monotonic()
             for key in self._dirty
             if key[0] == "title"
         ]
@@ -2040,16 +2068,18 @@ class Kernel(Transport):
         a "#2" survives a title refresh."""
         return f"{base} · {suffix}" if suffix else base
 
-    def refresh_title(self, thread_id: int, immediate: bool = False) -> None:
+    def refresh_title(self, thread_id: int, immediate: bool = False, quiet: float = 0.0) -> None:
         """Rebuild a window's title from its live `title_suffix()`, keeping its deduped
         base name."""
         inst = self.instances.get(thread_id)
         if inst is not None:
             base = inst.saved.get("base_name") or (type(inst).menu_label or type(inst).id.title())
             title = self._compose_title(base, inst.title_suffix())
-            self.rename_topic(thread_id, title, immediate=immediate)
+            self.rename_topic(thread_id, title, immediate=immediate, quiet=quiet)
 
-    def rename_topic(self, thread_id: int, name: str, immediate: bool = False) -> None:
+    def rename_topic(
+        self, thread_id: int, name: str, immediate: bool = False, quiet: float = 0.0
+    ) -> None:
         """Record a topic's wanted name (a frame-skip title, see `show_title`) and
         return at once; a name equal to the topic's current one makes no call."""
         inst = self.instances.get(thread_id)
@@ -2058,7 +2088,7 @@ class Kernel(Transport):
         if self._names().get(thread_id) == name:
             self.drop_title(thread_id)  # unchanged → no API call
             return
-        self.show_title(self.chat_id, thread_id, name, immediate=immediate)
+        self.show_title(self.chat_id, thread_id, name, immediate=immediate, quiet=quiet)
 
     def _title_landed(self, thread_id: int, name: str) -> None:
         super()._title_landed(thread_id, name)
@@ -2540,6 +2570,7 @@ class Kernel(Transport):
                 await inst.on_shutdown()
             except Exception:
                 LOGGER.exception("on_shutdown failed (%s)", inst.thread_id)
+        self.end_title_quiet()
         try:
             await asyncio.wait_for(self.flush_frames(), SHUTDOWN_FLUSH)
         except TimeoutError:

@@ -102,7 +102,8 @@ def test_the_summary_line_carries_context_and_quota(tmp_path):
         await drain(c, t)
         summary = texts(c)[0].replace("\\", "").splitlines()[0]
         assert summary.startswith("🔧 1 · ")
-        assert summary.endswith(" tokens · ctx 21% (41.4k) · 5h 1% · 7d 0%")
+        assert summary.endswith(" · ctx 21% (41.4k) · 5h 1% · 7d 0%")
+        assert " · ↓ " in summary and "tokens" not in summary
         assert t.context_window == 200_000
         assert t.saved["session"]["context_window"] == 200_000  # kept per window
 
@@ -129,7 +130,8 @@ def test_the_live_status_line_carries_context_and_quota(tmp_path):
         apply_event(t.turn, events["message_start"])
         t._note_quota(events["rate_limit_event"])
         head = t._live_view(t.turn).splitlines()[0]
-        assert head.endswith("tokens · ctx 21% (41.4k) · 5h 1% · 7d 0%)")
+        assert head.endswith(" · ctx 21% (41.4k) · 5h 1% · 7d 0%")  # no outer parentheses
+        assert " · ↓ " in head and "tokens" not in head and "(" not in head.split("ctx")[0]
 
     asyncio.run(scenario())
 

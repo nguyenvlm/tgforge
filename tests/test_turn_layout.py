@@ -104,7 +104,7 @@ def test_no_tools_gives_a_summary_only_message_and_the_answer(tmp_path):
         await _turn(c, t, answer="just text")
         shown = texts(c)
         assert len(shown) == 2
-        assert "tokens" in shown[0] and "🔧" not in shown[0]
+        assert "↓" in shown[0] and "🔧" not in shown[0]
         assert "**>" not in shown[0] and not shown[0].endswith("||")  # no block
         assert shown[1] == "just text"
 

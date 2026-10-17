@@ -100,8 +100,8 @@ def status_head(seed: int, spin: int, elapsed: int, tokens: int, usage: list[str
     context and quota parts."""
     frame = SPINNER[spin % len(SPINNER)]
     word = WORDS[(seed + elapsed // 20) % len(WORDS)]
-    parts = [fmt_duration(elapsed), f"↓ {fmt_tokens(tokens)} tokens", *usage]
-    return f"{frame} {word}… ({' · '.join(parts)})"
+    parts = [fmt_duration(elapsed), f"↓ {fmt_tokens(tokens)}", *usage]
+    return f"{frame} {word}… {' · '.join(parts)}"
 
 
 def default_context_window(model: str) -> int:

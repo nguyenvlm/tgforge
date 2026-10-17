@@ -704,7 +704,7 @@ class ClaudeTopic(Topic):
         return [p for p in parts if p]
 
     def _summary(self, turn: TurnState, ended: float, drop_last_text: bool = False) -> str:
-        """`🔧 N · 💬 N · duration · tokens · ctx P% (T) · 5h P% · 7d P%`."""
+        """`🔧 N · 💬 N · duration · ↓ tokens · ctx P% (T) · 5h P% · 7d P%`."""
         _, n_tools, n_narr = render_timeline(turn.timeline, drop_last_text)
         parts = []
         if n_tools:
@@ -712,7 +712,7 @@ class ClaudeTopic(Topic):
         if n_narr:
             parts.append(f"💬 {n_narr}")
         parts.append(fmt_duration(int(ended - turn.started)))
-        parts.append(f"{fmt_tokens(turn.tok_base + turn.tok_latest)} tokens")
+        parts.append(f"↓ {fmt_tokens(turn.tok_base + turn.tok_latest)}")
         return " · ".join(parts + self._usage_parts(turn.context_tokens))
 
     def _live_view(self, turn: TurnState) -> str:

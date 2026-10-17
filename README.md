@@ -15,7 +15,7 @@ The wizard installs the bot as a user service (systemd on Linux, launchd on macO
 
 - **Claude** (`/claude`) — a Claude Code session per window, with model/account/workspace pickers, plus `!` / `!!` one-shot shell prefixes inside a Claude window (`!cmd` runs it in the window's workspace, `!!cmd` also hands the output to the agent).
 - **Shell** (`/shell`) — a persistent PTY: each message is a line to stdin (slashes included), with Ctrl-C / Ctrl-D / close buttons. Starts in one of the agent's workspace roots, survives a bot restart and revives in the last cwd.
-- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`.
+- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`; type a path (absolute, relative to the current folder, or `~/…`) to jump there. The topic title follows the folder once you stop navigating for 30 s.
 - **gcloud** (`/gcloud`) — browserless Google Cloud sign-in.
 
 Built-in commands work in every window: `/` opens the button menu, `/new`, `/close`, `/help`, `/usage`, `/restart`. To run it in the foreground instead of the service: `tgforge run`. To remove a bot: `tgforge uninstall [name]` (`--keep-home` keeps its state).
@@ -66,7 +66,7 @@ Claude-plugin extras:
 - **Background jobs**: a panel at the bottom of the window lists the agent's running background jobs; a finished job shows ✓ / ✗ (◼ when the outcome is unknown) for a short while, then drops. `/kill <job>` stops one (no name → pick from buttons); `/cancel` only interrupts the running turn.
 - **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every typed prompt (a slash prompt, i.e. a skill, is sent as is).
 - Every typed prompt is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
-- **A finished turn** reads, top to bottom: the summary line `🔧 tools · 💬 notes · duration · tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` (context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), the tool calls folded under it into collapsed blocks (tap to expand), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
+- **A finished turn** reads, top to bottom: the summary line `🔧 tools · 💬 notes · duration · ↓ output tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` (context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), the tool calls folded under it into collapsed blocks (tap to expand), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
 
 ## How it works
 
