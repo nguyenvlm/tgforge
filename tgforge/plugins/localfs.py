@@ -1,6 +1,9 @@
 """Local-filesystem browser: `/localfs` opens a tap-to-navigate window over the
-whole filesystem. Each tap edits the window's panel in place; the current dir /
-file view persists in the window store, so a restart re-renders where it left off.
+whole filesystem. The view is the window's bottom frame: each tap records its newest
+content (edited in place when a slot is free), so taps never wait on Telegram, and a
+newer message in the topic re-sends it below. A typed path jumps to that folder. The
+current dir / file view persists in the window store, so a restart re-renders where it
+left off; the title stays the window's name.
 """
 
 from __future__ import annotations
@@ -9,12 +12,14 @@ import os
 from pathlib import Path
 
 from tgforge.base import ui
-from tgforge.base.kernel import Plugin, Topic, action, command, launch
+from tgforge.base.kernel import Plugin, Topic, action, command, launch, on_message
 from tgforge.base.ui import MAX_MSG
 
 PAGE = 10  # dir entries per page
 PREVIEW_BYTES = 3000
 PREVIEW_LINES = 40
+VIEW_FRAME = "view"  # the bottom frame holding the browser
+NOTE_LIFETIME = 30.0  # s before a bad-path notice is deleted
 
 
 def _human_size(n: int) -> str:
@@ -41,14 +46,6 @@ class LocalfsTopic(Topic):
     icon = "📁"
     menu_label = "Files"
 
-    def __init__(self, core, thread_id, name, saved):
-        super().__init__(core, thread_id, name, saved)
-        self.msg_id: int | None = None
-
-    def title_suffix(self) -> str | None:
-        cwd = self.saved.get("cwd")
-        return (Path(cwd).name or "/") if cwd else None
-
     async def _pick_start(self) -> str:
         home = str(self._core.config.home_path)
         bms = self.plugin.bookmarks
@@ -61,14 +58,11 @@ class LocalfsTopic(Topic):
         self.saved["cwd"] = await self._pick_start()
         self.saved["view"] = None
         self.saved["page"] = 0
-        self.msg_id = await self.send("opening…")
-        await self._redraw()
-        await self.refresh_title()
+        self._redraw()
 
     async def on_revive(self):
-        self.msg_id = await self.send("↻ browser restored")
-        await self._redraw()
-        await self.refresh_title()
+        self._redraw()
+        await self.refresh_title()  # the title is the window's name alone
 
     # ── Listing + views ────────────────────────────────────────────
     def _list(self, cwd: str):
@@ -154,15 +148,15 @@ class LocalfsTopic(Topic):
         dl = ui.act("⬇ download", "fs", "dl")
         return _code(content), content, ui.keyboard([[dl], [back, close]])
 
-    async def _redraw(self):
-        if self.msg_id is None:
-            return
+    def _redraw(self):
+        """Record the view's newest frame and return at once: a burst of taps shows the
+        last view, never waiting on Telegram."""
         if self.saved.get("view"):
             md, plain, markup = self._file_view()
-            await self.edit_md(self.msg_id, md, plain, reply_markup=markup)
+            self.show_bottom_frame(VIEW_FRAME, plain, md, reply_markup=markup)
         else:
             text, markup = self._dir_view()
-            await self.edit(self.msg_id, text, reply_markup=markup)
+            self.show_bottom_frame(VIEW_FRAME, text, reply_markup=markup)
 
     # ── Button routing ─────────────────────────────────────────────
     @action("fs")
@@ -199,9 +193,35 @@ class LocalfsTopic(Topic):
             self.saved["page"] = int(idx)
         elif act == "back":
             self.saved["view"] = None
-        await self._redraw()
-        if act in ("cd", "up"):
-            await self.refresh_title()
+        self._redraw()
+
+    @on_message
+    async def goto(self, ctx):
+        """A typed path jumps to that folder (relative to the current one, `~` expanded);
+        anything else gets a brief notice. The typed message is deleted either way."""
+        raw = ctx.text.strip()
+        if ctx.message is not None:
+            await ctx.delete(ctx.message.message_id)  # the view shows where it went
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = Path(self.saved["cwd"]) / target
+        target = Path(os.path.normpath(target))
+        try:
+            if target.is_dir():
+                reason = None
+            elif target.exists():
+                reason = "not a folder"
+            else:
+                reason = "no such folder"
+        except (OSError, ValueError) as e:  # too long, no permission to look, a NUL byte
+            reason = f"can't open ({e.__class__.__name__})"
+        if reason is not None:
+            await self.send_temporary(f"⚠️ {reason}: {raw}", NOTE_LIFETIME)
+            return
+        self.saved["cwd"] = str(target)
+        self.saved["page"] = 0
+        self.saved["view"] = None
+        self._redraw()
 
     # ── Bookmarks ──────────────────────────────────────────────────
     @command("/bookmarks", "go to or edit bookmarked folders", icon="⭐")
@@ -223,8 +243,7 @@ class LocalfsTopic(Topic):
                 self.saved["cwd"] = pick
                 self.saved["page"] = 0
                 self.saved["view"] = None
-                await self._redraw()
-                await self.refresh_title()
+                self._redraw()
         elif choice == "add":
             n = self.plugin.add_bookmark(self.saved["cwd"])
             await self.send(f"⭐ bookmarked {Path(self.saved['cwd']).name} — {n} bookmark(s)")

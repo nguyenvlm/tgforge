@@ -6,15 +6,15 @@ raw input (not commands); the panel's Ctrl-C / Ctrl-D / close buttons drive it.
 Output streams line-based (ANSI stripped) into one live message; a full-screen TUI
 (vim, htop) can't render there, so it's detected and its process is stopped (the
 panel can't show it). The window survives a bot restart: the PTY is gone, so the
-next message revives a fresh shell in the last working directory. The chosen
-workspace root and last cwd persist in the window store.
+next message revives a fresh shell in the last working directory. Only the last cwd
+persists in the window store; the workspace roots are the agent's (see
+`Shell.workspace_roots`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import fcntl
-import glob
 import os
 import pty
 import re
@@ -25,6 +25,7 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import Plugin, Topic, action, launch, on_message, pid_cwd, reap
+from tgforge.plugins.claude.config import read_roots, resolve_roots
 
 # ── PtyWindow: a Topic backed by a PTY-hosted child ────────────────
 # Owns the spawn / non-blocking read / write / reap plumbing. The child is reaped in
@@ -149,8 +150,7 @@ class ShellTopic(PtyWindow):
         self.allow_universal = True  # flipped off while a TUI holds the screen
         self.last_cmd = ""  # last line fed — names the program that went full-screen
         self._raw_tail = ""
-        self.msg_id: int | None = None
-        self._last_panel: str | None = None  # last rendered panel md — skip no-op edits
+        self.msg_id: int | None = None  # the live panel, sent when the shell spawns
         self._flush_task: asyncio.Task | None = None
 
     # ── Lifecycle ──────────────────────────────────────────────────
@@ -161,8 +161,8 @@ class ShellTopic(PtyWindow):
     async def on_open(self):
         cwd = await self._pick_cwd()
         self.saved["cwd"] = cwd
-        await self._spawn(cwd)
         await self.send("🖥 interactive shell — send commands as messages")
+        await self._spawn(cwd)
         await self.refresh_title()
 
     async def on_revive(self):
@@ -172,7 +172,7 @@ class ShellTopic(PtyWindow):
         await self._kill()
 
     async def _pick_cwd(self) -> str:
-        roots = self.plugin.workspace_roots() if self.plugin else []
+        roots = self.plugin.workspace_roots(self._core) if self.plugin else []
         if not roots:
             return str(self._core.config.home_path)
         if len(roots) == 1:
@@ -193,14 +193,17 @@ class ShellTopic(PtyWindow):
             "PATH": f"{Path.home()}/.local/bin:" + os.environ.get("PATH", ""),
         }
         await self._spawn_pty(cwd or str(self._core.config.home_path), env)
+        # the panel is sent here, from the handler, so the flush loop (which reads the
+        # PTY) only ever records frames and never waits on Telegram
+        self.msg_id = await self.send("(no output yet)")
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _ensure_proc(self):
         if self.proc is None or self.proc.returncode is not None:
             cwd = self.saved.get("cwd")
             where = f", back in {cwd}" if cwd else ""
-            await self._spawn(cwd)
             await self.send(f"🖥 shell restarted — fresh process{where}")
+            await self._spawn(cwd)
 
     def _on_output(self, data: bytes):
         raw = data.decode(errors="replace")
@@ -226,7 +229,7 @@ class ShellTopic(PtyWindow):
             await asyncio.sleep(FLUSH_INTERVAL)
             if self.dirty:
                 self.dirty = False
-                await self._render()
+                self._render()
                 cwd = self._pid_cwd()
                 if cwd and self.saved.get("cwd") != cwd:
                     self.saved["cwd"] = cwd  # snapshot so a revive lands here
@@ -290,22 +293,13 @@ class ShellTopic(PtyWindow):
             return None
         return pid_cwd(self.proc.pid)
 
-    async def _render(self):
-        if self.tui:
+    def _render(self):
+        """Record the panel's newest frame (the kernel skips an unchanged one)."""
+        if self.tui or self.msg_id is None:
             return  # a full-screen app briefly holds the screen; _end_tui posts the notice
         body = self.acc[-TAIL_CHARS:].strip() or "(no output yet)"
         esc = body.replace("\\", "\\\\").replace("`", "\\`")
-        await self._push(f"```\n{esc}\n```", body)
-
-    async def _push(self, md: str, plain: str):
-        if self.msg_id is None:
-            self.msg_id = await self.send(plain)
-            if self.msg_id is None:
-                return
-        if md == self._last_panel:
-            return  # unchanged → skip the no-op edit that would flip the panel to plain
-        self._last_panel = md
-        await self.edit_md(self.msg_id, md, plain, self._keys())
+        self.show_frame(self.msg_id, body, f"```\n{esc}\n```", reply_markup=self._keys())
 
     def _keys(self):
         return ui.keyboard(
@@ -350,15 +344,12 @@ class Shell(Plugin):
     def __init__(self, roots=None):
         self._roots = list(roots) if roots else []
 
-    def workspace_roots(self) -> list[Path]:
-        """Configured workspace roots (globs → existing dirs). Persisted edits in
-        the plugin store take priority; empty means the window falls back to home."""
-        globs = self.saved.get("roots", None) if hasattr(self, "saved") else None
-        globs = globs if globs is not None else self._roots
-        out: list[Path] = []
-        for g in globs:
-            for hit in sorted(glob.glob(os.path.expanduser(g))):
-                p = Path(hit)
-                if p.is_dir() and p not in out:
-                    out.append(p)
-        return out
+    def workspace_roots(self, core) -> list[Path]:
+        """The agent's workspace roots: the live claude plugin's (saved edits or its
+        `Claude(roots=[...])`), else the ones the install wizard / `tgforge workspaces`
+        saved in the bot home's state.db, else the roots this plugin was built with;
+        empty means the window falls back to home."""
+        agent = core.plugin_by_id.get("claude")
+        if agent is not None and agent.workspaces:
+            return list(agent.workspaces)
+        return resolve_roots(read_roots(core.config.home_path) or self._roots)

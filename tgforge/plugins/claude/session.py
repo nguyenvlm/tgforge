@@ -15,6 +15,10 @@ from tgforge.plugins.claude.events import extract_tool_status
 class TurnState:
     """Per-turn accumulators, reset at each turn start."""
 
+    card_id: int | None = None  # the turn's live card message, once the driver sent it
+    reply_to: int | None = None  # the message the turn answers
+    started: float = 0.0  # monotonic turn start
+    context_tokens: int = 0  # prompt size of the turn's latest model call
     preview_parts: list[str] = field(default_factory=list)  # current text block, live
     thinking_parts: list[str] = field(default_factory=list)  # current think block, live
     # ordered completed events (kind, payload): "tool"/"thinking"/"text";
@@ -35,8 +39,8 @@ class TurnAnswer:
 
 
 def apply_event(st: TurnState, ev: dict) -> None:
-    """Fold one stream-json event into the turn state: stream deltas, token roll,
-    completed text/thinking blocks, tool lines, and the compaction flag."""
+    """Fold one stream-json event into the turn state: stream deltas, token roll, the
+    context size, completed text/thinking blocks, tool lines, and the compaction flag."""
     t = ev.get("type")
     if t == "system" and ev.get("subtype") == "compact_boundary":
         st.compacted = True  # empty result = compaction, not cancel
@@ -55,6 +59,13 @@ def apply_event(st: TurnState, ev: dict) -> None:
             st._think_delta_seen = False
             st.tok_base += st.tok_latest
             st.tok_latest = 0
+            usage = inner.get("message", {}).get("usage") or {}
+            if usage and ev.get("parent_tool_use_id") is None:  # the main agent, not a subagent
+                st.context_tokens = (
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                )
         elif it == "message_delta":
             usage = inner.get("usage") or {}
             st.tok_latest = usage.get("output_tokens") or st.tok_latest

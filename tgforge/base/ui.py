@@ -84,12 +84,83 @@ def mdv2_escape(text: str) -> str:
     return "".join("\\" + c if c in "_*[]()~`>#+-=|{}.!\\" else c for c in text)
 
 
+def _collapsed(lines: list[str]) -> str:
+    rows = [("**>" if i == 0 else ">") + mdv2_escape(ln) for i, ln in enumerate(lines)]
+    return "\n".join(rows) + "||"
+
+
 def expandable(header: str, body: str) -> str:
     """A collapsed-by-default MarkdownV2 expandable blockquote: `header` is the
     always-shown first line, `body` the hidden-until-tapped remainder."""
-    lines = [header] + (["", *body.split("\n")] if body else [])
-    rows = [("**>" if i == 0 else ">") + mdv2_escape(ln) for i, ln in enumerate(lines)]
-    return "\n".join(rows) + "||"
+    return _collapsed([header] + (["", *body.split("\n")] if body else []))
+
+
+def _page(head: str, body: str, first: bool) -> tuple[str, str]:
+    """(md, plain) of one page: page 1 is `head` as a plain line with `body` collapsed
+    under it (no block when empty); a later page is one expandable headed `head`."""
+    if not first:
+        return expandable(head, body), head + (f"\n\n{body}" if body else "")
+    if not body:
+        return mdv2_escape(head), head
+    quote = _collapsed(body.split("\n"))
+    return f"{mdv2_escape(head)}\n{quote}", f"{head}\n{body}"
+
+
+def expandable_pages(
+    header: str, entries: list[str], limit: int = MAX_MSG
+) -> list[tuple[str, str]]:
+    """Fold `entries` into as few messages as fit, nothing cut: page 1 is `header` as a
+    plain line above its collapsed entries, the rest are collapsed blocks headed `↳ i/n`;
+    an entry too long for one message is split across messages. Returns (md, plain) per
+    page, each within `limit`."""
+    count = 1
+    while True:  # pack against the longest `↳ i/n` the page count needs, until it holds
+        cont = f"↳ {count}/{count}"
+        pages = _pack_pages(header, cont, entries, limit)
+        if len(pages) <= count:
+            break
+        count = len(pages)
+    return [
+        _page(header if i == 0 else f"↳ {i + 1}/{len(pages)}", "\n\n".join(page), i == 0)
+        for i, page in enumerate(pages)
+    ]
+
+
+def _pack_pages(header: str, cont: str, entries: list[str], limit: int) -> list[list[str]]:
+    parts: list[str] = []
+    for entry in entries:
+        parts.extend(_split_to_fit(entry, header, cont, limit))
+    pages: list[list[str]] = [[]]
+    for part in parts:
+        first = len(pages) == 1
+        body = "\n\n".join([*pages[-1], part])
+        if pages[-1] and len(_page(header if first else cont, body, first)[0]) > limit:
+            pages.append([])
+        pages[-1].append(part)
+    return pages
+
+
+def _split_to_fit(entry: str, header: str, cont: str, limit: int) -> list[str]:
+    """Split one entry into pieces that each fit page 1 under `header` and a later page
+    under `cont`, cutting at a newline (else a space) when one is near."""
+
+    def fits(text: str) -> bool:
+        return all(len(_page(h, text, f)[0]) <= limit for h, f in ((header, True), (cont, False)))
+
+    pieces = []
+    while not fits(entry):
+        cut = min(len(entry), limit)
+        while cut > 1 and not fits(entry[:cut]):
+            cut = cut * 9 // 10
+        for sep in ("\n", " "):
+            at = entry.rfind(sep, cut // 2, cut)
+            if at > 0:
+                cut = at
+                break
+        pieces.append(entry[:cut].rstrip())
+        entry = entry[cut:].lstrip()
+    pieces.append(entry)
+    return pieces
 
 
 def fmt_duration(seconds: int) -> str:

@@ -87,8 +87,9 @@ def test_dedup_base_survives_title_refresh(tmp_path):
         c = TestClient(Localfs(), home=str(tmp_path))
         w = await c.core.open_window(100, LocalfsTopic, None)
         w.saved["base_name"] = "Files #2"  # a deduped window
-        w.saved["cwd"] = "/srv/proj"
+        w.title_suffix = lambda: "proj"
         await w.refresh_title()
+        await c.core.flush_frames()
         # refresh recomposes from the stored base, not the class label → "#2" survives
         assert c.core._names()[w.thread_id] == "📁 Files #2 · proj"
 
@@ -158,9 +159,10 @@ def test_set_markup_attaches_keyboard(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
         t = c.core._instantiate(ClaudeTopic, 555, "work")
-        kb = await t._attach_suggestions(42, ["yes", "no"])
-        assert kb is not None
-        assert 42 in c.bot.markup_cleared  # the markup edit reached the (mock) API
+        kb = t._suggestion_markup(["yes", "no"])
+        await t.send_rich("the answer", reply_markup=kb)
+        assert c.bot.last_markup is kb  # the buttons ride the answer's own send
+        assert c.bot.markup_cleared == []  # no separate markup edit
 
     asyncio.run(scenario())
 
@@ -179,7 +181,7 @@ def test_plain_suggestion_routes_to_agent(tmp_path):
             submitted.append(prompt)
 
         t.submit = rec
-        await t._attach_suggestions(7, ["hi there", "!ls"])
+        t._suggestion_markup(["hi there", "!ls"])
         token = next(iter(t._suggested))
         await t._on_suggestion(SimpleNamespace(message=None), f"{token}:0")
         assert submitted == ["hi there"]  # a plain reply still reaches the agent
@@ -205,7 +207,7 @@ def test_bang_suggestion_runs_shell_not_prompt(tmp_path):
 
         t.submit = rec
         t.plugin._one_shot = fake_one_shot
-        await t._attach_suggestions(7, ["hi there", "!ls"])
+        t._suggestion_markup(["hi there", "!ls"])
         token = next(iter(t._suggested))
         await t._on_suggestion(SimpleNamespace(message=None), f"{token}:1")  # tap "!ls"
         assert shelled == [("!ls", False)]  # ran the shell prefix, honouring the ! route

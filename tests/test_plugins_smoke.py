@@ -73,7 +73,7 @@ def test_localfs_opens_and_navigates(tmp_path):
         assert inst.saved["cwd"] == str(tmp_path.resolve())
         # point at a clean dir so "sub" is the only entry, then tap into it
         inst.saved["cwd"] = str(base)
-        await inst._redraw()
+        inst._redraw()
         cb = SimpleNamespace(
             data="act:fs:cd:0",
             message=SimpleNamespace(message_thread_id=inst.thread_id, chat=SimpleNamespace(id=100)),

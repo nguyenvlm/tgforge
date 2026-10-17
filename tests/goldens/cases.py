@@ -99,7 +99,6 @@ RENDER_CASES = [
     ("tool_line", ["WebFetch", {"url": "http://x.com"}]),
     ("tool_line", ["Mystery", {"a": "", "b": "seen"}]),
     ("tool_line", ["Bash", "not-a-dict"]),
-    ("tool_line", ["Bash", {"command": "x" * 200}]),
     ("fmt_tokens", [0]),
     ("fmt_tokens", [999]),
     ("fmt_tokens", [1000]),

@@ -8,14 +8,14 @@ There are two ways to use it: run the **out-of-the-box app** (all bundled plugin
 
 ```
 uv pip install "tgforge @ git+https://github.com/nguyenvlm/tgforge"
-tgforge install     # wizard: name → token → config → user service → guided group setup
+tgforge install     # wizard: name → token → workspaces → config → user service → guided group setup
 ```
 
 The wizard installs the bot as a user service (systemd on Linux, launchd on macOS) and walks you through connecting it to a forum group. That's it — the default app ships every bundled plugin:
 
-- **Claude** (`/claude`) — a Claude Code session per window, with model/account/workspace pickers, plus `!` / `!!` one-shot shell prefixes anywhere.
-- **Shell** (`/shell`) — a persistent PTY: each message is a line to stdin (slashes included), with Ctrl-C / Ctrl-D / close buttons. Survives a bot restart and revives in the last cwd.
-- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`.
+- **Claude** (`/claude`) — a Claude Code session per window, with model/account/workspace pickers, plus `!` / `!!` one-shot shell prefixes inside a Claude window (`!cmd` runs it in the window's workspace, `!!cmd` also hands the output to the agent).
+- **Shell** (`/shell`) — a persistent PTY: each message is a line to stdin (slashes included), with Ctrl-C / Ctrl-D / close buttons. Starts in one of the agent's workspace roots, survives a bot restart and revives in the last cwd.
+- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`, kept as the topic's bottom message; type a path (absolute, relative to the current folder, or `~/…`) to jump there.
 - **gcloud** (`/gcloud`) — browserless Google Cloud sign-in.
 
 Built-in commands work in every window: `/` opens the button menu, `/new`, `/close`, `/help`, `/usage`, `/restart`. To run it in the foreground instead of the service: `tgforge run`. To remove a bot: `tgforge uninstall [name]` (`--keep-home` keeps its state).
@@ -64,11 +64,14 @@ Claude-plugin extras:
 - **Workspaces** (where the agent runs): `tgforge workspaces add <path-or-glob>` on the CLI, or `/workspace` in Telegram. Switching a topic to another root starts a fresh session there; the old one stays resumable.
 - **Model / effort** (per window): `/model` switches the active model (and edits the offered list), `/effort` switches the reasoning effort — the next message respawns the session with it.
 - **Background jobs**: a panel at the bottom of the window lists the agent's running background jobs; a finished job shows ✓ / ✗ (◼ when the outcome is unknown) for a short while, then drops. `/kill <job>` stops one (no name → pick from buttons); `/cancel` only interrupts the running turn.
-- **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every agent turn.
-- Every turn is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
+- **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every typed prompt (a slash prompt, i.e. a skill, is sent as is).
+- Every typed prompt is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
+- **A finished turn** reads, top to bottom: the summary line `🔧 tools · 💬 notes · duration · ↓ output tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` (context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), the tool calls folded under it into collapsed blocks (tap to expand), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
 
 ## How it works
 
 `tgforge/base/` is five modules: `kernel.py` (the whole core — persistence, the plugin API, Telegram transport, command registry, router, window lifecycle, menus), `app.py` (the `App` + `OwnerOnly` auth), `ui.py`, `config.py`, `service.py` (the managed service + detached restart).
 
-Each forum topic is a window owned by one class. The kernel routes an event down a chain — the window's own commands, then universal commands, then the window's `on_message` / `on_unknown` — and each handler may consume it or return `False` to fall through. General (outside any topic) reacts only to an `@mention`. Window titles track state (`Claude · <session>`, `Shell · <cwd>`) via a `title_suffix()` hook.
+Each forum topic is a window owned by one class. The kernel routes an event down a chain — the window's own commands, then universal commands, then the window's `on_message` / `on_unknown` — and each handler may consume it or return `False` to fall through. General (outside any topic) reacts only to an `@mention`. Window titles track state via a `title_suffix()` hook (`Shell · <cwd>`); a Claude window takes its session's title (`🤖 <session title>`).
+
+Telegram allows a group about 20 messages a minute, so the bot paces itself below that. Messages that change over time (a live card, a panel, the file browser, a shell's output, a topic title) only record their newest content and are redrawn when a slot is free — under a rate limit the bot keeps working and shows the latest state once Telegram allows it, skipping the frames in between. New messages are never skipped: they go out in order, after the wait. A topic is renamed at most every 5 s (each rename posts a "topic renamed" notice), so quick folder clicks give one rename to the last folder.

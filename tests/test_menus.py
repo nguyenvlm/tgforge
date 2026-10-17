@@ -108,7 +108,20 @@ def test_model_helpers_and_typed_path(tmp_path):
         await claude._models_typed(ctx)
         assert all(v != "claude-sonnet" for _l, v in claude.models)
         claude.reset_models()
-        assert claude.models == []
+        assert claude.models == []  # no app list: the library default
+
+    asyncio.run(scenario())
+
+
+def test_model_reset_restores_the_app_list(tmp_path):
+    async def scenario():
+        app_models = [["Opus", "claude-opus"], ["Haiku", "claude-haiku"]]
+        client = TestClient(Claude(models=app_models), home=str(tmp_path))
+        claude = client.core.plugin_by_id["claude"]
+        claude.add_model("Extra", "x")
+        claude.reset_models()
+        assert claude.models == app_models
+        assert claude.saved["models"] == app_models  # what a restart loads back
 
     asyncio.run(scenario())
 

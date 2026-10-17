@@ -44,12 +44,12 @@ def test_release_also_reaps(tmp_path):
     asyncio.run(scenario())
 
 
-def test_kill_process_group_kills_what_the_shell_started(tmp_path):
+def test_reap_kills_what_a_session_leading_shell_started(tmp_path):
     """A timed-out `!` command must not leave its children running: killing only the
     shell orphaned a child that kept working after the timeout was reported."""
     import os
 
-    from tgforge.base.kernel import kill_process_group
+    from tgforge.base.kernel import reap
 
     pid_file = tmp_path / "child.pid"
 
@@ -64,7 +64,7 @@ def test_kill_process_group_kills_what_the_shell_started(tmp_path):
             await asyncio.sleep(0.02)
         child = int(pid_file.read_text())
         os.kill(child, 0)  # alive before the kill
-        await kill_process_group(proc)
+        await reap(proc)
         for _ in range(100):
             # gone = no /proc entry (reaped) or a zombie; a reap can land between
             # any two reads, so one read decides
@@ -72,7 +72,7 @@ def test_kill_process_group_kills_what_the_shell_started(tmp_path):
                 with open(f"/proc/{child}/stat") as stat:
                     if stat.read().split()[2] == "Z":
                         return
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # reaped at open or at read
                 return
             await asyncio.sleep(0.02)
         raise AssertionError("the shell's child survived the group kill")

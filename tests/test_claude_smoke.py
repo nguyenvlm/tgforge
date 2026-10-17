@@ -95,7 +95,7 @@ def test_one_turn_against_fake_cli(tmp_path):
         await t.submit("hello there")
 
         async def answered():
-            return any("ANSWER" in e for e in core.bot.edited)
+            return any("ANSWER" in e for e in core.bot.sent)  # the answer is its own message
 
         waited = 0.0
         while waited < 6.0 and not await answered():

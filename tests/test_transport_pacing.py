@@ -1,13 +1,13 @@
 """The transport paces every outbound call under Telegram's per-group rate so a 429
-never fires in the first place. Essential calls (a reply) wait for a slot; droppable
-repaints skip when none is free and yield to any waiting essential."""
+never fires in the first place. Essential calls (a reply) wait for a slot; frame pushes
+wait for a spare one and yield to any pending essential."""
 
 from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
 
-from tgforge.base.kernel import _SKIPPED, Transport, _Pacer
+from tgforge.base.kernel import Transport, _Pacer
 
 
 def _fake_clock(monkeypatch):
@@ -29,57 +29,41 @@ def test_pacer_bursts_then_paces_essential(monkeypatch):
     async def scenario():
         _, slept = _fake_clock(monkeypatch)
         p = _Pacer(per_min=60, burst=2)  # 1 token/s, burst of 2
-        assert await p.acquire(wait=True)  # burst slot 1 — instant
-        assert await p.acquire(wait=True)  # burst slot 2 — instant
+        await p.take()  # burst slot 1 — instant
+        await p.take()  # burst slot 2 — instant
         assert slept == []
-        assert await p.acquire(wait=True)  # empty → waits one refill (~1s)
+        await p.take()  # empty → waits one refill (~1s)
         assert len(slept) == 1 and abs(slept[0] - 1.0) < 1e-6
 
     asyncio.run(scenario())
 
 
-def test_pacer_droppable_skips_when_empty(monkeypatch):
+def test_spare_slot_yields_to_a_pending_essential(monkeypatch):
     async def scenario():
-        _fake_clock(monkeypatch)
-        p = _Pacer(per_min=60, burst=1)
-        assert await p.acquire(wait=True)  # drains the one token
-        assert await p.acquire(wait=False) is False  # droppable skips, never blocks
-
-    asyncio.run(scenario())
-
-
-def test_pacer_droppable_yields_to_a_waiting_essential(monkeypatch):
-    async def scenario():
-        _fake_clock(monkeypatch)
+        clock, slept = _fake_clock(monkeypatch)
         p = _Pacer(per_min=60, burst=5)  # tokens available
-        p.waiting = 1  # an essential reply is queued for a slot
-        assert await p.acquire(wait=False) is False  # repaint yields even with tokens free
-        p.waiting = 0
-        assert await p.acquire(wait=False) is True  # no contender → takes a token
+        p.waiting = 1  # an essential reply is pending
+
+        async def release():
+            await asyncio.sleep(0.5)
+            p.waiting = 0
+
+        releaser = asyncio.create_task(release())
+        await p.take_spare()  # waits although tokens are free
+        await releaser
+        assert slept and clock["t"] >= 0.5  # it only got the slot once the reply was done
 
     asyncio.run(scenario())
 
 
 def test_pacer_disabled_is_a_noop(monkeypatch):
     async def scenario():
-        _fake_clock(monkeypatch)
+        _, slept = _fake_clock(monkeypatch)
         p = _Pacer(per_min=0, burst=0)  # disabled
         for _ in range(50):
-            assert await p.acquire(wait=False) is True  # never paces, never skips
-
-    asyncio.run(scenario())
-
-
-def test_call_droppable_paced_out_skips_the_bot(monkeypatch):
-    async def scenario():
-        _fake_clock(monkeypatch)
-        calls = []
-        bot = SimpleNamespace(edit_message_text=lambda *a, **k: calls.append(1))
-        t = Transport(bot=bot, pace_per_min=60, pace_burst=1)
-        t._pacer.tokens = 0  # budget spent
-        landed = await t.edit(7, 42, "spinner tick", droppable=True)
-        assert landed is False  # paced out → _SKIPPED → not landed
-        assert calls == []  # the bot was never called — no 429 provoked
+            await p.take()
+            await p.take_spare()
+        assert slept == []  # never paces
 
     asyncio.run(scenario())
 
@@ -103,26 +87,14 @@ def test_call_essential_waits_for_a_slot_then_sends(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_pacer_returns_skipped_sentinel_directly(monkeypatch):
-    async def scenario():
-        _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace(), pace_per_min=60, pace_burst=1)
-        t._pacer.tokens = 0
-        out = await t._call(lambda: None, droppable=True)
-        assert out is _SKIPPED
-
-    asyncio.run(scenario())
-
-
 def test_pacer_concurrent_essentials_serialize(monkeypatch):
     """Under real concurrency the lock must stop two waiting essentials from taking the
     same refilled token — all grants land, tokens never driven negative."""
 
     async def scenario():
         p = _Pacer(per_min=60000, burst=1)  # ~1ms per token → fast, real sleeps
-        assert await p.acquire(wait=True)  # drain the initial token
-        results = await asyncio.gather(*[p.acquire(wait=True) for _ in range(8)])
-        assert results == [True] * 8  # every waiter eventually got its own slot
+        await p.take()  # drain the initial token
+        await asyncio.gather(*[p.take() for _ in range(8)])  # every waiter gets its own slot
         assert p.tokens > -1e-9  # never over-consumed past zero
 
     asyncio.run(scenario())
