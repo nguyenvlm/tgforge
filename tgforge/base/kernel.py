@@ -949,7 +949,8 @@ class Transport:
         self._frames: dict[tuple, _Frame] = {}
         self._titles: dict[int, _Title] = {}
         self._title_landed_at: dict[int, float] = {}
-        self._dirty: dict[tuple, None] = {}  # keys awaiting a push, oldest first
+        # keys awaiting a push, oldest first → (first recorded at, times replaced since)
+        self._dirty: dict[tuple, tuple[float, int]] = {}
         self._frame_wakeup = asyncio.Event()
         self._frames_idle = asyncio.Event()
         self._frames_idle.set()
@@ -1158,7 +1159,8 @@ class Transport:
             del self._frames[key]
 
     def _mark_dirty(self, key: tuple) -> None:
-        self._dirty.setdefault(key, None)
+        recorded_at, replaced = self._dirty.get(key, (time.monotonic(), -1))
+        self._dirty[key] = (recorded_at, replaced + 1)
         self._frames_idle.clear()
         self._frame_wakeup.set()
         self._ensure_frame_task()
@@ -1206,12 +1208,14 @@ class Transport:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._frame_wakeup.wait(), self._title_wait())
                 continue
+            slot_wait_from = time.monotonic()
             await self._clear_to_call(spare=True)
             key = self._next_dirty()  # re-pick: the newest state after the waits
             if key is None:
                 self._pacer.give_back()
                 continue
-            del self._dirty[key]
+            recorded_at, replaced = self._dirty.pop(key)
+            pushed_at = time.monotonic()
             self._pushing = True
             try:
                 await self._push(key)
@@ -1219,6 +1223,27 @@ class Transport:
                 LOGGER.exception("frame push failed (%s)", key)
             finally:
                 self._pushing = False
+            LOGGER.info(
+                "frame push %s: %.1fs after first recorded (slot wait %.1fs, call %.1fs, "
+                "%d replaced, %d still pending)",
+                self._frame_label(key),
+                pushed_at - recorded_at,
+                pushed_at - slot_wait_from,
+                time.monotonic() - pushed_at,
+                replaced,
+                len(self._dirty),
+            )
+
+    def _frame_label(self, key: tuple) -> str:
+        frame = self._frames.get(key)
+        thread = f" thread {frame.thread_id}" if frame and frame.thread_id is not None else ""
+        if key[0] == "msg":
+            return f"msg {key[2]}{thread}"
+        if key[0] == "bottom":
+            return f"bottom {key[1]}{thread}"
+        if key[0] == "title":
+            return f"title thread {key[1]}"
+        return f"delete {key[2]}"
 
     async def _push(self, key: tuple) -> None:
         if key[0] == "title":

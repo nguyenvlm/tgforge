@@ -487,3 +487,23 @@ def test_a_lasting_failure_retries_again_after_new_content():
         assert len(bot.texts("send")) == 2 * BOTTOM_RESEND_ATTEMPTS
 
     asyncio.run(scenario())
+
+
+def test_each_frame_push_logs_its_delay_and_replaced_count(caplog):
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        for n in range(3):  # recorded before the frame task runs: one push, 2 replaced
+            t.show_frame(1, 50, f"frame {n}", thread_id=9)
+        t.show_title(1, 7, "a name")
+        await t.flush_frames()
+
+    with caplog.at_level("INFO", logger="tgforge"):
+        asyncio.run(scenario())
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("frame push")]
+    assert len(lines) == 2
+    assert lines[0].startswith("frame push msg 50 thread 9: ")
+    assert "s after first recorded (slot wait " in lines[0]
+    assert "2 replaced, 1 still pending" in lines[0]
+    assert lines[1].startswith("frame push title thread 7: ")
+    assert "0 replaced, 0 still pending" in lines[1]
