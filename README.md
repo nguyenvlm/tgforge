@@ -15,7 +15,7 @@ The wizard installs the bot as a user service (systemd on Linux, launchd on macO
 
 - **Claude** (`/claude`) — a Claude Code session per window, with model/account/workspace pickers, plus `!` / `!!` one-shot shell prefixes inside a Claude window (`!cmd` runs it in the window's workspace, `!!cmd` also hands the output to the agent).
 - **Shell** (`/shell`) — a persistent PTY: each message is a line to stdin (slashes included), with Ctrl-C / Ctrl-D / close buttons. Starts in one of the agent's workspace roots, survives a bot restart and revives in the last cwd.
-- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`; type a path (absolute, relative to the current folder, or `~/…`) to jump there. The topic title follows the folder once you stop navigating for 30 s.
+- **Files** (`/localfs`) — a tap-to-navigate file browser with `/bookmarks`, kept as the topic's bottom message; type a path (absolute, relative to the current folder, or `~/…`) to jump there.
 - **gcloud** (`/gcloud`) — browserless Google Cloud sign-in.
 
 Built-in commands work in every window: `/` opens the button menu, `/new`, `/close`, `/help`, `/usage`, `/restart`. To run it in the foreground instead of the service: `tgforge run`. To remove a bot: `tgforge uninstall [name]` (`--keep-home` keeps its state).
@@ -72,6 +72,6 @@ Claude-plugin extras:
 
 `tgforge/base/` is five modules: `kernel.py` (the whole core — persistence, the plugin API, Telegram transport, command registry, router, window lifecycle, menus), `app.py` (the `App` + `OwnerOnly` auth), `ui.py`, `config.py`, `service.py` (the managed service + detached restart).
 
-Each forum topic is a window owned by one class. The kernel routes an event down a chain — the window's own commands, then universal commands, then the window's `on_message` / `on_unknown` — and each handler may consume it or return `False` to fall through. General (outside any topic) reacts only to an `@mention`. Window titles track state via a `title_suffix()` hook (`Shell · <cwd>`, `Files · <folder>`); a Claude window takes its session's title (`🤖 <session title>`).
+Each forum topic is a window owned by one class. The kernel routes an event down a chain — the window's own commands, then universal commands, then the window's `on_message` / `on_unknown` — and each handler may consume it or return `False` to fall through. General (outside any topic) reacts only to an `@mention`. Window titles track state via a `title_suffix()` hook (`Shell · <cwd>`); a Claude window takes its session's title (`🤖 <session title>`).
 
 Telegram allows a group about 20 messages a minute, so the bot paces itself below that. Messages that change over time (a live card, a panel, the file browser, a shell's output, a topic title) only record their newest content and are redrawn when a slot is free — under a rate limit the bot keeps working and shows the latest state once Telegram allows it, skipping the frames in between. New messages are never skipped: they go out in order, after the wait. A topic is renamed at most every 5 s (each rename posts a "topic renamed" notice), so quick folder clicks give one rename to the last folder.

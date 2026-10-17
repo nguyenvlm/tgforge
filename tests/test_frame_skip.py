@@ -509,20 +509,40 @@ def test_each_frame_push_logs_its_delay_and_replaced_count(caplog):
     assert "0 replaced, 0 still pending" in lines[1]
 
 
-def test_a_quiet_title_waits_until_no_newer_name_came(monkeypatch):
-    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
+def test_a_bottom_frame_keeps_its_keyboard_when_re_sent():
+    async def scenario():
+        bot = _Bot()
+        sent_markup = []
+        real_send = bot.send_message
 
+        async def send_message(chat_id, text, **kw):
+            sent_markup.append(kw.get("reply_markup"))
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send_message
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "view", "the view", reply_markup="KEYS")
+        await t.flush_frames()
+        t.note_message(7, bot._next + 1)  # a newer message below it
+        await t.flush_frames()
+        assert bot.texts("send") == ["the view", "the view"]  # re-sent below
+        assert sent_markup == ["KEYS", "KEYS"]  # the buttons came along
+
+    asyncio.run(scenario())
+
+
+def test_a_message_that_does_not_bury_leaves_the_bottom_frame_in_place():
     async def scenario():
         bot = _Bot()
         t = Transport(bot=bot)
-        for name in ("a", "b", "c"):  # each newer name restarts the quiet period
-            t.show_title(1, 7, name, quiet=0.3)
-            last = time.monotonic()
-            await asyncio.sleep(0.15)
-        assert bot.texts("title") == []
+        t.show_bottom_frame(1, 7, "view", "the view")
         await t.flush_frames()
-        assert bot.texts("title") == ["c"]
-        landed = next(at for at, method, _ in bot.calls if method == "title")
-        assert landed - last >= 0.29
+        await t.send(1, "a notice", thread_id=7, buries_bottom=False)
+        await t.flush_frames()
+        assert bot.texts("send") == ["the view", "a notice"]  # no re-send, no delete
+        assert bot.texts("delete") == []
+        await t.send(1, "a reply", thread_id=7)
+        await t.flush_frames()
+        assert bot.texts("send")[-1] == "the view"  # an ordinary message does re-send it
 
     asyncio.run(scenario())

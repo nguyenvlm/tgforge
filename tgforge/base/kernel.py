@@ -655,13 +655,12 @@ class Topic:
         None → the bare class label. Override, and call `refresh_title()` on change."""
         return None
 
-    async def refresh_title(self, immediate: bool = False, quiet: float = 0.0) -> None:
+    async def refresh_title(self, immediate: bool = False) -> None:
         """Recompose the topic title from the current `title_suffix()` and return at
         once: the rename is a frame-skip title (see `Transport.show_title`), skipped
-        when unchanged, so a burst of state changes gives one rename. `quiet` holds it
-        until the state stopped changing for that many seconds; `immediate` (an
+        when unchanged, so a burst of state changes gives one rename. `immediate` (an
         explicit rename) skips the spacing between renames."""
-        self._core.refresh_title(self.thread_id, immediate=immediate, quiet=quiet)
+        self._core.refresh_title(self.thread_id, immediate=immediate)
 
     # ── Lifecycle hooks (override as needed) ───────────────────────
     async def on_open(self) -> None:
@@ -709,8 +708,12 @@ class Topic:
         )
 
     async def send_temporary(self, text, lifetime: float) -> int | None:
-        """Send a brief notice and delete it `lifetime` seconds later."""
-        msg_id = await self.send(text)
+        """Send a brief notice and delete it `lifetime` seconds later; the window's bottom
+        frames stay where they are."""
+        chat_id = self._core.chat_id
+        msg_id = await self.run_message_call(
+            lambda: self._core.send(chat_id, text, self.thread_id, buries_bottom=False)
+        )
         if msg_id is not None:
             task = asyncio.get_running_loop().create_task(self._delete_after(msg_id, lifetime))
             self._timed_deletes.add(task)
@@ -777,11 +780,16 @@ class Topic:
             thread_id=self.thread_id,
         )
 
-    def show_bottom_frame(self, name: str, plain, md=None) -> None:
+    def show_bottom_frame(self, name: str, plain, md=None, reply_markup=None) -> None:
         """Keep this window's message `name` as its bottom-most message (see
         `Transport.show_bottom_frame`); `plain=None` deletes it."""
         self._core.show_bottom_frame(
-            self._core.chat_id, self.thread_id, f"{self.thread_id}:{name}", plain, md
+            self._core.chat_id,
+            self.thread_id,
+            f"{self.thread_id}:{name}",
+            plain,
+            md,
+            reply_markup=reply_markup,
         )
 
     def bottom_frame_id(self, name: str) -> int | None:
@@ -937,7 +945,6 @@ class _Title:
     thread_id: int
     name: str
     immediate: bool = False  # an explicit rename: no TITLE_MIN_INTERVAL wait
-    quiet_until: float = 0.0  # monotonic time before which it waits (no newer name meanwhile)
 
 
 class Transport:
@@ -999,7 +1006,9 @@ class Transport:
 
     # ── One attempt / essential calls ──────────────────────────────
 
-    async def _attempt(self, make_coro, ok_not_modified=False, spare=True, paced=True):
+    async def _attempt(
+        self, make_coro, ok_not_modified=False, spare=True, paced=True, buries_bottom=True
+    ):
         """Issue one aiogram call (its slot already taken). Returns its result,
         `_FLOODED` on a flood-wait (the deadline is recorded), `_NOT_MODIFIED` on a benign
         "message is not modified" edit when `ok_not_modified`, or None on any other API
@@ -1008,7 +1017,8 @@ class Transport:
         slot like the first try (`_clear_to_call` in the caller's mode: a spare slot for
         the frame task, the default; `_call` passes its own); then given up with a
         warning; a 4xx gets one try. A retried send whose first try did reach Telegram
-        can post twice."""
+        can post twice. `buries_bottom=False` sends a message that leaves the thread's
+        bottom frames where they are (a notice deleted soon)."""
         backoff = TRANSIENT_BACKOFF
         for attempt in range(TRANSIENT_RETRIES + 1):
             try:
@@ -1036,7 +1046,7 @@ class Transport:
                 return None
             break
         message_id = getattr(result, "message_id", None)
-        if isinstance(message_id, int):  # a sent (or edited) message
+        if buries_bottom and isinstance(message_id, int):  # a sent (or edited) message
             self.note_message(getattr(result, "message_thread_id", None), message_id)
         return result
 
@@ -1059,7 +1069,7 @@ class Transport:
             if paced:
                 self._pacer.give_back()
 
-    async def _call(self, make_coro, ok_not_modified=False, paced=True):
+    async def _call(self, make_coro, ok_not_modified=False, paced=True, buries_bottom=True):
         """An essential aiogram call; returns its result. `make_coro` is a zero-arg
         factory (`lambda: self.bot.send_message(...)`) so a retry issues a fresh
         coroutine — awaiting the same one twice is a RuntimeError. Calls go out in issue
@@ -1073,7 +1083,11 @@ class Transport:
                 while True:
                     await self._clear_to_call(paced=paced)
                     result = await self._attempt(
-                        make_coro, ok_not_modified, spare=False, paced=paced
+                        make_coro,
+                        ok_not_modified,
+                        spare=False,
+                        paced=paced,
+                        buries_bottom=buries_bottom,
                     )
                     if result is not _FLOODED:
                         return result
@@ -1112,7 +1126,9 @@ class Transport:
         self._mark_dirty(key)
         return frame
 
-    def show_bottom_frame(self, chat_id, thread_id, key: str, plain, md=None) -> None:
+    def show_bottom_frame(
+        self, chat_id, thread_id, key: str, plain, md=None, reply_markup=None
+    ) -> None:
         """Keep a message as the bottom-most of its thread: the first content sends it
         (silently), later ones edit it, and a newer message in the thread re-sends it
         below and deletes the old copy. `plain=None` deletes it. Returns at once."""
@@ -1124,7 +1140,7 @@ class Transport:
             frame = _Frame(chat_id=chat_id, thread_id=thread_id, message_id=None, plain=plain)
             frame.bottom = True
             self._frames[frame_key] = frame
-        frame.plain, frame.md = plain, md
+        frame.plain, frame.md, frame.reply_markup = plain, md, reply_markup
         self._mark_dirty(frame_key)
 
     def bottom_frame_id(self, key: str) -> int | None:
@@ -1132,23 +1148,13 @@ class Transport:
         frame = self._frames.get(("bottom", key))
         return frame.message_id if frame else None
 
-    def show_title(
-        self, chat_id, thread_id: int, name: str, immediate=False, quiet: float = 0.0
-    ) -> None:
+    def show_title(self, chat_id, thread_id: int, name: str, immediate=False) -> None:
         """Record a topic's newest wanted name and return at once; renames of one topic
         land at least TITLE_MIN_INTERVAL apart (each posts a "topic renamed" service
-        message), so a burst gives one rename to the last name. `quiet` holds the rename
-        until no newer name came for that many seconds. `immediate` skips both waits
-        (an explicit rename)."""
-        quiet_until = time.monotonic() + quiet
-        self._titles[thread_id] = _Title(chat_id, thread_id, name, immediate, quiet_until)
+        message), so a burst gives one rename to the last name. `immediate` skips that
+        wait (an explicit rename)."""
+        self._titles[thread_id] = _Title(chat_id, thread_id, name, immediate)
         self._mark_dirty(("title", thread_id))
-
-    def end_title_quiet(self) -> None:
-        """Let every rename held by its quiet period go out now (a graceful stop)."""
-        for title in self._titles.values():
-            title.quiet_until = 0.0
-        self._frame_wakeup.set()
 
     def drop_title(self, thread_id: int) -> None:
         """Forget a recorded rename (the wanted name is already the topic's)."""
@@ -1210,12 +1216,11 @@ class Transport:
 
     def _title_ready_at(self, thread_id: int) -> float:
         """When a topic's recorded rename may go out: TITLE_MIN_INTERVAL after its last
-        rename and past its quiet period (an immediate one: now)."""
+        rename (an immediate one: now)."""
         title = self._titles.get(thread_id)
         if title is None or title.immediate:
             return 0.0
-        spaced = self._title_landed_at.get(thread_id, -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL
-        return max(spaced, title.quiet_until)
+        return self._title_landed_at.get(thread_id, -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL
 
     def _title_wait(self) -> float | None:
         """Seconds until the earliest waiting title is ready (None when none waits)."""
@@ -1336,8 +1341,8 @@ class Transport:
             _resolve(waiters, True)
 
     async def _resend_bottom(self, key: tuple, frame: _Frame, content: tuple) -> None:
-        plain, md, _markup = content
-        kw = {"disable_notification": True}
+        plain, md, markup = content
+        kw = {"disable_notification": True, "reply_markup": markup}
         if frame.thread_id is not None:
             kw["message_thread_id"] = frame.thread_id
         result = None
@@ -1401,7 +1406,9 @@ class Transport:
 
     # ── Essential sends / edits ────────────────────────────────────
 
-    async def send(self, chat_id, text, thread_id=None, reply_to=None) -> int | None:
+    async def send(
+        self, chat_id, text, thread_id=None, reply_to=None, buries_bottom=True
+    ) -> int | None:
         mid = None
         for i, chunk in enumerate(chunks(text)):
             kw = {}
@@ -1410,7 +1417,8 @@ class Transport:
             if reply_to is not None and i == 0:
                 kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
             msg = await self._call(
-                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, _cap(chunk), **kw)
+                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, _cap(chunk), **kw),
+                buries_bottom=buries_bottom,
             )
             mid = msg.message_id if msg else mid
         return mid
@@ -2068,18 +2076,16 @@ class Kernel(Transport):
         a "#2" survives a title refresh."""
         return f"{base} · {suffix}" if suffix else base
 
-    def refresh_title(self, thread_id: int, immediate: bool = False, quiet: float = 0.0) -> None:
+    def refresh_title(self, thread_id: int, immediate: bool = False) -> None:
         """Rebuild a window's title from its live `title_suffix()`, keeping its deduped
         base name."""
         inst = self.instances.get(thread_id)
         if inst is not None:
             base = inst.saved.get("base_name") or (type(inst).menu_label or type(inst).id.title())
             title = self._compose_title(base, inst.title_suffix())
-            self.rename_topic(thread_id, title, immediate=immediate, quiet=quiet)
+            self.rename_topic(thread_id, title, immediate=immediate)
 
-    def rename_topic(
-        self, thread_id: int, name: str, immediate: bool = False, quiet: float = 0.0
-    ) -> None:
+    def rename_topic(self, thread_id: int, name: str, immediate: bool = False) -> None:
         """Record a topic's wanted name (a frame-skip title, see `show_title`) and
         return at once; a name equal to the topic's current one makes no call."""
         inst = self.instances.get(thread_id)
@@ -2088,7 +2094,7 @@ class Kernel(Transport):
         if self._names().get(thread_id) == name:
             self.drop_title(thread_id)  # unchanged → no API call
             return
-        self.show_title(self.chat_id, thread_id, name, immediate=immediate, quiet=quiet)
+        self.show_title(self.chat_id, thread_id, name, immediate=immediate)
 
     def _title_landed(self, thread_id: int, name: str) -> None:
         super()._title_landed(thread_id, name)
@@ -2570,7 +2576,6 @@ class Kernel(Transport):
                 await inst.on_shutdown()
             except Exception:
                 LOGGER.exception("on_shutdown failed (%s)", inst.thread_id)
-        self.end_title_quiet()
         try:
             await asyncio.wait_for(self.flush_frames(), SHUTDOWN_FLUSH)
         except TimeoutError:

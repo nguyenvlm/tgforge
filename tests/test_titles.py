@@ -39,14 +39,14 @@ def test_compose_title_joins_base_and_suffix(tmp_path):
     assert c.core._compose_title("Files", None) == "Files"  # bare base, no suffix
 
 
-def test_localfs_suffix_is_folder_name(tmp_path):
+def test_localfs_title_is_the_window_name(tmp_path):
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
         t = _instantiate(c, LocalfsTopic, "localfs")
         t.saved["cwd"] = "/srv/data/myproj"
         await t.refresh_title()
         await c.core.flush_frames()
-        assert c.core._names()[555] == "📁 Files · myproj"
+        assert c.core._names()[555] == "📁 Files"  # no folder suffix
 
     asyncio.run(scenario())
 
@@ -124,15 +124,15 @@ def test_sync_title_custom_outranks_ai(tmp_path):
 # ── Flood-safe rename guard ────────────────────────────────────────────
 def test_unchanged_title_skips_the_api_call(tmp_path):
     async def scenario():
-        c = TestClient(Localfs(), home=str(tmp_path))
+        c = TestClient(Shell(), home=str(tmp_path))
         calls = _spy_renames(c.core)
-        t = _instantiate(c, LocalfsTopic, "localfs")
+        t = _instantiate(c, ShellTopic, "shell")
         t.saved["cwd"] = "/srv/data/myproj"
         await t.refresh_title()
         await c.core.flush_frames()
         await t.refresh_title()  # same suffix → no second edit_forum_topic
         await c.core.flush_frames()
-        assert calls == ["📁 Files · myproj"]
+        assert calls == [f"{ShellTopic.icon} {ShellTopic.menu_label} · myproj"]
 
     asyncio.run(scenario())
 

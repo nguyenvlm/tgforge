@@ -90,6 +90,13 @@ async def _files_window(c, root):
     return inst
 
 
+def _view_text(c, inst) -> str:
+    """The Files view's newest landed text (its bottom message, sent or edited)."""
+    view_id = inst.bottom_frame_id(localfs.VIEW_FRAME)
+    edited = [text for mid, text in c.bot.edits if mid == view_id]
+    return edited[-1] if edited else next(t for m, _th, t in c.bot.created if m == view_id)
+
+
 async def _click(c, inst, arg):
     """Run the window's button handler for a tap; returns how long it took."""
     started = time.monotonic()
@@ -99,7 +106,6 @@ async def _click(c, inst, arg):
 
 def test_files_clicks_during_a_flood_return_at_once_and_show_the_last_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
-    monkeypatch.setattr(localfs, "TITLE_QUIET", 0)
 
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
@@ -111,41 +117,6 @@ def test_files_clicks_during_a_flood_return_at_once_and_show_the_last_folder(tmp
         await c.core.flush_frames()
         assert c.edits[-1].startswith(f"📂 {root}/d0/d1/d2/d3/d4")
         assert len(flood["calls"]) == 2  # the flooded view, then the newest; 3 skipped
-
-    asyncio.run(scenario())
-
-
-def test_five_quick_folder_clicks_give_one_rename_to_the_last_folder(tmp_path, monkeypatch):
-    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0.3)
-    monkeypatch.setattr(localfs, "TITLE_QUIET", 0.1)
-
-    async def scenario():
-        c = TestClient(Localfs(), home=str(tmp_path))
-        root = _nested(tmp_path)
-        inst = await _files_window(c, root)
-        await inst.refresh_title()
-        await c.core.flush_frames()
-        renames = _flood_once(c.bot, "edit_forum_topic", 0, times=0)
-        for _ in range(5):
-            await _click(c, inst, "cd:0")
-            await asyncio.sleep(0.01)  # the frame task runs between clicks
-        await c.core.flush_frames()
-        assert renames["calls"] == ["📁 browse · d4"]
-
-    asyncio.run(scenario())
-
-
-def test_a_click_never_waits_on_a_flood_waited_rename(tmp_path, monkeypatch):
-    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
-
-    async def scenario():
-        c = TestClient(Localfs(), home=str(tmp_path))
-        root = _nested(tmp_path)
-        inst = await _files_window(c, root)
-        _flood_once(c.bot, "edit_forum_topic", 5)
-        assert await _click(c, inst, "cd:0") < 0.1
-        await asyncio.sleep(0.05)  # the rename hits its flood-wait meanwhile
-        assert await _click(c, inst, "cd:0") < 0.1
 
     asyncio.run(scenario())
 
@@ -243,37 +214,8 @@ def test_a_cut_off_utf8_character_at_the_end_is_kept(tmp_path):
     asyncio.run(scenario())
 
 
-def test_a_folder_rename_waits_until_navigation_stops(tmp_path, monkeypatch):
-    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
-    monkeypatch.setattr(localfs, "TITLE_QUIET", 0.3)
-
-    async def scenario():
-        c = TestClient(Localfs(), home=str(tmp_path))
-        root = _nested(tmp_path)
-        inst = await _files_window(c, root)
-        renames = []
-        real = c.bot.edit_forum_topic
-
-        async def rename(*args, **kwargs):
-            renames.append((time.monotonic(), kwargs["name"]))
-            return await real(*args, **kwargs)
-
-        c.bot.edit_forum_topic = rename
-        for _ in range(3):  # clicks 0.2 s apart: each restarts the quiet period
-            await _click(c, inst, "cd:0")
-            last_click = time.monotonic()
-            await asyncio.sleep(0.2)
-        assert renames == []  # nothing yet: 0.2 s since the last click
-        await c.core.flush_frames()
-        assert [name for _t, name in renames] == ["📁 browse · d2"]
-        assert renames[0][0] - last_click >= 0.29
-
-    asyncio.run(scenario())
-
-
 def test_a_typed_path_jumps_to_that_folder(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(localfs, "TITLE_QUIET", 0)
     monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
 
     async def scenario():
@@ -291,11 +233,11 @@ def test_a_typed_path_jumps_to_that_folder(tmp_path, monkeypatch):
             await c.send(typed, thread_id=inst.thread_id)
             await c.settle()
             await c.core.flush_frames()
-            typed_id = c.bot.created[-1][0] if c.bot.created[-1][2] == typed else None
+            typed_id = next(mid for mid, _t, text in reversed(c.bot.created) if text == typed)
             assert inst.saved["cwd"] == str(expected), typed
-            assert c.edits[-1].startswith(f"📂 {expected}"), typed  # the view shows it
-            assert len(c.bot.sent) == sent_before  # no reply message
-            assert typed_id is not None and typed_id in c.bot.deleted  # the typed path goes
+            assert _view_text(c, inst).startswith(f"📂 {expected}"), typed  # the view shows it
+            assert all(text.startswith("📂") for _t, text in c.bot.sent[sent_before:])  # no reply
+            assert typed_id in c.bot.deleted  # the typed path goes
 
     asyncio.run(scenario())
 
@@ -338,16 +280,49 @@ def test_a_typed_path_that_cannot_be_checked_gets_a_notice(tmp_path):
     asyncio.run(scenario())
 
 
-def test_a_graceful_stop_sends_a_held_rename_at_once(tmp_path, monkeypatch):
-    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)  # the real 30 s quiet period stays
+def test_folder_clicks_and_typed_paths_make_no_rename(tmp_path, monkeypatch):
+    monkeypatch.setattr(kernel, "TITLE_MIN_INTERVAL", 0)
 
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
         root = _nested(tmp_path)
         inst = await _files_window(c, root)
         renames = _flood_once(c.bot, "edit_forum_topic", 0, times=0)
+        for _ in range(3):
+            await _click(c, inst, "cd:0")
+        await c.send(str(root), thread_id=inst.thread_id)
+        await c.settle()
+        await c.core.flush_frames()
+        assert renames["calls"] == []
+
+    asyncio.run(scenario())
+
+
+def test_the_files_view_stays_the_bottom_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(localfs, "NOTE_LIFETIME", 0.2)
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = _nested(tmp_path)
+        inst = await _files_window(c, root)
+        view_id = inst.bottom_frame_id(localfs.VIEW_FRAME)
         await _click(c, inst, "cd:0")
-        await asyncio.wait_for(c.core.broadcast_shutdown(), 2)  # not held 30 s
-        assert renames["calls"] == ["📁 browse · d0"]
+        await c.core.flush_frames()
+        assert inst.bottom_frame_id(localfs.VIEW_FRAME) == view_id  # a tap edits in place
+        assert c.edits[-1].startswith(f"📂 {root}/d0")
+
+        await inst.send("⭐ bookmarked d0")  # a new message below the view
+        await c.core.flush_frames()
+        new_id = inst.bottom_frame_id(localfs.VIEW_FRAME)
+        assert new_id > c.bot.created[-2][0]  # re-sent below it
+        assert view_id in c.bot.deleted  # the old copy is gone
+        assert c.bot.last_markup is not None  # with its buttons
+
+        views_before = sum(text.startswith("📂") for _m, _t, text in c.bot.created)
+        await c.send("nope", thread_id=inst.thread_id)  # a bad path: typed message + notice
+        await c.settle()
+        await c.core.flush_frames()
+        views_after = sum(text.startswith("📂") for _m, _t, text in c.bot.created)
+        assert views_after - views_before == 1  # one re-send for the typed message, none more
 
     asyncio.run(scenario())

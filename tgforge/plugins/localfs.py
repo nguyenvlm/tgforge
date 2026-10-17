@@ -1,9 +1,9 @@
 """Local-filesystem browser: `/localfs` opens a tap-to-navigate window over the
-whole filesystem. Each tap records the window's view as a frame (edited in place when a
-slot is free) and the title as a frame-skip rename held until navigation stops for
-TITLE_QUIET seconds, so taps never wait on Telegram; a typed path jumps to that folder.
-The current dir / file view persists in the window store, so a restart re-renders where
-it left off.
+whole filesystem. The view is the window's bottom frame: each tap records its newest
+content (edited in place when a slot is free), so taps never wait on Telegram, and a
+newer message in the topic re-sends it below. A typed path jumps to that folder. The
+current dir / file view persists in the window store, so a restart re-renders where it
+left off; the title stays the window's name.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from tgforge.base.ui import MAX_MSG
 PAGE = 10  # dir entries per page
 PREVIEW_BYTES = 3000
 PREVIEW_LINES = 40
-TITLE_QUIET = 30.0  # s without navigation before the title follows the folder
+VIEW_FRAME = "view"  # the bottom frame holding the browser
 NOTE_LIFETIME = 30.0  # s before a bad-path notice is deleted
 
 
@@ -46,14 +46,6 @@ class LocalfsTopic(Topic):
     icon = "📁"
     menu_label = "Files"
 
-    def __init__(self, core, thread_id, name, saved):
-        super().__init__(core, thread_id, name, saved)
-        self.msg_id: int | None = None
-
-    def title_suffix(self) -> str | None:
-        cwd = self.saved.get("cwd")
-        return (Path(cwd).name or "/") if cwd else None
-
     async def _pick_start(self) -> str:
         home = str(self._core.config.home_path)
         bms = self.plugin.bookmarks
@@ -66,14 +58,11 @@ class LocalfsTopic(Topic):
         self.saved["cwd"] = await self._pick_start()
         self.saved["view"] = None
         self.saved["page"] = 0
-        self.msg_id = await self.send("opening…")
         self._redraw()
-        await self.refresh_title()
 
     async def on_revive(self):
-        self.msg_id = await self.send("↻ browser restored")
         self._redraw()
-        await self.refresh_title()
+        await self.refresh_title()  # the title is the window's name alone
 
     # ── Listing + views ────────────────────────────────────────────
     def _list(self, cwd: str):
@@ -162,14 +151,12 @@ class LocalfsTopic(Topic):
     def _redraw(self):
         """Record the view's newest frame and return at once: a burst of taps shows the
         last view, never waiting on Telegram."""
-        if self.msg_id is None:
-            return
         if self.saved.get("view"):
             md, plain, markup = self._file_view()
-            self.show_frame(self.msg_id, plain, md, reply_markup=markup)
+            self.show_bottom_frame(VIEW_FRAME, plain, md, reply_markup=markup)
         else:
             text, markup = self._dir_view()
-            self.show_frame(self.msg_id, text, reply_markup=markup)
+            self.show_bottom_frame(VIEW_FRAME, text, reply_markup=markup)
 
     # ── Button routing ─────────────────────────────────────────────
     @action("fs")
@@ -207,8 +194,6 @@ class LocalfsTopic(Topic):
         elif act == "back":
             self.saved["view"] = None
         self._redraw()
-        if act in ("cd", "up"):
-            await self.refresh_title(quiet=TITLE_QUIET)
 
     @on_message
     async def goto(self, ctx):
@@ -237,7 +222,6 @@ class LocalfsTopic(Topic):
         self.saved["page"] = 0
         self.saved["view"] = None
         self._redraw()
-        await self.refresh_title(quiet=TITLE_QUIET)
 
     # ── Bookmarks ──────────────────────────────────────────────────
     @command("/bookmarks", "go to or edit bookmarked folders", icon="⭐")
@@ -260,7 +244,6 @@ class LocalfsTopic(Topic):
                 self.saved["page"] = 0
                 self.saved["view"] = None
                 self._redraw()
-                await self.refresh_title(quiet=TITLE_QUIET)
         elif choice == "add":
             n = self.plugin.add_bookmark(self.saved["cwd"])
             await self.send(f"⭐ bookmarked {Path(self.saved['cwd']).name} — {n} bookmark(s)")

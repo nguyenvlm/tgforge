@@ -87,7 +87,7 @@ def test_dedup_base_survives_title_refresh(tmp_path):
         c = TestClient(Localfs(), home=str(tmp_path))
         w = await c.core.open_window(100, LocalfsTopic, None)
         w.saved["base_name"] = "Files #2"  # a deduped window
-        w.saved["cwd"] = "/srv/proj"
+        w.title_suffix = lambda: "proj"
         await w.refresh_title()
         await c.core.flush_frames()
         # refresh recomposes from the stored base, not the class label → "#2" survives
