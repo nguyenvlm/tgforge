@@ -6,6 +6,7 @@ lands."""
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 from aiogram.exceptions import (
@@ -221,5 +222,42 @@ def test_a_4xx_gets_one_try(monkeypatch):
         attempt, state = _failing([_BadRequest()])
         assert await t._call(lambda: attempt()) is None
         assert state["calls"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_transient_retry_waits_out_a_flood_recorded_during_its_backoff(monkeypatch):
+    async def scenario():
+        _fake_clock(monkeypatch)
+        t = Transport(bot=SimpleNamespace())
+        tries = []
+
+        async def attempt():
+            tries.append(time.monotonic())
+            if len(tries) == 1:
+                t.flood_until = time.monotonic() + 20  # another call's flood, meanwhile
+                raise _ServerError()
+            return "sent"
+
+        assert await t._call(lambda: attempt()) == "sent"
+        assert tries[1] >= t.flood_until  # the retry waited the deadline out
+
+    asyncio.run(scenario())
+
+
+def test_a_transient_retry_takes_a_pacer_slot(monkeypatch):
+    async def scenario():
+        _fake_clock(monkeypatch)
+        t = Transport(bot=SimpleNamespace(), pace_per_min=6, pace_burst=1)  # 10 s refill
+        tries = []
+
+        async def attempt():
+            tries.append(time.monotonic())
+            if len(tries) == 1:
+                raise _ServerError()
+            return "sent"
+
+        assert await t._call(lambda: attempt()) == "sent"
+        assert tries[1] - tries[0] >= 10 - 1e-6  # waited for a slot, not just the 1 s backoff
 
     asyncio.run(scenario())

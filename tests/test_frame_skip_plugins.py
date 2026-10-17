@@ -179,3 +179,62 @@ def test_a_chatty_one_shot_command_finishes_well_inside_the_timeout(tmp_path, mo
         assert time.monotonic() - started < 5
 
     asyncio.run(scenario())
+
+
+def _record_views(t):
+    """Spy the window's live frames: (time, plain view) per record."""
+    views = []
+    real = t.show_frame
+
+    def spy(msg_id, plain, md=None, reply_markup=None):
+        views.append((time.monotonic(), plain))
+        real(msg_id, plain, md, reply_markup=reply_markup)
+
+    t.show_frame = spy
+    return views
+
+
+def test_the_one_shot_pump_records_at_most_one_frame_per_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.4)
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        views = _record_views(t)
+        script = "for i in $(seq 1 20); do echo line$i; sleep 0.06; done"
+        await c.send(f"!{script}", thread_id=THREAD)
+        await asyncio.wait_for(c.settle(), 10)
+        times = [at for at, _view in views]
+        assert 2 <= len(times) <= 5  # ~1.2 s of output: not one frame per chunk (20)
+        assert all(b - a >= 0.4 - 0.02 for a, b in zip(times, times[1:], strict=False))
+
+    asyncio.run(scenario())
+
+
+def test_output_before_a_quiet_stretch_shows_within_one_interval(tmp_path, monkeypatch):
+    """`b` lands 0.3 s after `a` (shown at once), inside the 1 s interval, then the
+    command goes quiet for 2 s: a timer shows `b` when the interval ends."""
+    monkeypatch.setattr(drv, "EDIT_INTERVAL", 1.0)
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        views = _record_views(t)
+        started = time.monotonic()
+        await c.send("!printf a; sleep 0.3; printf b; sleep 2", thread_id=THREAD)
+        await asyncio.wait_for(c.settle(), 10)
+        shown = [at - started for at, view in views if "b" in view.split("\n", 1)[1]]
+        assert shown and shown[0] < 1.6  # at the interval's end, not at the 2.3 s exit
+
+    asyncio.run(scenario())
+
+
+def test_a_cut_off_utf8_character_at_the_end_is_kept(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        window(c, tmp_path)
+        await c.send("!printf 'ok\\342\\202'", thread_id=THREAD)  # 2 of €'s 3 bytes
+        await asyncio.wait_for(c.settle(), 10)
+        assert "ok�" in c.edits[-1]  # flushed as a replacement, not dropped
+
+    asyncio.run(scenario())

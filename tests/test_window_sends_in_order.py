@@ -147,3 +147,30 @@ def test_the_help_reply_in_a_claude_window_waits_for_the_settle(tmp_path):
         assert _below_every_answer(c, help_text)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("prompt", ["menu", "ask_buttons", "ask_text"])
+def test_a_prompt_cancelled_while_its_send_is_queued_leaves_no_state(tmp_path, prompt):
+    """The window closes while the prompt's send waits behind a settle: no tap future
+    or active prompt is left registered for a keyboard that never showed."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        await _settling(c, t)
+        calls = {
+            "menu": lambda: t.menu("pick", [("a", "a")]),
+            "ask_buttons": lambda: t.ask_buttons("sure?", [("yes", "yes")]),
+            "ask_text": lambda: t.ask_text("name?"),
+        }
+        task = asyncio.create_task(calls[prompt]())
+        await asyncio.sleep(0.05)
+        assert c.core.pending_callbacks  # registered early, so an instant tap is caught
+        assert THREAD not in c.core._active_prompt  # not active before it is on screen
+        t.proc = None  # the fake CLI has no OS process to reap
+        await t.on_close()
+        await asyncio.gather(task, return_exceptions=True)
+        assert c.core.pending_callbacks == {}
+        assert THREAD not in c.core._active_prompt
+
+    asyncio.run(scenario())

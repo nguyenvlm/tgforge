@@ -153,6 +153,10 @@ def test_a_mid_turn_fold_moves_the_card_below_the_message(tmp_path):
 
 
 def test_a_failed_card_move_keeps_the_old_card(tmp_path):
+    """Only the re-send fails (Telegram rejects it); a delete still reaches the bot, so
+    deleting the old card without a replacement would show."""
+    from aiogram.exceptions import TelegramBadRequest
+
     async def scenario():
         c = client(tmp_path)
         t = window(c, tmp_path)
@@ -160,10 +164,10 @@ def test_a_failed_card_move_keeps_the_old_card(tmp_path):
         await drain(c, t)
         card = t.turn.card_id
 
-        async def rejected(chat_id, text, **kw):
-            return None  # an API error: no new card
+        async def rejected(*args, **kwargs):
+            raise TelegramBadRequest(method=None, message="Bad Request: rejected")
 
-        t._core._call = lambda make_coro, **kw: rejected(None, None)
+        c.bot.send_message = rejected
         await asyncio.wait_for(t._reorder_holder(), 2)
         assert t.turn.card_id == card  # still the live card
         assert card not in c.bot.deleted  # never deleted without a replacement

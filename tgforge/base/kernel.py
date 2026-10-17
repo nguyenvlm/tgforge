@@ -982,13 +982,16 @@ class Transport:
 
     # ── One attempt / essential calls ──────────────────────────────
 
-    async def _attempt(self, make_coro, ok_not_modified=False):
-        """Issue one aiogram call. Returns its result, `_FLOODED` on a flood-wait (the
-        deadline is recorded), `_NOT_MODIFIED` on a benign "message is not modified"
-        edit when `ok_not_modified`, or None on any other API error. A network error or
-        a Telegram 5xx is retried up to TRANSIENT_RETRIES times (1, 2, 4 s apart, each
-        after any flood-wait), then given up with a warning; a 4xx gets one try. A
-        retried send whose first try did reach Telegram can post twice."""
+    async def _attempt(self, make_coro, ok_not_modified=False, spare=True, paced=True):
+        """Issue one aiogram call (its slot already taken). Returns its result,
+        `_FLOODED` on a flood-wait (the deadline is recorded), `_NOT_MODIFIED` on a benign
+        "message is not modified" edit when `ok_not_modified`, or None on any other API
+        error. A network error or a Telegram 5xx is retried up to TRANSIENT_RETRIES times
+        (1, 2, 4 s apart), each retry clearing the flood deadline and taking a pacer
+        slot like the first try (`_clear_to_call` in the caller's mode: a spare slot for
+        the frame task, the default; `_call` passes its own); then given up with a
+        warning; a 4xx gets one try. A retried send whose first try did reach Telegram
+        can post twice."""
         backoff = TRANSIENT_BACKOFF
         for attempt in range(TRANSIENT_RETRIES + 1):
             try:
@@ -1009,7 +1012,7 @@ class Transport:
                 LOGGER.warning("telegram call failed (%r), retry in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff *= 2
-                await self._wait_flood()
+                await self._clear_to_call(spare=spare, paced=paced)
                 continue
             except TelegramAPIError as e:
                 LOGGER.debug("telegram api error: %r", e)
@@ -1052,7 +1055,9 @@ class Transport:
             async with self._send_order if paced else contextlib.nullcontext():
                 while True:
                     await self._clear_to_call(paced=paced)
-                    result = await self._attempt(make_coro, ok_not_modified)
+                    result = await self._attempt(
+                        make_coro, ok_not_modified, spare=False, paced=paced
+                    )
                     if result is not _FLOODED:
                         return result
         finally:
@@ -2097,20 +2102,23 @@ class Kernel(Transport):
         pid = uuid.uuid4().hex[:8]
         kb = ui.stacked_choices([label for label, _v in opts], pid)
         kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-        # registered before the prompt is visible, so even an instant tap is caught
+        # registered before the prompt is visible, so even an instant tap is caught; the
+        # cleanup covers the send too (a window closing while it is queued cancels it)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending_callbacks[pid] = fut
-        msg = await self._in_window(
-            thread_id,
-            lambda: self._call(lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)),
-        )
-        if msg is None:
-            self.pending_callbacks.pop(pid, None)
-            return None, None  # the prompt never rendered — don't hang for the timeout
         try:
-            idx = await asyncio.wait_for(fut, timeout)
-        except TimeoutError:
-            idx = None
+            msg = await self._in_window(
+                thread_id,
+                lambda: self._call(
+                    lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)
+                ),
+            )
+            if msg is None:
+                return None, None  # the prompt never rendered — don't hang for the timeout
+            try:
+                idx = await asyncio.wait_for(fut, timeout)
+            except TimeoutError:
+                idx = None
         finally:
             self.pending_callbacks.pop(pid, None)
         if msg:
@@ -2154,25 +2162,25 @@ class Kernel(Transport):
         pid = uuid.uuid4().hex[:8]
         self._await_input[key] = _feed
         msg_id = None
-        if prompt:
-            kb = ui.stacked_choices(["✖ Cancel"], pid)
-            kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-            self.pending_callbacks[pid] = fut  # before the prompt is visible
-            msg = await self._in_window(
-                thread_id,
-                lambda: self._call(
-                    lambda: self.bot.send_message(chat_id, prompt, reply_markup=kb, **kw)
-                ),
-            )
-            if msg is None:
-                self._await_input.pop(key, None)
-                self.pending_callbacks.pop(pid, None)
-                return None  # the prompt never rendered — don't hang for the timeout
-            msg_id = msg.message_id
-        try:
-            result = await asyncio.wait_for(fut, timeout)
-        except TimeoutError:
-            result = None
+        result = None
+        try:  # the cleanup covers the prompt's send too (it can be cancelled while queued)
+            if prompt:
+                kb = ui.stacked_choices(["✖ Cancel"], pid)
+                kw = {"message_thread_id": thread_id} if thread_id is not None else {}
+                self.pending_callbacks[pid] = fut  # before the prompt is visible
+                msg = await self._in_window(
+                    thread_id,
+                    lambda: self._call(
+                        lambda: self.bot.send_message(chat_id, prompt, reply_markup=kb, **kw)
+                    ),
+                )
+                if msg is None:
+                    return None  # the prompt never rendered — don't hang for the timeout
+                msg_id = msg.message_id
+            try:
+                result = await asyncio.wait_for(fut, timeout)
+            except TimeoutError:
+                result = None
         finally:
             if self._await_input.get(key) is _feed:
                 del self._await_input[key]
@@ -2255,35 +2263,36 @@ class Kernel(Transport):
         pid = uuid.uuid4().hex[:8]
         solo_back = bool(options) and options[-1][1] == MENU_BACK
         kb = ui.stacked_choices([label for label, _v in options], pid, solo_last=solo_back)
-        # registered before the keyboard is visible, so even an instant tap is caught
+        # the tap future is registered before the keyboard is visible, so even an instant
+        # tap is caught; the prompt becomes the thread's active one (which a newer menu
+        # supersedes) only once it is on screen; the cleanup covers the send too
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending_callbacks[pid] = fut
         key = thread_id or 0
-        self._active_prompt[key] = pid  # the tap this thread awaits — supersede can dismiss it
-        if msg_id is None:
-            kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-            msg = await self._in_window(
-                thread_id,
-                lambda: self._call(
-                    lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)
-                ),
-            )
-            if msg is None:
-                self.pending_callbacks.pop(pid, None)
-                if self._active_prompt.get(key) == pid:
-                    del self._active_prompt[key]
-                return None, None  # the menu never rendered — don't hang for the timeout
-            msg_id = msg.message_id
-        else:
-            await self._call(
-                lambda: self.bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb
-                )
-            )
+        idx = None
         try:
-            idx = await asyncio.wait_for(fut, 120)
-        except TimeoutError:
-            idx = None
+            if msg_id is None:
+                kw = {"message_thread_id": thread_id} if thread_id is not None else {}
+                msg = await self._in_window(
+                    thread_id,
+                    lambda: self._call(
+                        lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)
+                    ),
+                )
+                if msg is None:
+                    return None, None  # the menu never rendered — don't hang for the timeout
+                msg_id = msg.message_id
+            else:
+                await self._call(
+                    lambda: self.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb
+                    )
+                )
+            self._active_prompt[key] = pid  # the tap this thread awaits — supersede can dismiss it
+            try:
+                idx = await asyncio.wait_for(fut, 120)
+            except TimeoutError:
+                idx = None
         finally:
             self.pending_callbacks.pop(pid, None)
             if self._active_prompt.get(key) == pid:

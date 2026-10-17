@@ -471,3 +471,19 @@ def test_a_markdown_rejected_panel_re_sends_plain_through_a_flood():
         assert calls[:2] == ["MarkdownV2", None]  # md refused, plain flooded, then retried
 
     asyncio.run(scenario())
+
+
+def test_a_lasting_failure_retries_again_after_new_content():
+    from tgforge.base.kernel import BOTTOM_RESEND_ATTEMPTS
+
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot)
+        bot.reject.add("send")
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await asyncio.wait_for(t.flush_frames(), 2)
+        t.show_bottom_frame(1, 7, "panel", "rows, later")  # new content: a fresh burst
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert len(bot.texts("send")) == 2 * BOTTOM_RESEND_ATTEMPTS
+
+    asyncio.run(scenario())

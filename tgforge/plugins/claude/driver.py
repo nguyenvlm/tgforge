@@ -1957,6 +1957,14 @@ class Claude(Plugin):
         }
         hid = await topic.send(f"$ {cmd}\n…")
         buf: list[str] = []
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        view = {"last": 0.0, "timer": None}  # the pump's last frame time, its pending timer
+
+        def show_view():
+            view["timer"] = None
+            view["last"] = time.monotonic()
+            topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
+
         status = ""
         proc = None
         try:
@@ -1973,9 +1981,9 @@ class Claude(Plugin):
 
             async def pump():
                 # only reads and records: a frame at most every EDIT_INTERVAL, never
-                # waited on; the output is read in whatever chunks the pipe holds
-                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-                kept, last = 0, 0.0
+                # waited on; output held back by that interval is shown when it ends (a
+                # timer), not only when the next chunk comes
+                kept = 0
                 while True:
                     data = await proc.stdout.read(SHELL_READ_SIZE)
                     if not data:
@@ -1984,10 +1992,13 @@ class Claude(Plugin):
                     kept += len(buf[-1])
                     while len(buf) > 1 and kept - len(buf[0]) >= SHELL_KEEP_CHARS:
                         kept -= len(buf.pop(0))
-                    now = time.monotonic()
-                    if hid is not None and now - last >= EDIT_INTERVAL:
-                        last = now
-                        topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
+                    if hid is None:
+                        continue
+                    wait = view["last"] + EDIT_INTERVAL - time.monotonic()
+                    if wait <= 0:
+                        show_view()
+                    elif view["timer"] is None:
+                        view["timer"] = asyncio.get_running_loop().call_later(wait, show_view)
 
             await asyncio.wait_for(pump(), timeout=SHELL_TIMEOUT)
             await proc.wait()
@@ -2002,8 +2013,13 @@ class Claude(Plugin):
         except Exception as exc:
             status = f"failed to run: {exc}"
         finally:
+            if view["timer"] is not None:
+                view["timer"].cancel()  # the final view below replaces it
             if proc is not None:
                 await reap(proc)  # never leave the shell child running on any exit path
+        tail = decoder.decode(b"", final=True)  # a cut-off multi-byte character at the end
+        if tail:
+            buf.append(tail)
         result = shell_view(cmd, buf, status)
         if hid is not None:
             await topic.land_frame(hid, result, shell_md(cmd, buf, status))
