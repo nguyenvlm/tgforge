@@ -66,7 +66,7 @@ Claude-plugin extras:
 - **Background jobs**: a panel at the bottom of the window lists the agent's running background jobs; a finished job shows ✓ / ✗ (◼ when the outcome is unknown) for a short while, then drops. `/kill <job>` stops one (no name → pick from buttons); `/cancel` only interrupts the running turn.
 - **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every typed prompt (a slash prompt, i.e. a skill, is sent as is).
 - Every typed prompt is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
-- **A finished turn** reads, top to bottom: the tool calls folded into collapsed blocks (tap to expand; the first one's header is the summary `🔧 tools · 💬 notes · duration · tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` — context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
+- **A finished turn** reads, top to bottom: the summary line `🔧 tools · 💬 notes · duration · tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` (context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), the tool calls folded under it into collapsed blocks (tap to expand), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
 
 ## How it works
 

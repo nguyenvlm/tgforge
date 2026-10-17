@@ -53,7 +53,7 @@ async def _turn(c, t, timeline=(), answer="the answer"):
 
 
 def _is_fold(text: str) -> bool:
-    return text.startswith("**>") and text.endswith("||")
+    return "**>" in text and text.endswith("||")
 
 
 def test_a_long_timeline_folds_into_several_messages_with_every_entry(tmp_path):
@@ -72,7 +72,10 @@ def test_a_long_timeline_folds_into_several_messages_with_every_entry(tmp_path):
             assert f"step {i:03d}" in joined  # every entry present
         assert "…" not in joined.replace("↳", "")  # nothing cut
         assert shown[-1] == "the answer"  # the answer is the bottom-most message
-        assert folds[0].startswith("**>🔧 40")  # message 1 carries the summary line
+        summary, quote = folds[0].split("\n", 1)
+        assert summary.startswith("🔧 40")  # message 1 opens with the summary line, plain
+        assert quote.startswith("**>💻 Bash: step 000")  # the block holds only the timeline
+        assert all(f.startswith("**>↳ ") for f in folds[1:])  # later pages: `↳ i/n` in the block
 
     asyncio.run(scenario())
 
@@ -101,7 +104,8 @@ def test_no_tools_gives_a_summary_only_message_and_the_answer(tmp_path):
         await _turn(c, t, answer="just text")
         shown = texts(c)
         assert len(shown) == 2
-        assert _is_fold(shown[0]) and "tokens" in shown[0] and "🔧" not in shown[0]
+        assert "tokens" in shown[0] and "🔧" not in shown[0]
+        assert "**>" not in shown[0] and not shown[0].endswith("||")  # no block
         assert shown[1] == "just text"
 
     asyncio.run(scenario())
@@ -437,3 +441,4 @@ def test_a_hundred_page_timeline_keeps_every_page_within_a_message():
     assert all(len(md) <= MAX_MSG for md, _plain in pages)  # 3-digit headers fit too
     assert sum(md.count("x") for md, _plain in pages) == 120 * size  # nothing lost
     assert pages[-1][1].startswith(f"↳ {len(pages)}/{len(pages)}")
+    assert pages[0][0].startswith("🔧 120\n**>x")  # page 1: plain summary over its block

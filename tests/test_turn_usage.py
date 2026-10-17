@@ -101,7 +101,7 @@ def test_the_summary_line_carries_context_and_quota(tmp_path):
         await asyncio.wait_for(t._reader(), 5)
         await drain(c, t)
         summary = texts(c)[0].replace("\\", "").splitlines()[0]
-        assert summary.startswith("**>🔧 1 · ")
+        assert summary.startswith("🔧 1 · ")
         assert summary.endswith(" tokens · ctx 21% (41.4k) · 5h 1% · 7d 0%")
         assert t.context_window == 200_000
         assert t.saved["session"]["context_window"] == 200_000  # kept per window

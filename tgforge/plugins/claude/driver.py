@@ -825,8 +825,8 @@ class ClaudeTopic(Topic):
             )
 
     async def _settle_turn(self, turn: TurnState, ans, acks: list[dict], ended: float):
-        """Render a closed turn: the timeline folded into collapsed expandable messages
-        (the first carries the summary line) above the answer messages (suggestion
+        """Render a closed turn: the summary line, then the timeline folded into collapsed
+        expandable messages, above the answer messages (suggestion
         buttons on the last), then attachments. Every piece lands, in order."""
         card_id = turn.card_id
         if acks:

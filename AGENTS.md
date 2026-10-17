@@ -51,7 +51,7 @@ The background-jobs panel is not a turn message: it sits below everything, the f
 ### Finalized-turn format
 
 At settle, a turn renders as new messages in this order, each piece waiting out flood-waits and retried until it lands (no gap, no skip); a network error or 5xx gets the bounded retries above:
-- the tool-call part: one or more messages, each one collapsed expandable block (`ui.expandable_pages`); the first carries the summary line `🔧 N · 💬 N · duration · tokens · ctx P% (T) · 5h P% · 7d P%`; timeline entries are packed into as few messages as fit; nothing is cut — an entry longer than a message is split across messages; a turn with no tools still gets the summary-only message;
+- the tool-call part: one or more messages (`ui.expandable_pages`); the first is the summary line `🔧 N · 💬 N · duration · tokens · ctx P% (T) · 5h P% · 7d P%` as plain text with a collapsed expandable block under it, each later one a collapsed expandable block headed `↳ i/n`; timeline entries are packed into as few messages as fit; nothing is cut — an entry longer than a message is split across messages; a turn with no timeline still gets the summary line alone, with no block;
 - the answer part: one or more messages (MarkdownV2, split to fit); an empty answer is `(no reply)`; the suggestion buttons ride the last answer message;
 - the `[[attach]]` files.
 
