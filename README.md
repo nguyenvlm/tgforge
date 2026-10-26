@@ -64,8 +64,8 @@ Claude-plugin extras:
 - **Workspaces** (where the agent runs): `tgforge workspaces add <path-or-glob>` on the CLI, or `/workspace` in Telegram. Switching a topic to another root starts a fresh session there; the old one stays resumable.
 - **Model / effort** (per window): `/model` switches the active model (and edits the offered list), `/effort` switches the reasoning effort — the next message respawns the session with it.
 - **Background jobs**: a panel at the bottom of the window lists the agent's running background jobs; a finished job shows ✓ / ✗ (◼ when the outcome is unknown) for a short while, then drops. `/kill <job>` stops one (no name → pick from buttons); `/cancel` only interrupts the running turn.
-- **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — appended to every typed prompt (a slash prompt, i.e. a skill, is sent as is).
-- Every typed prompt is tagged `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
+- **Per-repo guidance**: pass `Claude(brief="…")` or drop a `session_brief.md` in the bot home — added to the session's system prompt (written to `session_notes/` in the bot home, passed as `--append-system-prompt-file`) with the bot's Telegram rules, so every turn runs under it, a slash prompt (a skill) included; prompts reach the agent exactly as typed.
+- The note opens with `[via Telegram bot · <bot> · …]` so the agent knows where it's running.
 - **A finished turn** reads, top to bottom: the summary line `🔧 tools · 💬 notes · duration · ↓ output tokens · ctx 21% (42.4k) · 5h 3% · 7d 0%` (context used of the model's window, then the account's 5-hour and weekly quota, ⚠️ when limited), the tool calls folded under it into collapsed blocks (tap to expand), then the answer (split into as many messages as it needs, the suggested replies on the last), then any attached files. Nothing is cut. The live card shows the same context and quota while the turn runs.
 
 ## How it works

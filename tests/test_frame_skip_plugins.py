@@ -326,3 +326,26 @@ def test_the_files_view_stays_the_bottom_message(tmp_path, monkeypatch):
         assert views_after - views_before == 1  # one re-send for the typed message, none more
 
     asyncio.run(scenario())
+
+
+def test_the_files_view_moves_as_one_copy_below_a_burst_of_messages(tmp_path):
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        c.core._pacer = kernel._Pacer(1200, kernel.PACE_BURST)  # fast, live burst size
+        inst = await _files_window(c, _nested(tmp_path))
+        for n in range(3):
+            await inst.send(f"note {n}")  # each buries the view
+            await asyncio.sleep(0.05)
+        await c.core.flush_frames()
+        is_view = lambda text: text.startswith("📂")  # noqa: E731
+        assert c.bot.peak_on_screen(is_view) == 1
+        view_id = inst.bottom_frame_id(localfs.VIEW_FRAME)
+        assert c.bot.created[-1][0] == view_id  # at the bottom
+        log = c.bot.screen_log
+        moves = [at for at, (kind, _m, _t) in enumerate(log) if kind == "delete"]
+        assert moves, "the view never moved"
+        for at in moves:  # each old copy's delete is the call right before its re-send
+            kind, _new, text = log[at + 1]
+            assert kind == "create" and is_view(text)
+
+    asyncio.run(scenario())

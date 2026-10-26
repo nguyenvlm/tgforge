@@ -61,6 +61,11 @@ LOGGER = logging.getLogger("tgforge")
 
 _NOT_MODIFIED = object()  # a benign edit no-op: the new content already matches the message
 _FLOODED = object()  # a call Telegram flood-waited; the deadline is in `flood_until`
+# a delete's outcome (`_attempt(delete_outcome=True)`), besides a landed True and _FLOODED
+_GONE = object()  # "message to delete not found": the message is not there
+_UNSURE = object()  # transient retries ran out: the message may still be there
+_REFUSED = object()  # any other rejection: the message stays
+STUB_TEXT = "·"  # what an undeletable bottom-frame copy is edited down to
 FRAME_MEMORY = 256  # landed message frames kept for the no-op check (oldest forgotten)
 
 
@@ -128,10 +133,10 @@ class _Pacer:
                 delay = (1 - self.tokens) / self.refill
             await asyncio.sleep(delay)
 
-    def give_back(self) -> None:
-        """Return a slot taken for a call that did not go out."""
+    def give_back(self, count: int = 1) -> None:
+        """Return slots taken for calls that did not go out."""
         if self.enabled:
-            self.tokens = min(self.capacity, self.tokens + 1)
+            self.tokens = min(self.capacity, self.tokens + count)
 
     async def take_spare(self) -> None:
         if not self.enabled:
@@ -142,8 +147,31 @@ class _Pacer:
                 if not self.waiting and self.tokens >= 1:
                     self.tokens -= 1
                     return
-                delay = (1 - self.tokens) / self.refill if self.tokens < 1 else SPARE_SLOT_POLL
-            await asyncio.sleep(max(delay, SPARE_SLOT_POLL))
+            await asyncio.sleep(self.spare_delay(1))
+
+    @property
+    def fits_pair(self) -> bool:
+        """Whether two slots can be held at once (pacing off, or a burst of 2 or more)."""
+        return not self.enabled or self.capacity >= 2
+
+    def take_spare_now(self) -> bool:
+        """Take a spare slot if one is free right now; never waits."""
+        if not self.enabled:
+            return True
+        self._replenish()
+        if self.waiting or self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+    def spare_delay(self, count: int) -> float:
+        """Seconds until `count` spare slots are free (at least SPARE_SLOT_POLL)."""
+        if not self.enabled:
+            return 0.0
+        self._replenish()
+        if self.waiting or self.tokens >= count:
+            return SPARE_SLOT_POLL
+        return max((count - self.tokens) / self.refill, SPARE_SLOT_POLL)
 
 
 def setup_logging() -> None:
@@ -925,7 +953,7 @@ class _Frame:
 
     chat_id: int
     thread_id: int | None
-    message_id: int | None  # None: a bottom frame not sent yet
+    message_id: int | None  # None: a bottom frame with no copy on screen
     plain: str | None  # None: a bottom frame to delete
     md: str | None = None
     reply_markup: object = None
@@ -935,6 +963,7 @@ class _Frame:
     waiters: list = field(default_factory=list)  # futures resolved when this content lands
     shown: tuple | None = None  # the content that last landed
     failures: int = 0  # consecutive failed (non-flood) re-sends of a bottom frame
+    vacated: tuple[int, float] | None = None  # a moved bottom frame's (old id, delete issued at)
 
 
 @dataclass
@@ -982,7 +1011,8 @@ class Transport:
 
     def note_message(self, thread_id: int | None, message_id: int | None) -> None:
         """Record `message_id` as seen in `thread_id`; a replayed message (a tapped
-        suggestion) may carry no id. A bottom frame it lands below is re-sent."""
+        suggestion) may carry no id. A bottom frame it lands below is re-sent, and so
+        is one with no copy on screen (its re-send gave up after the old copy's delete)."""
         if not isinstance(message_id, int):
             return
         if message_id <= self.latest_message_ids.get(thread_id, 0):
@@ -993,8 +1023,7 @@ class Transport:
                 frame.bottom
                 and frame.thread_id == thread_id
                 and frame.plain is not None
-                and frame.message_id is not None
-                and frame.message_id < message_id
+                and (frame.message_id is None or frame.message_id < message_id)
             ):
                 frame.resend = True
                 self._mark_dirty(key)
@@ -1007,7 +1036,13 @@ class Transport:
     # ── One attempt / essential calls ──────────────────────────────
 
     async def _attempt(
-        self, make_coro, ok_not_modified=False, spare=True, paced=True, buries_bottom=True
+        self,
+        make_coro,
+        ok_not_modified=False,
+        spare=True,
+        paced=True,
+        buries_bottom=True,
+        delete_outcome=False,
     ):
         """Issue one aiogram call (its slot already taken). Returns its result,
         `_FLOODED` on a flood-wait (the deadline is recorded), `_NOT_MODIFIED` on a benign
@@ -1018,7 +1053,9 @@ class Transport:
         the frame task, the default; `_call` passes its own); then given up with a
         warning; a 4xx gets one try. A retried send whose first try did reach Telegram
         can post twice. `buries_bottom=False` sends a message that leaves the thread's
-        bottom frames where they are (a notice deleted soon)."""
+        bottom frames where they are (a notice deleted soon). `delete_outcome` (a delete)
+        replaces None with `_GONE` ("message to delete not found"), `_UNSURE` (transient
+        retries ran out) or `_REFUSED` (any other rejection)."""
         backoff = TRANSIENT_BACKOFF
         for attempt in range(TRANSIENT_RETRIES + 1):
             try:
@@ -1031,11 +1068,13 @@ class Transport:
                 if ok_not_modified and "message is not modified" in str(e):
                     return _NOT_MODIFIED
                 LOGGER.debug("telegram api error: %r", e)
+                if delete_outcome:
+                    return _GONE if "message to delete not found" in str(e) else _REFUSED
                 return None
             except (TelegramNetworkError, TelegramServerError) as e:
                 if attempt == TRANSIENT_RETRIES:
                     LOGGER.warning("telegram call failed after %d retries: %r", attempt, e)
-                    return None
+                    return _UNSURE if delete_outcome else None
                 LOGGER.warning("telegram call failed (%r), retry in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff *= 2
@@ -1043,7 +1082,7 @@ class Transport:
                 continue
             except TelegramAPIError as e:
                 LOGGER.debug("telegram api error: %r", e)
-                return None
+                return _REFUSED if delete_outcome else None
             break
         message_id = getattr(result, "message_id", None)
         if buries_bottom and isinstance(message_id, int):  # a sent (or edited) message
@@ -1167,7 +1206,7 @@ class Transport:
         self.note_message(thread_id, self.latest_message_ids.get(thread_id, 0) + 1)
 
     async def flush_frames(self) -> None:
-        """Wait until every recorded frame, title and queued delete has been pushed."""
+        """Wait until every recorded frame and title has been pushed."""
         while self._dirty or self._pushing:
             self._ensure_frame_task()
             self._frames_idle.clear()
@@ -1232,7 +1271,11 @@ class Transport:
         return max(0.0, min(waits)) if waits else None
 
     async def _push_frames(self) -> None:
-        """The frame task: push the newest recorded content when a slot is spare."""
+        """The frame task: push the newest recorded content when a slot is spare. A
+        bottom-frame move needs a second slot free at the same moment; without it the
+        slot goes back and the pick is redone once the pacer refills, so a must-land
+        frame recorded meanwhile goes first."""
+        slot_wait_from = None
         while True:
             if self._next_dirty() is None:
                 if not self._dirty:
@@ -1241,11 +1284,18 @@ class Transport:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._frame_wakeup.wait(), self._title_wait())
                 continue
-            slot_wait_from = time.monotonic()
+            if slot_wait_from is None:
+                slot_wait_from = time.monotonic()
             await self._clear_to_call(spare=True)
             key = self._next_dirty()  # re-pick: the newest state after the waits
             if key is None:
                 self._pacer.give_back()
+                continue
+            if self._is_move(key) and self._pacer.fits_pair and not self._pacer.take_spare_now():
+                self._pacer.give_back()
+                self._frame_wakeup.clear()  # a frame recorded meanwhile re-picks at once
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._frame_wakeup.wait(), self._pacer.spare_delay(2))
                 continue
             recorded_at, replaced = self._dirty.pop(key)
             pushed_at = time.monotonic()
@@ -1266,6 +1316,18 @@ class Transport:
                 replaced,
                 len(self._dirty),
             )
+            slot_wait_from = None
+
+    def _is_move(self, key: tuple) -> bool:
+        """Whether pushing `key` moves a buried bottom-frame copy (a delete + a send)."""
+        frame = self._frames.get(key)
+        return (
+            frame is not None
+            and frame.bottom
+            and frame.plain is not None
+            and frame.message_id is not None
+            and frame.resend
+        )
 
     def _frame_label(self, key: tuple) -> str:
         frame = self._frames.get(key)
@@ -1274,16 +1336,11 @@ class Transport:
             return f"msg {key[2]}{thread}"
         if key[0] == "bottom":
             return f"bottom {key[1]}{thread}"
-        if key[0] == "title":
-            return f"title thread {key[1]}"
-        return f"delete {key[2]}"
+        return f"title thread {key[1]}"
 
     async def _push(self, key: tuple) -> None:
         if key[0] == "title":
             await self._push_title(key)
-        elif key[0] == "delete":
-            if await self._attempt(lambda: self.bot.delete_message(key[1], key[2])) is _FLOODED:
-                self._mark_dirty(key)
         else:
             await self._push_frame(key)
 
@@ -1324,7 +1381,7 @@ class Transport:
         waiters, frame.waiters = frame.waiters, []
         must_land, frame.must_land = frame.must_land, False  # a newer must-land sets it anew
         if frame.bottom and (frame.message_id is None or frame.resend):
-            await self._resend_bottom(key, frame, content)
+            await self._resend_bottom(key, frame)
             return
         if content == frame.shown:
             _resolve(waiters, True)
@@ -1340,7 +1397,19 @@ class Transport:
             frame.shown = content
             _resolve(waiters, True)
 
-    async def _resend_bottom(self, key: tuple, frame: _Frame, content: tuple) -> None:
+    async def _resend_bottom(self, key: tuple, frame: _Frame) -> None:
+        """Send a bottom frame below the thread's newest message. A buried copy moves
+        with the two slots the frame task holds (one slot each when the burst is under
+        2): the old copy's delete, then the new send right after it, so the thread never
+        shows two copies and the gap without one is one call. Only a landed delete or
+        "not found" frees the old copy; an undeletable one is edited to a stub first."""
+        if frame.message_id is not None:
+            if not await self._vacate_bottom(key, frame):
+                return
+            if self._frames.get(key) is not frame or frame.plain is None:
+                self._pacer.give_back()  # dropped or retired during the delete: no send
+                return
+        content = (frame.plain, frame.md, frame.reply_markup)  # the newest, read at the send
         plain, md, markup = content
         kw = {"disable_notification": True, "reply_markup": markup}
         if frame.thread_id is not None:
@@ -1361,23 +1430,89 @@ class Transport:
             self._mark_dirty(key)
             return
         if result is None:
-            frame.failures += 1
-            if frame.failures < BOTTOM_RESEND_ATTEMPTS:
-                LOGGER.info("bottom frame %s: re-send failed, retrying", key[1])
-                self._mark_dirty(key)
-            else:  # a lasting rejection: the next content or newer message tries again
-                LOGGER.warning("bottom frame %s: re-send failed %d times", key[1], frame.failures)
-                frame.failures = 0
+            self._count_bottom_failure(key, frame, "re-send")
             return
         frame.failures = 0
-        old, frame.message_id = frame.message_id, result.message_id
+        frame.message_id = result.message_id
         frame.shown = content
-        LOGGER.info("bottom frame %s: re-anchored %s → %s", key[1], old, frame.message_id)
-        if old is not None:
-            self._mark_dirty(("delete", frame.chat_id, old))
+        old, deleted_at = frame.vacated or (None, None)
+        frame.vacated = None
+        gap = "" if deleted_at is None else f" (gap {time.monotonic() - deleted_at:.1f}s)"
+        LOGGER.info("bottom frame %s: re-anchored %s → %s%s", key[1], old, frame.message_id, gap)
         frame.resend = self.latest_message_ids.get(frame.thread_id, 0) > frame.message_id
         if frame.resend or (frame.plain, frame.md, frame.reply_markup) != content:
             self._mark_dirty(key)
+        else:  # the send's own id marked it buried; nothing is left to push
+            self._dirty.pop(key, None)
+
+    async def _vacate_bottom(self, key: tuple, frame: _Frame) -> bool:
+        """Take a buried bottom-frame copy off the screen ahead of its re-send. Called
+        holding the delete's slot, plus the send's when the pacer fits a pair. True once
+        the copy is gone (deleted, not found, or edited to a stub and untracked), with
+        the send's slot held. False when the copy stays, holding no slot: a flood-wait
+        retries the move, an unconfirmed delete or a failed stub counts as a failure."""
+        paired = self._pacer.fits_pair
+        chat_id, old = frame.chat_id, frame.message_id
+        deleted_at = time.monotonic()
+        outcome = await self._attempt(
+            lambda: self.bot.delete_message(chat_id, old), delete_outcome=True
+        )
+        if outcome is _FLOODED or outcome is _UNSURE:
+            if paired:
+                self._pacer.give_back()
+            if outcome is _FLOODED:
+                LOGGER.info("bottom frame %s: delete of %s flood-waited, retrying", key[1], old)
+                self._mark_dirty(key)
+            else:
+                LOGGER.info("bottom frame %s: delete of %s unconfirmed", key[1], old)
+                self._count_bottom_failure(key, frame, "delete")
+            return False
+        if outcome is _GONE:
+            LOGGER.info("bottom frame %s: old copy %s already gone", key[1], old)
+        elif outcome is _REFUSED:
+            if paired:
+                await self._recheck_flood()
+            else:
+                await self._clear_to_call(spare=True)
+            stub = await self._attempt(
+                lambda: self.bot.edit_message_text(STUB_TEXT, chat_id=chat_id, message_id=old),
+                ok_not_modified=True,
+            )
+            if stub is None or stub is _FLOODED:
+                LOGGER.warning(
+                    "bottom frame %s: old copy %s can't be deleted or stubbed", key[1], old
+                )
+                if stub is _FLOODED:
+                    self._mark_dirty(key)
+                else:
+                    self._count_bottom_failure(key, frame, "stub")
+                return False
+            LOGGER.warning("bottom frame %s: old copy %s can't be deleted, stubbed", key[1], old)
+            paired = False  # the stub took the send's slot
+        if paired:
+            await self._recheck_flood()
+        else:
+            await self._clear_to_call(spare=True)
+        frame.message_id, frame.vacated = None, (old, deleted_at)
+        return True
+
+    async def _recheck_flood(self) -> None:
+        """A slot held across another call: if a flood-wait began meanwhile, hand it
+        back and wait the flood out for a fresh one."""
+        if self.flood_until > time.monotonic():
+            self._pacer.give_back()
+            await self._clear_to_call(spare=True)
+
+    def _count_bottom_failure(self, key: tuple, frame: _Frame, what: str) -> None:
+        """A failed (non-flood) bottom-frame move or re-send: retried up to
+        BOTTOM_RESEND_ATTEMPTS times, then left for the next content or newer message."""
+        frame.failures += 1
+        if frame.failures < BOTTOM_RESEND_ATTEMPTS:
+            LOGGER.info("bottom frame %s: %s failed, retrying", key[1], what)
+            self._mark_dirty(key)
+        else:
+            LOGGER.warning("bottom frame %s: %s failed %d times", key[1], what, frame.failures)
+            frame.failures = 0
 
     async def _edit_attempt(self, chat_id, msg_id, plain, md, reply_markup):
         """One edit of a frame: the MarkdownV2 body when it fits, else (or when Telegram

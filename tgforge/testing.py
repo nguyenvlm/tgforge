@@ -40,6 +40,8 @@ class MockBot:
         self.deleted: list[int] = []  # message ids passed to delete_message
         self.deleted_topics: list[int] = []
         self.last_markup = None
+        # ("create" | "edit" | "delete", message id, text) in call order
+        self.screen_log: list[tuple[str, int, str | None]] = []
 
     def _id(self) -> int:
         self._next += 1
@@ -61,6 +63,7 @@ class MockBot:
     def _created(self, thread_id, text, kw) -> SimpleNamespace:
         message_id = self._id()
         self.created.append((message_id, thread_id, text))
+        self.screen_log.append(("create", message_id, text))
         if kw.get("disable_notification"):
             self.silent.add(message_id)
         return SimpleNamespace(message_id=message_id, message_thread_id=thread_id)
@@ -89,6 +92,7 @@ class MockBot:
 
     async def edit_message_text(self, text, **kw):
         self.edits.append((kw.get("message_id"), text))
+        self.screen_log.append(("edit", kw.get("message_id"), text))
         if kw.get("reply_markup") is not None:
             self.last_markup = kw["reply_markup"]
         return SimpleNamespace(message_id=kw.get("message_id"))
@@ -102,7 +106,30 @@ class MockBot:
 
     async def delete_message(self, chat_id, message_id):
         self.deleted.append(message_id)
+        self.screen_log.append(("delete", message_id, None))
         return True
+
+    def _replay_screen(self, match):
+        """Yield the ids of bot messages whose current text satisfies `match`, after
+        each send, edit and delete, in call order."""
+        shown: set[int] = set()
+        for kind, message_id, text in self.screen_log:
+            if kind != "delete" and match(text):
+                shown.add(message_id)
+            else:
+                shown.discard(message_id)
+            yield shown
+
+    def peak_on_screen(self, match) -> int:
+        """The most bot messages matching `match` that were on screen at once."""
+        return max((len(shown) for shown in self._replay_screen(match)), default=0)
+
+    def on_screen(self, match) -> list[int]:
+        """The ids of bot messages matching `match` on screen now, oldest first."""
+        shown: set[int] = set()
+        for shown in self._replay_screen(match):  # noqa: B007 — the last state is the answer
+            continue
+        return sorted(shown)
 
 
 class TestClient:

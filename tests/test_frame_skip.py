@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from tgforge.base import kernel
 from tgforge.base.kernel import Transport
+from tgforge.testing import MockBot
 
 
 class _Flood(TelegramRetryAfter):
@@ -544,5 +545,557 @@ def test_a_message_that_does_not_bury_leaves_the_bottom_frame_in_place():
         await t.send(1, "a reply", thread_id=7)
         await t.flush_frames()
         assert bot.texts("send")[-1] == "the view"  # an ordinary message does re-send it
+
+    asyncio.run(scenario())
+
+
+# ── Moving a buried bottom frame: one paired step ──────────────────
+
+
+def _record_pacer(t: Transport, events: list) -> None:
+    """Log every pacer slot taken into `events`, next to the bot's own calls."""
+    pacer = t._pacer
+    for name in ("take", "take_spare"):
+        real = getattr(pacer, name)
+
+        async def wait(real=real, name=name):
+            await real()
+            events.append((name, None))
+
+        setattr(pacer, name, wait)
+    real_now = pacer.take_spare_now
+
+    def take_now():
+        taken = real_now()
+        if taken:
+            events.append(("take_spare_now", None))
+        return taken
+
+    pacer.take_spare_now = take_now
+
+
+def _logging_mock_bot(events: list) -> MockBot:
+    bot = MockBot()
+    real_send, real_delete = bot.send_message, bot.delete_message
+
+    async def send_message(chat_id, text, **kw):
+        result = await real_send(chat_id, text, **kw)
+        events.append(("send", result.message_id))
+        return result
+
+    async def delete_message(chat_id, message_id):
+        events.append(("delete", message_id))
+        return await real_delete(chat_id, message_id)
+
+    bot.send_message, bot.delete_message = send_message, delete_message
+    return bot
+
+
+def _is_panel(text: str) -> bool:
+    return text.startswith("rows")
+
+
+def test_a_buried_panel_is_deleted_then_re_sent_with_no_slot_wait_between():
+    async def scenario():
+        events = []
+        bot = _logging_mock_bot(events)
+        t = Transport(bot=bot)
+        _record_pacer(t, events)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        events.clear()
+        t.note_message(7, first + 1)  # a newer message buries it
+        await t.flush_frames()
+        second = t.bottom_frame_id("panel")
+        assert events[-4:] == [
+            ("take_spare", None),
+            ("take_spare_now", None),  # the second slot, free at the same moment
+            ("delete", first),
+            ("send", second),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_the_paired_move_lands_both_calls_inside_one_slot_wait():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=3)  # one slot per 0.1 s
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        t._pacer.tokens = 0.0  # the bucket is empty when the panel is buried
+        t.note_message(7, first + 1)
+        started = time.monotonic()
+        await t.flush_frames()
+        (deleted_at,) = [at for at, m, p in bot.calls if m == "delete"]
+        sent_at = [at for at, m, _p in bot.calls if m == "send"][-1]
+        assert deleted_at - started >= 0.18  # waited for two slots, not one
+        assert 0 <= sent_at - deleted_at < 0.05  # no slot wait between the two calls
+
+    asyncio.run(scenario())
+
+
+def test_take_spare_now_takes_only_a_free_spare_slot_and_never_waits():
+    pacer = kernel._Pacer(600, 3)  # one slot per 0.1 s
+    pacer.tokens = 1.0
+    assert pacer.take_spare_now() and pacer.tokens < 0.1
+    assert not pacer.take_spare_now()  # none free: no wait, no take
+    pacer.tokens, pacer.waiting = 3.0, 1  # an essential call is pending
+    assert not pacer.take_spare_now() and pacer.tokens > 2.9
+
+
+def test_spare_delay_is_the_refill_time_to_the_wanted_slots():
+    pacer = kernel._Pacer(600, 3)  # one slot per 0.1 s
+    pacer.tokens = 1.0
+    assert 0.09 <= pacer.spare_delay(2) <= 0.1
+    pacer.tokens = 3.0
+    assert pacer.spare_delay(2) == kernel.SPARE_SLOT_POLL  # free now: one poll, no spin
+    assert kernel._Pacer(0, 3).spare_delay(2) == 0.0  # pacing off
+
+
+def test_a_burst_of_three_messages_never_shows_two_panels():
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot, pace_per_min=1200, pace_burst=3)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        for n in range(3):
+            await t.send(1, f"message {n}", thread_id=7)
+            await asyncio.sleep(0.05)  # the frame task moves the panel between them
+        await t.flush_frames()
+        assert bot.peak_on_screen(_is_panel) == 1
+        assert bot.created[-1][2] == "rows"  # one panel, at the bottom
+        assert len(bot.created) - len(bot.deleted) == 4  # three messages + one panel
+
+    asyncio.run(scenario())
+
+
+def test_a_flood_between_the_delete_and_the_send_still_ends_with_one_panel():
+    async def scenario():
+        bot = MockBot()
+        real_send = bot.send_message
+        floods = {"left": 0}
+
+        async def send_message(chat_id, text, **kw):
+            if text == "rows" and floods["left"]:
+                floods["left"] -= 1
+                raise _Flood(0.05)
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send_message
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        floods["left"] = 1  # the move's send hits a flood-wait after its delete landed
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.deleted == [first]
+        assert bot.peak_on_screen(_is_panel) == 1
+        assert bot.created[-1] == (t.bottom_frame_id("panel"), 7, "rows")  # back at the bottom
+
+    asyncio.run(scenario())
+
+
+def test_a_flood_waited_delete_keeps_the_old_panel_until_the_move_retries():
+    async def scenario():
+        events = []
+        bot = _Bot()
+        t = Transport(bot=bot)
+        _record_pacer(t, events)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        bot.flood["delete"] = [0.05]
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        methods = [m for _at, m, _p in bot.calls]
+        assert methods == ["send", "send", "delete", "delete", "send"]  # no send after the flood
+        assert t.bottom_frame_id("panel") > first
+        assert [e for e in events if e[0] == "take_spare_now"] == [("take_spare_now", None)] * 2
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_re_send_after_the_delete_retries_up_to_the_attempt_limit():
+    from tgforge.base.kernel import BOTTOM_RESEND_ATTEMPTS
+
+    async def scenario():
+        bot = MockBot()
+        real_send = bot.send_message
+        failures = {"left": 0}
+        tried = []
+
+        async def send_message(chat_id, text, **kw):
+            if text == "rows":
+                tried.append(text)
+            if text == "rows" and failures["left"]:
+                failures["left"] -= 1
+                raise _Rejected("Bad Request: something transient")
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send_message
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        failures["left"] = BOTTOM_RESEND_ATTEMPTS - 1  # the last allowed attempt lands
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert len(tried) == 1 + BOTTOM_RESEND_ATTEMPTS
+        assert bot.deleted == [first]
+        assert bot.peak_on_screen(_is_panel) == 1
+        assert bot.created[-1] == (t.bottom_frame_id("panel"), 7, "rows")
+
+        tried.clear()
+        failures["left"] = 10**6  # a lasting rejection stops at the limit
+        await t.send(1, "later again", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert len(tried) == BOTTOM_RESEND_ATTEMPTS
+
+    asyncio.run(scenario())
+
+
+def test_a_panel_left_with_no_copy_is_re_sent_by_the_next_newer_message():
+    from tgforge.base.kernel import BOTTOM_RESEND_ATTEMPTS
+
+    async def scenario():
+        bot = MockBot()
+        real_send = bot.send_message
+        failures = {"left": 0}
+
+        async def send_message(chat_id, text, **kw):
+            if text == "rows" and failures["left"]:
+                failures["left"] -= 1
+                raise _Rejected("Bad Request: something transient")
+            return await real_send(chat_id, text, **kw)
+
+        bot.send_message = send_message
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        failures["left"] = BOTTOM_RESEND_ATTEMPTS  # the move's send gives up
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert t.bottom_frame_id("panel") is None  # old copy deleted, no new one
+        await t.send(1, "even later", thread_id=7)  # same content, a newer message
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.created[-1] == (t.bottom_frame_id("panel"), 7, "rows")
+        assert bot.peak_on_screen(_is_panel) == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_move_logs_its_gap_from_the_delete_to_the_landed_send(caplog):
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        await t.send(1, "later", thread_id=7)
+        await t.flush_frames()
+
+    with caplog.at_level("INFO", logger="tgforge"):
+        asyncio.run(scenario())
+    lines = [r.getMessage() for r in caplog.records if "re-anchored" in r.getMessage()]
+    assert lines[0] == "bottom frame panel: re-anchored None → 1001"
+    assert lines[1].startswith("bottom frame panel: re-anchored 1001 → 1003 (gap ")
+
+
+# ── A delete that fails for a reason other than a flood-wait ──────
+
+
+class _BadRequest(TelegramBadRequest):
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+def _bot_with_failing_delete(make_error):
+    """A MockBot whose delete raises `make_error()` while `state["fail"]`, leaving the
+    message on screen."""
+    bot = MockBot()
+    real_delete = bot.delete_message
+    state = {"fail": False}
+
+    async def delete_message(chat_id, message_id):
+        if state["fail"]:
+            raise make_error()
+        return await real_delete(chat_id, message_id)
+
+    bot.delete_message = delete_message
+    return bot, state
+
+
+def test_delete_of_an_already_gone_copy_still_ends_with_one_panel():
+    async def scenario():
+        bot, state = _bot_with_failing_delete(
+            lambda: _BadRequest("Bad Request: message to delete not found")
+        )
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        bot.screen_log.append(("delete", first, None))  # the user deleted it by hand
+        state["fail"] = True
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.on_screen(_is_panel) == [t.bottom_frame_id("panel")]
+        assert t.bottom_frame_id("panel") > first
+
+    asyncio.run(scenario())
+
+
+def test_a_lasting_4xx_on_the_delete_never_leaves_two_panels():
+    """E.g. "message can't be deleted" (a copy older than 48 h without the delete
+    right): the old copy is edited to a stub, so the thread keeps one panel."""
+
+    async def scenario():
+        bot, state = _bot_with_failing_delete(
+            lambda: _BadRequest("Bad Request: message can't be deleted")
+        )
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows", reply_markup="KEYS")
+        await t.flush_frames()
+        state["fail"] = True
+        for n in range(3):
+            await t.send(1, f"later {n}", thread_id=7)
+            await asyncio.wait_for(t.flush_frames(), 2)
+        assert len(bot.on_screen(_is_panel)) == 1, f"panels on screen: {bot.on_screen(_is_panel)}"
+        assert bot.peak_on_screen(_is_panel) == 1
+        assert [text for _m, text in bot.edits] == [kernel.STUB_TEXT] * 3
+        assert bot.created[-1] == (t.bottom_frame_id("panel"), 7, "rows")
+
+    asyncio.run(scenario())
+
+
+def test_the_stub_edit_drops_the_old_copys_keyboard():
+    async def scenario():
+        bot, state = _bot_with_failing_delete(
+            lambda: _BadRequest("Bad Request: message can't be deleted")
+        )
+        stub_kw = []
+        real_edit = bot.edit_message_text
+
+        async def edit_message_text(text, **kw):
+            stub_kw.append(kw)
+            return await real_edit(text, **kw)
+
+        bot.edit_message_text = edit_message_text
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "view", "rows", reply_markup="KEYS")
+        await t.flush_frames()
+        first = t.bottom_frame_id("view")
+        state["fail"] = True
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert stub_kw == [{"chat_id": 1, "message_id": first}]  # no reply_markup: no buttons
+        assert bot.last_markup == "KEYS"  # the new copy carries them
+
+    asyncio.run(scenario())
+
+
+def test_an_undeletable_copy_that_cannot_be_stubbed_stays_the_one_copy():
+    async def scenario():
+        bot, state = _bot_with_failing_delete(
+            lambda: _BadRequest("Bad Request: message can't be deleted")
+        )
+
+        async def edit_message_text(text, **kw):
+            raise _BadRequest("Bad Request: message can't be edited")
+
+        bot.edit_message_text = edit_message_text
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        state["fail"] = True
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.on_screen(_is_panel) == [first]  # buried, but never a second copy
+        assert t.bottom_frame_id("panel") == first
+
+    asyncio.run(scenario())
+
+
+def test_a_delete_that_exhausts_its_network_retries_never_leaves_two_panels(monkeypatch):
+    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.methods import DeleteMessage
+
+    monkeypatch.setattr(kernel, "TRANSIENT_BACKOFF", 0.001)
+
+    async def scenario():
+        method = DeleteMessage(chat_id=1, message_id=1)
+        bot, state = _bot_with_failing_delete(lambda: TelegramNetworkError(method, "timeout"))
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        state["fail"] = True
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)  # bounded: the move gives up
+        assert bot.on_screen(_is_panel) == [first], f"panels on screen: {bot.on_screen(_is_panel)}"
+        state["fail"] = False  # the network is back: the next newer message moves it
+        await t.send(1, "even later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.on_screen(_is_panel) == [t.bottom_frame_id("panel")]
+        assert bot.created[-1][2] == "rows" and bot.peak_on_screen(_is_panel) == 1
+
+    asyncio.run(scenario())
+
+
+# ── The move never holds back a must-land frame or stale content ───
+
+
+def test_a_finalizing_edit_recorded_during_the_pair_wait_is_not_held_behind_it():
+    """A land_frame recorded while the frame task waits for the move's two slots
+    lands after one slot, not after the pair plus the move."""
+
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=3)  # one slot per 0.1 s
+        card = await t.send(1, "card", thread_id=7)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        t._pacer.tokens = 0.0
+        t.note_message(7, t.bottom_frame_id("panel") + 1)
+        await asyncio.sleep(0.12)  # the frame task picked the move; it waits for a pair
+        started = time.monotonic()
+        landed = t.land_frame(1, card, "final", thread_id=7)
+        assert await asyncio.wait_for(landed, 2)
+        assert time.monotonic() - started < 0.15, time.monotonic() - started
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.on_screen(_is_panel) == [t.bottom_frame_id("panel")]
+
+    asyncio.run(scenario())
+
+
+def test_content_recorded_during_the_pair_wait_goes_out_in_the_move_itself():
+    """The panel ticks its clock; a new content recorded while the move waits for its
+    pair rides the move's send, not a follow-up edit."""
+
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=3)
+        t.show_bottom_frame(1, 7, "panel", "rows 0s")
+        await t.flush_frames()
+        t._pacer.tokens = 0.0
+        t.note_message(7, t.bottom_frame_id("panel") + 1)
+        await asyncio.sleep(0.12)  # inside the pair wait
+        t.show_bottom_frame(1, 7, "panel", "rows 1s")
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.created[-1][2] == "rows 1s"
+        assert bot.edits == []
+
+    asyncio.run(scenario())
+
+
+def test_a_move_takes_no_extra_slot_after_its_send():
+    """The move's own send marks the frame buried by its new id; that must not cost a
+    further frame push (and its pacer slot)."""
+
+    async def scenario():
+        events = []
+        bot = _logging_mock_bot(events)
+        t = Transport(bot=bot)
+        _record_pacer(t, events)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        await t.send(1, "later", thread_id=7)  # ids keep growing, as in Telegram
+        await t.flush_frames()
+        moved = events[[name for name, _ in events].index("delete") - 2 :]
+        assert [name for name, _ in moved] == ["take_spare", "take_spare_now", "delete", "send"]
+
+    asyncio.run(scenario())
+
+
+# ── A burst below 2 slots ───────────────────────────────────────────
+
+
+def test_a_transport_with_burst_one_still_moves_the_panel():
+    async def scenario():
+        bot = _Bot()
+        t = Transport(bot=bot, pace_per_min=600, pace_burst=1)  # one slot per 0.1 s
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        first = t.bottom_frame_id("panel")
+        t._pacer.tokens = 1.0
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert [m for _at, m, _p in bot.calls] == ["send", "send", "delete", "send"]
+        assert bot.texts("delete") == [first] and bot.texts("send")[-1] == "rows"
+        deleted_at, sent_at = [at for at, m, _p in bot.calls][-2:]
+        assert 0.08 <= sent_at - deleted_at < 0.2  # one slot between the two calls
+
+    asyncio.run(scenario())
+
+
+def test_content_recorded_during_the_moves_delete_rides_its_send():
+    async def scenario():
+        bot = MockBot()
+        real_delete = bot.delete_message
+        t = Transport(bot=bot)
+
+        async def delete_message(chat_id, message_id):
+            t.show_bottom_frame(1, 7, "panel", "rows 1s")  # the clock ticks mid-delete
+            return await real_delete(chat_id, message_id)
+
+        t.show_bottom_frame(1, 7, "panel", "rows 0s")
+        await t.flush_frames()
+        bot.delete_message = delete_message
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert bot.created[-1][2] == "rows 1s"
+        assert bot.edits == []  # no follow-up edit
+
+    asyncio.run(scenario())
+
+
+def test_a_finalizing_edit_recorded_while_a_move_waits_for_its_second_slot_goes_at_once():
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot, pace_per_min=60, pace_burst=3)  # one slot per second
+        card = await t.send(1, "card", thread_id=7)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        t._pacer.tokens = 0.0
+        t.note_message(7, t.bottom_frame_id("panel") + 1)  # a move, short of its pair
+        await asyncio.sleep(1.1)  # one slot came back; the move handed it back and waits
+        started = time.monotonic()
+        assert await asyncio.wait_for(t.land_frame(1, card, "final", thread_id=7), 5)
+        assert time.monotonic() - started < 0.3
+
+    asyncio.run(scenario())
+
+
+def test_the_moves_send_waits_out_a_flood_recorded_during_its_delete():
+    async def scenario():
+        bot = MockBot()
+        t = Transport(bot=bot)
+        t.show_bottom_frame(1, 7, "panel", "rows")
+        await t.flush_frames()
+        real_send, real_delete = bot.send_message, bot.delete_message
+        flood = {}
+        panel_sends = []
+
+        async def delete_message(chat_id, message_id):
+            result = await real_delete(chat_id, message_id)
+            flood["until"] = t.flood_until = time.monotonic() + 0.3  # another call's 429
+            return result
+
+        async def send_message(chat_id, text, **kw):
+            if text == "rows":
+                panel_sends.append(time.monotonic())
+            return await real_send(chat_id, text, **kw)
+
+        bot.delete_message, bot.send_message = delete_message, send_message
+        await t.send(1, "later", thread_id=7)
+        await asyncio.wait_for(t.flush_frames(), 2)
+        assert panel_sends and panel_sends[-1] >= flood["until"]
+        assert bot.peak_on_screen(_is_panel) == 1
 
     asyncio.run(scenario())
