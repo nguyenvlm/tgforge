@@ -180,7 +180,7 @@ class ClaudeTopic(Topic):
         return self._core.chat_id
 
     def _env_tag(self) -> str:
-        """The `[via Telegram bot · …]` locator prepended to a turn's brief: which
+        """The `[via Telegram bot · …]` locator leading the session note: which
         bot, its process manager, and where it runs. Absent fields are dropped."""
         cfg = self._core.config
         name = (cfg.service or cfg.bot_username or "tgforge").strip()
@@ -205,6 +205,23 @@ class ClaudeTopic(Topic):
                 except OSError:
                     p.brief_resolved = ""
         return p.brief_resolved
+
+    def _session_note(self) -> str:
+        """The Telegram note — env tag, `SESSION_BRIEF`, app brief — every turn of the
+        CLI process runs under (a slash skill too)."""
+        extra = self._app_brief()
+        return f"{self._env_tag()} {SESSION_BRIEF}" + (f"\n{extra}" if extra else "")
+
+    def _session_note_file(self) -> Path:
+        """This window's note file in the bot home, passed as `--append-system-prompt-file`
+        (a file, not an argument: a long app brief would pass the kernel's argument cap)."""
+        return self._core.config.home_path / "session_notes" / f"{self.thread_id or 0}.md"
+
+    def _write_session_note(self) -> Path:
+        path = self._session_note_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self._session_note())
+        return path
 
     def _default_workspace(self) -> str:
         ws = self.plugin.workspaces
@@ -251,6 +268,7 @@ class ClaudeTopic(Topic):
                 t.cancel()
         if self.proc:
             await reap(self.proc)  # close the transport so the CLI child never leaks
+        self._session_note_file().unlink(missing_ok=True)
 
     def _save(self):
         self.saved["session"] = {
@@ -341,6 +359,7 @@ class ClaudeTopic(Topic):
         prompt_file = system_prompt_file(Path(self.workspace))
         if prompt_file is not None:
             cmd += ["--system-prompt-file", str(prompt_file)]
+        cmd += ["--append-system-prompt-file", str(self._write_session_note())]
         env = self._login_env(self._session_config_dir())
         env["TELEGRAM_THREAD_ID"] = str(self.thread_id or 0)
         env["TELEGRAM_BOT_DRIVEN"] = "1"
@@ -485,10 +504,6 @@ class ClaudeTopic(Topic):
                 note = f"failed to launch: {exc}"  # `exc` is unbound once the block ends
                 self._send_in_order(lambda: self.send(note))
                 return
-            if not prompt.startswith("/"):
-                brief = f"{self._env_tag()} {SESSION_BRIEF}"
-                extra = self._app_brief()
-                prompt = f"{prompt}\n\n{brief}" + (f"\n{extra}" if extra else "")
             proc_alive = self.proc is not None and self.proc.returncode is None
             LOGGER.info(
                 "submit (%s): busy=%s proc_alive=%s pending=%d card=%s seq=%d :: %r",

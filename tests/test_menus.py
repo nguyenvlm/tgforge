@@ -1,6 +1,6 @@
 """Nested-menu command flows and the per-bot session-brief locator: the workspace
 switch (a new cwd starts a fresh session), the list-editor helpers shared by the
-typed path and the menu, and the `[via Telegram bot · …]` tag prepended to a turn."""
+typed path and the menu, and the `[via Telegram bot · …]` tag leading the session note."""
 
 from __future__ import annotations
 
