@@ -54,8 +54,9 @@ _SPOILER_TAGS = ("<tg-spoiler>", "</tg-spoiler>")
 
 class LayoutKeepingWalker(EventWalker):
     """telegramify-markdown's event walker, changed to keep the source layout:
-    raw HTML stays as literal text, and a list item's later lines and blocks sit
-    under the bullet (hanging indent).
+    raw HTML stays as literal text; a list item's later lines and blocks sit right
+    under its bullet, first line indented, and an item with more than one block is
+    set off from what follows it in the list by a blank line, so each bullet reads as one group.
 
     A hanging indent never exceeds the source line's own indent, so the output adds
     no whitespace the input lacks (`md_chunks` relies on bounded growth)."""
@@ -65,8 +66,12 @@ class LayoutKeepingWalker(EventWalker):
         self._event_range: dict[str, int] | None = None
         self._in_html_block = False
         self._html_block_lines = 0
-        # per open list item: (output offset where its content starts, hanging indent width)
-        self._item_stack: list[tuple[int, int]] = []
+        # per open list item: [output offset where its content starts, hanging indent
+        # width, whether it has a later block]
+        self._item_stack: list[list] = []
+        # a closed item had a later block: the next bullet or block inside the list
+        # starts after a blank line
+        self._gap_pending = False
 
     def _handle_event(self, event) -> None:
         payload, source_range = event if isinstance(event, tuple) else (event, None)
@@ -101,24 +106,37 @@ class LayoutKeepingWalker(EventWalker):
 
     def _on_start_item(self) -> None:
         ordered = self._list_stack[-1] if self._list_stack else None
+        self._write_newlines(2 if self._gap_pending else 1)
+        self._gap_pending = False
         super()._on_start_item()
         marker = (
             f"{ordered}{self._config.markdown_symbol.ordered_list_suffix} "
             if ordered is not None
             else f"{self._config.markdown_symbol.unordered_list_item} "
         )
-        self._item_stack.append((self._buf.py_offset, len(self._item_indent + marker)))
+        self._item_stack.append([self._buf.py_offset, len(self._item_indent + marker), False])
 
     def _on_task_list_marker(self, checked: bool) -> None:
         super()._on_task_list_marker(checked)
         symbol = self._config.markdown_symbol
         mark = symbol.task_completed if checked else symbol.task_uncompleted
-        self._item_stack[-1] = (self._buf.py_offset, len(f"{self._item_indent}{mark} "))
+        self._item_stack[-1][:2] = [self._buf.py_offset, len(f"{self._item_indent}{mark} ")]
 
     def _on_end_item(self) -> None:
         super()._on_end_item()
-        if self._item_stack:
-            self._item_stack.pop()
+        if self._item_stack and self._item_stack.pop()[2]:
+            self._gap_pending = True
+
+    def _on_end_list(self) -> None:
+        super()._on_end_list()
+        if not self._list_stack:
+            self._gap_pending = False
+
+    def _write_newlines(self, count: int) -> None:
+        """End the output with at least `count` newlines (none at the very start)."""
+        needed = count - self._buf.trailing_newline_count()
+        if self._buf.py_offset > 0 and needed > 0:
+            self._buf.write("\n" * needed)
 
     def _source_line_indent(self, position: int | None, forward: bool) -> int:
         """Spaces/tabs before `position` on its source line (0 when other text
@@ -156,16 +174,17 @@ class LayoutKeepingWalker(EventWalker):
             self._buf.write(self._hanging_indent(end, forward=True))
 
     def _start_block(self, source_start: int | None, indent: bool = True) -> None:
-        """Open a block: a later block of a list item goes on its own line (after a
-        blank line when the source has one), indented under its bullet unless
-        `indent` is off; any other block gets the library's block spacing."""
+        """Open a block: a later block of a list item goes on the next line, indented
+        under its bullet unless `indent` is off; any other block gets the library's
+        block spacing."""
         if not self._list_stack:
             self._ensure_block_spacing(source_start)
             return
         if not self._item_stack or self._buf.py_offset <= self._item_stack[-1][0]:
             return
-        blank = source_start is not None and self._has_extra_blank_line(source_start)
-        self._write_block_gap(2 if blank else 1)
+        self._item_stack[-1][2] = True
+        self._write_newlines(2 if self._gap_pending else 1)
+        self._gap_pending = False
         if indent:
             self._buf.write(self._hanging_indent(source_start))
 
@@ -179,11 +198,6 @@ class LayoutKeepingWalker(EventWalker):
         if self._list_stack:
             self._start_block(self._code_block_start_source, indent=False)
         super()._on_end_code_block()
-
-    def _write_block_gap(self, newlines: int) -> None:
-        needed = newlines - self._buf.trailing_newline_count()
-        if needed > 0:
-            self._buf.write("\n" * needed)
 
 
 def to_md(text: str) -> str:

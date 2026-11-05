@@ -128,16 +128,21 @@ TO_MD_CASES = [
     ("a <tag>", "a <tag\\>"),
     ("a <b>bold</b> & <tag>", "a <b\\>bold</b\\> & <tag\\>"),
     ("<div>\nhi\n</div>\n\nafter", "<div\\>\nhi\n</div\\>\n\nafter"),
-    # a later paragraph of a list item hangs under its bullet
-    ("- a\n\n  more of a\n- b", "⦁ a\n\n  more of a\n⦁ b\n"),
-    ("1. a\n   b\n\n   c\n2. d", "1\\. a\n   b\n\n   c\n2\\. d\n"),
+    # a later paragraph of a list item sits right under its bullet, and a blank
+    # line sets the item off from the next bullet
+    ("- a\n\n  more of a\n- b", "⦁ a\n  more of a\n\n⦁ b\n"),
+    ("- a\n\n  more of a\n\n- b", "⦁ a\n  more of a\n\n⦁ b\n"),
+    ("1. a\n   b\n\n   c\n2. d", "1\\. a\n   b\n   c\n\n2\\. d\n"),
+    # items with one block each stay tight
+    ("- a\n  - a1\n  - a2\n- b", "⦁ a\n  ⦁ a1\n  ⦁ a2\n⦁ b\n"),
     ("- a\n  b\n- c", "⦁ a\n  b\n⦁ c\n"),
     # the hanging indent never exceeds the source line's own indent
     ("- a\n  b\nc", "⦁ a\n  b\nc\n"),
-    ("- a\n\n  <div>\n  x\n  </div>\n- b", "⦁ a\n\n  <div\\>\n  x\n  </div\\>\n⦁ b\n"),
-    ("- [ ] a\n\n  more", "☐ a\n\n  more\n"),
-    ("- a\n  - b\n\n    more b\n\n  more a", "⦁ a\n  ⦁ b\n\n    more b\n\n  more a\n"),
-    # a code block inside a list item starts on its own line
+    ("- a\n\n  <div>\n  x\n  </div>\n- b", "⦁ a\n  <div\\>\n  x\n  </div\\>\n\n⦁ b\n"),
+    ("- [ ] a\n\n  more", "☐ a\n  more\n"),
+    ("- a\n  - b\n\n    more b\n\n  more a", "⦁ a\n  ⦁ b\n    more b\n\n  more a\n"),
+    # a code block inside a list item starts on its own line; one newline before
+    # the next bullet, since Telegram adds the gap after a code block itself
     ("- a\n  ```\n  code\n  ```\n- b", "⦁ a\n```\ncode\n```\n⦁ b\n"),
     # after a code block one newline is enough: Telegram adds the gap itself
     ("```py\nx = 1\n```\n\nAfter.", "```py\nx = 1\n```\nAfter\\."),
