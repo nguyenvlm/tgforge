@@ -9,6 +9,9 @@ trigger a function another app registered — the bot core routes it.
 from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telegramify_markdown import entities_to_markdownv2
+from telegramify_markdown.config import get_runtime_config
+from telegramify_markdown.converter import STANDARD_OPTIONS, EventWalker, _parse
 
 MAX_MSG = 4096
 SAFE_RAW_CHUNK = 1800  # raw size whose MarkdownV2 conversion always fits MAX_MSG
@@ -46,13 +49,151 @@ def chunks(text: str) -> list[str]:
     return out
 
 
-def to_md(text: str) -> str:
-    """GFM → Telegram MarkdownV2. Returns the text unchanged on any converter
-    error; the send path then retries the message plain (no parse_mode)."""
-    try:
-        import telegramify_markdown
+_SPOILER_TAGS = ("<tg-spoiler>", "</tg-spoiler>")
 
-        return telegramify_markdown.markdownify(text)
+
+class LayoutKeepingWalker(EventWalker):
+    """telegramify-markdown's event walker, changed to keep the source layout:
+    raw HTML stays as literal text, and a list item's later lines and blocks sit
+    under the bullet (hanging indent).
+
+    A hanging indent never exceeds the source line's own indent, so the output adds
+    no whitespace the input lacks (`md_chunks` relies on bounded growth)."""
+
+    def __init__(self, config, source_markdown: str) -> None:
+        super().__init__(config, source_markdown)
+        self._event_range: dict[str, int] | None = None
+        self._in_html_block = False
+        self._html_block_lines = 0
+        # per open list item: (output offset where its content starts, hanging indent width)
+        self._item_stack: list[tuple[int, int]] = []
+
+    def _handle_event(self, event) -> None:
+        payload, source_range = event if isinstance(event, tuple) else (event, None)
+        self._event_range = source_range
+        if isinstance(payload, dict):
+            if payload.get("Start") == "HtmlBlock":
+                self._start_block(self._source_start(source_range))
+                self._in_html_block = True
+                self._html_block_lines = 0
+                return
+            if payload.get("End") == "HtmlBlock":
+                self._in_html_block = False
+                if not self._list_stack:
+                    self._mark_block_end()
+                return
+            if "Html" in payload and self._in_html_block:
+                self._on_html_block_line(payload["Html"])
+                return
+        super()._handle_event(event)
+
+    def _on_html_block_line(self, line: str) -> None:
+        if self._html_block_lines:
+            self._buf.write("\n" + self._hanging_indent(self._source_start(self._event_range)))
+        self._html_block_lines += 1
+        self._on_text(line.rstrip("\n"))
+
+    def _on_inline_html(self, html: str) -> None:
+        if html.strip().lower() in _SPOILER_TAGS:
+            super()._on_inline_html(html)
+        else:
+            self._on_text(html)
+
+    def _on_start_item(self) -> None:
+        ordered = self._list_stack[-1] if self._list_stack else None
+        super()._on_start_item()
+        marker = (
+            f"{ordered}{self._config.markdown_symbol.ordered_list_suffix} "
+            if ordered is not None
+            else f"{self._config.markdown_symbol.unordered_list_item} "
+        )
+        self._item_stack.append((self._buf.py_offset, len(self._item_indent + marker)))
+
+    def _on_task_list_marker(self, checked: bool) -> None:
+        super()._on_task_list_marker(checked)
+        symbol = self._config.markdown_symbol
+        mark = symbol.task_completed if checked else symbol.task_uncompleted
+        self._item_stack[-1] = (self._buf.py_offset, len(f"{self._item_indent}{mark} "))
+
+    def _on_end_item(self) -> None:
+        super()._on_end_item()
+        if self._item_stack:
+            self._item_stack.pop()
+
+    def _source_line_indent(self, position: int | None, forward: bool) -> int:
+        """Spaces/tabs before `position` on its source line (0 when other text
+        precedes it), or after it when `forward` (`position` is a line start)."""
+        if position is None:
+            return 0
+        source = self._source_bytes
+        count = 0
+        if forward:
+            while source[position + count : position + count + 1] in (b" ", b"\t"):
+                count += 1
+            return count
+        i = position - 1
+        while i >= 0 and source[i : i + 1] in (b" ", b"\t"):
+            count += 1
+            i -= 1
+        return count if i < 0 or source[i : i + 1] in (b"\n", b"\r") else 0
+
+    def _hanging_indent(self, source_start: int | None, forward: bool = False) -> str:
+        if not self._list_stack or not self._item_stack or self._in_table_cell:
+            return ""
+        width = self._item_stack[-1][1]
+        return " " * min(width, self._source_line_indent(source_start, forward))
+
+    def _on_soft_break(self) -> None:
+        super()._on_soft_break()
+        if not self._in_code_block:
+            end = self._event_range.get("end") if self._event_range else None
+            self._buf.write(self._hanging_indent(end, forward=True))
+
+    def _on_hard_break(self) -> None:
+        super()._on_hard_break()
+        if not self._in_code_block:
+            end = self._event_range.get("end") if self._event_range else None
+            self._buf.write(self._hanging_indent(end, forward=True))
+
+    def _start_block(self, source_start: int | None, indent: bool = True) -> None:
+        """Open a block: a later block of a list item goes on its own line (after a
+        blank line when the source has one), indented under its bullet unless
+        `indent` is off; any other block gets the library's block spacing."""
+        if not self._list_stack:
+            self._ensure_block_spacing(source_start)
+            return
+        if not self._item_stack or self._buf.py_offset <= self._item_stack[-1][0]:
+            return
+        blank = source_start is not None and self._has_extra_blank_line(source_start)
+        self._write_block_gap(2 if blank else 1)
+        if indent:
+            self._buf.write(self._hanging_indent(source_start))
+
+    def _on_start_paragraph(self, source_start: int | None = None) -> None:
+        if self._list_stack:
+            self._start_block(source_start)
+        else:
+            super()._on_start_paragraph(source_start)
+
+    def _on_end_code_block(self) -> None:
+        if self._list_stack:
+            self._start_block(self._code_block_start_source, indent=False)
+        super()._on_end_code_block()
+
+    def _write_block_gap(self, newlines: int) -> None:
+        needed = newlines - self._buf.trailing_newline_count()
+        if needed > 0:
+            self._buf.write("\n" * needed)
+
+
+def to_md(text: str) -> str:
+    """GFM → Telegram MarkdownV2, the library's `markdownify` pipeline run through
+    `LayoutKeepingWalker`. Returns the text unchanged on any converter error; the
+    send path then retries the message plain (no parse_mode)."""
+    try:
+        parsed, events = _parse(text, STANDARD_OPTIONS, latex_escape=True)
+        plain, entities, _ = LayoutKeepingWalker(get_runtime_config(), parsed).walk(events)
+        return entities_to_markdownv2(plain, entities)
     except Exception:
         return text
 
