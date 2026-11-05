@@ -141,6 +141,10 @@ TO_MD_CASES = [
     ("- a\n\n  <div>\n  x\n  </div>\n- b", "⦁ a\n  <div\\>\n  x\n  </div\\>\n\n⦁ b\n"),
     ("- [ ] a\n\n  more", "☐ a\n  more\n"),
     ("- a\n  - b\n\n    more b\n\n  more a", "⦁ a\n  ⦁ b\n    more b\n\n  more a\n"),
+    # a blockquote inside a list item sits under its bullet, its lines unindented
+    ("- a\n\n  > q\n- b", "⦁ a\n>q\n\n⦁ b\n"),
+    ("- a\n  > q1\n  > q2\n- b", "⦁ a\n>q1\n>q2\n\n⦁ b\n"),
+    ("- a\n  > q1\n  > q2\n\n  more\n- b", "⦁ a\n>q1\n>q2\n  more\n\n⦁ b\n"),
     # a code block inside a list item starts on its own line; one newline before
     # the next bullet, since Telegram adds the gap after a code block itself
     ("- a\n  ```\n  code\n  ```\n- b", "⦁ a\n```\ncode\n```\n⦁ b\n"),

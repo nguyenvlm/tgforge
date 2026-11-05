@@ -156,7 +156,12 @@ class LayoutKeepingWalker(EventWalker):
         return count if i < 0 or source[i : i + 1] in (b"\n", b"\r") else 0
 
     def _hanging_indent(self, source_start: int | None, forward: bool = False) -> str:
-        if not self._list_stack or not self._item_stack or self._in_table_cell:
+        if (
+            not self._list_stack
+            or not self._item_stack
+            or self._in_table_cell
+            or self._blockquote_scopes  # Telegram's quote has no indent
+        ):
             return ""
         width = self._item_stack[-1][1]
         return " " * min(width, self._source_line_indent(source_start, forward))
