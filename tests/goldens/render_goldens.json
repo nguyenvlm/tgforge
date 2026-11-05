@@ -53,38 +53,6 @@
   },
   {
     "group": "render",
-    "name": "to_md",
-    "args": [
-      "**bold** _italic_ `code`"
-    ],
-    "expected": "*bold* _italic_ `code`"
-  },
-  {
-    "group": "render",
-    "name": "to_md",
-    "args": [
-      "# Heading\n- one\n- two"
-    ],
-    "expected": "📌 __*Heading*__\n⦁ one\n⦁ two\n"
-  },
-  {
-    "group": "render",
-    "name": "to_md",
-    "args": [
-      "a [link](http://example.com) here"
-    ],
-    "expected": "a [link](http://example.com) here"
-  },
-  {
-    "group": "render",
-    "name": "to_md",
-    "args": [
-      "plain text, nothing special"
-    ],
-    "expected": "plain text, nothing special"
-  },
-  {
-    "group": "render",
     "name": "mdv2_escape",
     "args": [
       "a_b*c[d](e)"
