@@ -134,16 +134,18 @@ TO_MD_CASES = [
     ("- a\n\n  more of a\n\n- b", "◆ a\n  more of a\n\n◆ b\n"),
     ("1. a\n   b\n\n   c\n2. d", "1\\. a\n   b\n   c\n\n2\\. d\n"),
     # the bullet symbol follows the list depth and repeats past the third
-    ("- a\n  - b\n    - c\n      - d\n- e", "◆ a\n  ▸ b\n    ⦁ c\n      ◆ d\n◆ e\n"),
-    ("1. a\n   - b\n2. c", "1\\. a\n  ▸ b\n2\\. c\n"),
+    ("- a\n  - b\n    - c\n      - d\n- e", "◆ a\n    ▸ b\n        ⦁ c\n            ◆ d\n◆ e\n"),
+    ("1. a\n   - b\n2. c", "1\\. a\n    ▸ b\n2\\. c\n"),
+    # nesting levels are 4 spaces apart; a nested task item keeps its level's indent
+    ("- [ ] t\n  - [x] x\n    - y", "☐ t\n    ✅ x\n        ⦁ y\n"),
     # items with one block each stay tight
-    ("- a\n  - a1\n  - a2\n- b", "◆ a\n  ▸ a1\n  ▸ a2\n◆ b\n"),
+    ("- a\n  - a1\n  - a2\n- b", "◆ a\n    ▸ a1\n    ▸ a2\n◆ b\n"),
     ("- a\n  b\n- c", "◆ a\n  b\n◆ c\n"),
     # the hanging indent never exceeds the source line's own indent
     ("- a\n  b\nc", "◆ a\n  b\nc\n"),
     ("- a\n\n  <div>\n  x\n  </div>\n- b", "◆ a\n  <div\\>\n  x\n  </div\\>\n\n◆ b\n"),
     ("- [ ] a\n\n  more", "☐ a\n  more\n"),
-    ("- a\n  - b\n\n    more b\n\n  more a", "◆ a\n  ▸ b\n    more b\n\n  more a\n"),
+    ("- a\n  - b\n\n    more b\n\n  more a", "◆ a\n    ▸ b\n      more b\n\n  more a\n"),
     # a blockquote inside a list item sits under its bullet, its lines unindented
     ("- a\n\n  > q\n- b", "◆ a\n>q\n\n◆ b\n"),
     ("- a\n  > q1\n  > q2\n- b", "◆ a\n>q1\n>q2\n\n◆ b\n"),
@@ -177,6 +179,13 @@ def test_md_chunks_fit_with_unindented_list_continuation():
     # lazy continuation lines inside a nested item: a hanging indent the source
     # lacks would grow every line past the SAFE_RAW_CHUNK bound
     raw = "- - - a\n" + ".\n" * 3000
+    for p in md_chunks(raw):
+        assert len(to_md(p)) <= MAX_MSG
+
+
+def test_md_chunks_fit_with_deep_nesting():
+    # 4 spaces per level against at least 2 in the source: still within 2x growth
+    raw = "- a\n  - b\n    - c\n      - d\n        - e\n" * 300
     for p in md_chunks(raw):
         assert len(to_md(p)) <= MAX_MSG
 
