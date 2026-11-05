@@ -8,6 +8,8 @@ trigger a function another app registered — the bot core routes it.
 
 from __future__ import annotations
 
+import copy
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from telegramify_markdown import entities_to_markdownv2
 from telegramify_markdown.config import get_runtime_config
@@ -50,6 +52,10 @@ def chunks(text: str) -> list[str]:
 
 
 _SPOILER_TAGS = ("<tg-spoiler>", "</tg-spoiler>")
+# bullet symbol per list depth, repeating past the last one
+BULLET_SYMBOLS = ("◆", "▸", "⦁")
+# spaces per nesting level; the library writes 2 of them itself
+LIST_LEVEL_INDENT = 4
 
 
 class LayoutKeepingWalker(EventWalker):
@@ -58,14 +64,18 @@ class LayoutKeepingWalker(EventWalker):
     under its bullet, first line indented, and an item with more than one block is
     set off from what follows it in the list by a blank line, so each bullet reads as one group.
 
-    A hanging indent never exceeds the source line's own indent, so the output adds
-    no whitespace the input lacks (`md_chunks` relies on bounded growth)."""
+    Nesting levels are LIST_LEVEL_INDENT spaces apart. A nested item's source indent
+    is at least 2 per level and a hanging indent is capped at twice the source line's
+    own, so leading whitespace stays within the 2x growth `md_chunks` relies on;
+    bullets nested on one source line (`- - a`) have no source indent and exceed it."""
 
     def __init__(self, config, source_markdown: str) -> None:
-        super().__init__(config, source_markdown)
+        # own copy: the bullet symbol is set per item, the runtime config is shared
+        super().__init__(copy.deepcopy(config), source_markdown)
         self._event_range: dict[str, int] | None = None
         self._in_html_block = False
         self._html_block_lines = 0
+        self._extra_indent = ""
         # per open list item: [output offset where its content starts, hanging indent
         # width, whether it has a later block]
         self._item_stack: list[list] = []
@@ -106,21 +116,34 @@ class LayoutKeepingWalker(EventWalker):
 
     def _on_start_item(self) -> None:
         ordered = self._list_stack[-1] if self._list_stack else None
+        depth = len(self._list_stack)
+        self._config.markdown_symbol.unordered_list_item = BULLET_SYMBOLS[
+            (depth - 1) % len(BULLET_SYMBOLS)
+        ]
         self._write_newlines(2 if self._gap_pending else 1)
         self._gap_pending = False
         super()._on_start_item()
+        # put in front of the library's bullet write as a write of its own, so a task
+        # marker (which replaces the library's last write) keeps it
+        self._extra_indent = " " * ((LIST_LEVEL_INDENT - 2) * (depth - 1))
+        if self._extra_indent:
+            bullet = self._buf.pop_last()
+            self._buf.write(self._extra_indent)
+            self._buf.write(bullet)
         marker = (
             f"{ordered}{self._config.markdown_symbol.ordered_list_suffix} "
             if ordered is not None
             else f"{self._config.markdown_symbol.unordered_list_item} "
         )
-        self._item_stack.append([self._buf.py_offset, len(self._item_indent + marker), False])
+        width = len(self._extra_indent + self._item_indent + marker)
+        self._item_stack.append([self._buf.py_offset, width, False])
 
     def _on_task_list_marker(self, checked: bool) -> None:
         super()._on_task_list_marker(checked)
         symbol = self._config.markdown_symbol
         mark = symbol.task_completed if checked else symbol.task_uncompleted
-        self._item_stack[-1][:2] = [self._buf.py_offset, len(f"{self._item_indent}{mark} ")]
+        width = len(f"{self._extra_indent}{self._item_indent}{mark} ")
+        self._item_stack[-1][:2] = [self._buf.py_offset, width]
 
     def _on_end_item(self) -> None:
         super()._on_end_item()
@@ -164,7 +187,7 @@ class LayoutKeepingWalker(EventWalker):
         ):
             return ""
         width = self._item_stack[-1][1]
-        return " " * min(width, self._source_line_indent(source_start, forward))
+        return " " * min(width, 2 * self._source_line_indent(source_start, forward))
 
     def _on_soft_break(self) -> None:
         super()._on_soft_break()
