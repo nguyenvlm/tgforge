@@ -114,14 +114,14 @@ def test_mdv2_checker_rejects_invalid(bad):
 TO_MD_CASES = [
     # inputs the reference-bot goldens used to pin
     ("**bold** _italic_ `code`", "*bold* _italic_ `code`"),
-    ("# Heading\n- one\n- two", "📌 __*Heading*__\n⦁ one\n⦁ two\n"),
+    ("# Heading\n- one\n- two", "📌 __*Heading*__\n◆ one\n◆ two\n"),
     ("a [link](http://example.com) here", "a [link](http://example.com) here"),
     ("plain text, nothing special", "plain text, nothing special"),
     # a list keeps the blank line before the next paragraph
-    ("- a\n- b\n\nText.", "⦁ a\n⦁ b\n\nText\\."),
+    ("- a\n- b\n\nText.", "◆ a\n◆ b\n\nText\\."),
     ("1. a\n2. b\n\nAfter.", "1\\. a\n2\\. b\n\nAfter\\."),
     # a bullet list followed by a numbered list stays two lists
-    ("- a\n\n1. one", "⦁ a\n\n1\\. one\n"),
+    ("- a\n\n1. one", "◆ a\n\n1\\. one\n"),
     # an unchecked task item is an empty box
     ("- [ ] todo\n- [x] done", "☐ todo\n✅ done\n"),
     # angle-bracket text is kept as literal, escaped text
@@ -130,24 +130,27 @@ TO_MD_CASES = [
     ("<div>\nhi\n</div>\n\nafter", "<div\\>\nhi\n</div\\>\n\nafter"),
     # a later paragraph of a list item sits right under its bullet, and a blank
     # line sets the item off from the next bullet
-    ("- a\n\n  more of a\n- b", "⦁ a\n  more of a\n\n⦁ b\n"),
-    ("- a\n\n  more of a\n\n- b", "⦁ a\n  more of a\n\n⦁ b\n"),
+    ("- a\n\n  more of a\n- b", "◆ a\n  more of a\n\n◆ b\n"),
+    ("- a\n\n  more of a\n\n- b", "◆ a\n  more of a\n\n◆ b\n"),
     ("1. a\n   b\n\n   c\n2. d", "1\\. a\n   b\n   c\n\n2\\. d\n"),
+    # the bullet symbol follows the list depth and repeats past the third
+    ("- a\n  - b\n    - c\n      - d\n- e", "◆ a\n  ▸ b\n    ⦁ c\n      ◆ d\n◆ e\n"),
+    ("1. a\n   - b\n2. c", "1\\. a\n  ▸ b\n2\\. c\n"),
     # items with one block each stay tight
-    ("- a\n  - a1\n  - a2\n- b", "⦁ a\n  ⦁ a1\n  ⦁ a2\n⦁ b\n"),
-    ("- a\n  b\n- c", "⦁ a\n  b\n⦁ c\n"),
+    ("- a\n  - a1\n  - a2\n- b", "◆ a\n  ▸ a1\n  ▸ a2\n◆ b\n"),
+    ("- a\n  b\n- c", "◆ a\n  b\n◆ c\n"),
     # the hanging indent never exceeds the source line's own indent
-    ("- a\n  b\nc", "⦁ a\n  b\nc\n"),
-    ("- a\n\n  <div>\n  x\n  </div>\n- b", "⦁ a\n  <div\\>\n  x\n  </div\\>\n\n⦁ b\n"),
+    ("- a\n  b\nc", "◆ a\n  b\nc\n"),
+    ("- a\n\n  <div>\n  x\n  </div>\n- b", "◆ a\n  <div\\>\n  x\n  </div\\>\n\n◆ b\n"),
     ("- [ ] a\n\n  more", "☐ a\n  more\n"),
-    ("- a\n  - b\n\n    more b\n\n  more a", "⦁ a\n  ⦁ b\n    more b\n\n  more a\n"),
+    ("- a\n  - b\n\n    more b\n\n  more a", "◆ a\n  ▸ b\n    more b\n\n  more a\n"),
     # a blockquote inside a list item sits under its bullet, its lines unindented
-    ("- a\n\n  > q\n- b", "⦁ a\n>q\n\n⦁ b\n"),
-    ("- a\n  > q1\n  > q2\n- b", "⦁ a\n>q1\n>q2\n\n⦁ b\n"),
-    ("- a\n  > q1\n  > q2\n\n  more\n- b", "⦁ a\n>q1\n>q2\n  more\n\n⦁ b\n"),
+    ("- a\n\n  > q\n- b", "◆ a\n>q\n\n◆ b\n"),
+    ("- a\n  > q1\n  > q2\n- b", "◆ a\n>q1\n>q2\n\n◆ b\n"),
+    ("- a\n  > q1\n  > q2\n\n  more\n- b", "◆ a\n>q1\n>q2\n  more\n\n◆ b\n"),
     # a code block inside a list item starts on its own line; one newline before
     # the next bullet, since Telegram adds the gap after a code block itself
-    ("- a\n  ```\n  code\n  ```\n- b", "⦁ a\n```\ncode\n```\n⦁ b\n"),
+    ("- a\n  ```\n  code\n  ```\n- b", "◆ a\n```\ncode\n```\n◆ b\n"),
     # after a code block one newline is enough: Telegram adds the gap itself
     ("```py\nx = 1\n```\n\nAfter.", "```py\nx = 1\n```\nAfter\\."),
     ("```\na\n```\n\n```\nb\n```", "```\na\n```\n```\nb\n```"),
@@ -156,7 +159,7 @@ TO_MD_CASES = [
     ("run `a_b*c[d](e)` now", "run `a_b*c[d](e)` now"),
     ("use `<x>` and `a <b> c`", "use `<x>` and `a <b> c`"),
     ("```\n<x> a_b *c* .!\n  kept indent\n```", "```\n<x> a_b *c* .!\n  kept indent\n```"),
-    ("- a\n  ```\n  <x> l1\n    l2\n  ```", "⦁ a\n```\n<x> l1\n  l2\n```\n"),
+    ("- a\n  ```\n  <x> l1\n    l2\n  ```", "◆ a\n```\n<x> l1\n  l2\n```\n"),
 ]
 
 
@@ -176,3 +179,11 @@ def test_md_chunks_fit_with_unindented_list_continuation():
     raw = "- - - a\n" + ".\n" * 3000
     for p in md_chunks(raw):
         assert len(to_md(p)) <= MAX_MSG
+
+
+def test_to_md_leaves_the_shared_converter_config_alone():
+    from telegramify_markdown.config import get_runtime_config
+
+    before = get_runtime_config().markdown_symbol.unordered_list_item
+    to_md("- a\n  - b")
+    assert get_runtime_config().markdown_symbol.unordered_list_item == before

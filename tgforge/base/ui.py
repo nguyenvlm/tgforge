@@ -8,6 +8,8 @@ trigger a function another app registered — the bot core routes it.
 
 from __future__ import annotations
 
+import copy
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from telegramify_markdown import entities_to_markdownv2
 from telegramify_markdown.config import get_runtime_config
@@ -50,6 +52,8 @@ def chunks(text: str) -> list[str]:
 
 
 _SPOILER_TAGS = ("<tg-spoiler>", "</tg-spoiler>")
+# bullet symbol per list depth, repeating past the last one
+BULLET_SYMBOLS = ("◆", "▸", "⦁")
 
 
 class LayoutKeepingWalker(EventWalker):
@@ -62,7 +66,8 @@ class LayoutKeepingWalker(EventWalker):
     no whitespace the input lacks (`md_chunks` relies on bounded growth)."""
 
     def __init__(self, config, source_markdown: str) -> None:
-        super().__init__(config, source_markdown)
+        # own copy: the bullet symbol is set per item, the runtime config is shared
+        super().__init__(copy.deepcopy(config), source_markdown)
         self._event_range: dict[str, int] | None = None
         self._in_html_block = False
         self._html_block_lines = 0
@@ -106,6 +111,10 @@ class LayoutKeepingWalker(EventWalker):
 
     def _on_start_item(self) -> None:
         ordered = self._list_stack[-1] if self._list_stack else None
+        depth = len(self._list_stack)
+        self._config.markdown_symbol.unordered_list_item = BULLET_SYMBOLS[
+            (depth - 1) % len(BULLET_SYMBOLS)
+        ]
         self._write_newlines(2 if self._gap_pending else 1)
         self._gap_pending = False
         super()._on_start_item()
