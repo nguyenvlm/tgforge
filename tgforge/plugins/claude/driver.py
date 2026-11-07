@@ -1143,12 +1143,15 @@ class ClaudeTopic(Topic):
             rtext = (reply.text or reply.caption or "").strip()
             has_file = bool(reply.photo or reply.document)
             if rtext or has_file:
-                quoted = rtext or "(attachment)"
-                if len(quoted) > 500:
-                    quoted = quoted[:497] + "..."
+                quote = getattr(message, "quote", None)
+                label, quoted = (
+                    ("Quoting", quote.text)
+                    if quote is not None and quote.text
+                    else ("Replying to", rtext or "(attachment)")
+                )
                 tail = " [with attachment]" if has_file and rtext else ""
                 who = reply.from_user.full_name if reply.from_user else "someone"
-                notes.append(f"[Replying to {who}: {quoted}{tail}]")
+                notes.append(f"[{label} {who}: {quoted}{tail}]")
         return "\n".join(notes)
 
     async def _build_prompt(self, msgs, text) -> str:
