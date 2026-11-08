@@ -88,6 +88,10 @@ SHELL_TIMEOUT = 120
 SHELL_KEEP_CHARS = 2 * MAX_MSG  # the ! output tail kept (the view shows a MAX_MSG tail)
 SHELL_READ_SIZE = 65536  # bytes per read of the ! output pipe
 PANEL_FRAME = "background"  # the bottom frame holding the background-jobs panel
+PROJECT_DIR_MAX = 200  # the CLI's longest project dir name kept whole
+UNDELIVERED_NOTE = (
+    "⚠️ not delivered — the session process exited before reading this message. Send it again."
+)
 
 # Claude CLI --permission-mode values, passed on every spawn. The app default is
 # `auto` (a bot has no human to answer prompts); set it on the plugin or via /mode.
@@ -115,7 +119,25 @@ SESSION_BRIEF = (
 
 
 def _project_dir(config_dir: Path, workspace: Path) -> Path:
-    return config_dir / "projects" / ("-" + str(workspace).replace("/", "-").lstrip("-"))
+    """The CLI's transcript dir for a cwd, named as the CLI names it: every UTF-16 unit
+    that is not an ASCII letter or digit becomes `-`; a name over `PROJECT_DIR_MAX`
+    is cut to that length plus `-` and the base-36 Java-style string hash of the path."""
+    raw = str(workspace).encode("utf-16-le", "surrogatepass")
+    units = [int.from_bytes(raw[i : i + 2], "little") for i in range(0, len(raw), 2)]
+    name = "".join(chr(u) if chr(u).isascii() and chr(u).isalnum() else "-" for u in units)
+    if len(name) > PROJECT_DIR_MAX:
+        digest = 0
+        for u in units:
+            digest = (digest * 31 + u) & 0xFFFFFFFF
+        digest = abs(digest - (1 << 32) if digest >= 1 << 31 else digest)
+        suffix = ""
+        while True:
+            digest, digit = divmod(digest, 36)
+            suffix = "0123456789abcdefghijklmnopqrstuvwxyz"[digit] + suffix
+            if not digest:
+                break
+        name = f"{name[:PROJECT_DIR_MAX]}-{suffix}"
+    return config_dir / "projects" / name
 
 
 @launch("/claude", "open a Claude agent window")
@@ -465,6 +487,16 @@ class ClaudeTopic(Topic):
         revived = self._arm_heartbeat()
         LOGGER.info("turn start (%s): live panel %s", self.name, "revived" if revived else "alive")
 
+    def _open_next_turn(self) -> None:
+        """Open the turn the CLI just started between turns: the oldest queued message's
+        (the CLI runs its input queue in order, and a local slash command runs with no
+        replay), else its own (a background completion)."""
+        if self.pending_writes:
+            entry = self.pending_writes.pop(0)
+            self._open_holder(reply_to=entry["reply_to"], ack=entry)
+        else:
+            self._open_holder(reply_to=self.turn.reply_to)
+
     def _reorder_holder(self) -> asyncio.Task:
         """Queue a move of the live card to the bottom: send it anew, delete the old."""
         turn = self.turn
@@ -489,6 +521,18 @@ class ClaudeTopic(Topic):
                 await self.delete(entry["bubble_id"])
 
         self._send_in_order(delete)
+
+    def _flag_undelivered(self, entry: dict) -> None:
+        """Queue the swap of a queued message's "queued ✓" bubble for a notice, replying
+        to the message, that the process exited before running it."""
+        LOGGER.warning("reader (%s): proc exited with a queued message unread", self.name)
+
+        async def flag():
+            if entry.get("bubble_id") is not None:
+                await self.delete(entry["bubble_id"])
+            await self.send(UNDELIVERED_NOTE, reply_to=entry["reply_to"])
+
+        self._send_in_order(flag)
 
     async def submit(self, prompt, reply_to=None):
         """The single prompt entry point (on_message, a skill slash, the ! chain,
@@ -598,12 +642,8 @@ class ClaudeTopic(Topic):
                 if t == "control_response":
                     self._resolve_control(ev)
                     continue
-                if (
-                    not self.turn_open
-                    and not self.pending_writes
-                    and t in ("assistant", "stream_event")
-                ):
-                    self._open_holder()
+                if not self.turn_open and t in ("assistant", "stream_event"):
+                    self._open_next_turn()
                 if t == "rate_limit_event":
                     self._note_quota(ev)
                 if t == "assistant":
@@ -618,17 +658,18 @@ class ClaudeTopic(Topic):
                     folded = False
                     n = min(prompt_block_count(ev), len(self.pending_writes))
                     for _ in range(n):
-                        entry = self.pending_writes.pop(0)
                         if not self.turn_open:
-                            self._open_holder(reply_to=entry["reply_to"], ack=entry)
-                        elif not entry["is_initiator"]:
+                            self._open_next_turn()
+                            continue
+                        entry = self.pending_writes.pop(0)
+                        if not entry["is_initiator"]:
                             self._delete_ack(entry)
                             folded = True
                     if folded:
                         self._reorder_holder()
                 elif t == "result":
                     if not self.turn_open:
-                        self._open_holder(reply_to=self.turn.reply_to)
+                        self._open_next_turn()
                     await self._finalize_turn(
                         ev.get("result", ""),
                         subtype=ev.get("subtype", "success"),
@@ -674,6 +715,10 @@ class ClaudeTopic(Topic):
             self._warn_interrupted()
             await self._settle_cancel_note()  # a cancel that ended via a dead proc
             self._fail_control_waiters()
+            if not asyncio.current_task().cancelling():  # cancelled = the window is going
+                for entry in self.pending_writes:
+                    if not entry["is_initiator"]:
+                        self._flag_undelivered(entry)
             if self._jsonl().exists():
                 self.mirror_offset = self._jsonl().stat().st_size
             self.proc = None
@@ -807,10 +852,15 @@ class ClaudeTopic(Topic):
             # decision, so a message right after the boundary queues for the next turn
             boundary = self.turn_seq
             self.turn_seq += 1  # the result closes this turn; later acks belong to the next
-            mine = [e for e in self.pending_writes if e.get("turn_seq", 0) <= boundary]
+            # this turn's initiator goes; every queued message whose replay has not come
+            # stays queued, ack on screen: the CLI runs it as the next turn
             self.pending_writes = [
-                e for e in self.pending_writes if e.get("turn_seq", 0) > boundary
+                e
+                for e in self.pending_writes
+                if not (e["is_initiator"] and e.get("turn_seq", 0) <= boundary)
             ]
+            # a message ack'd during this turn sits below its card: the output goes below it
+            below_queued = any(e.get("turn_seq", 0) <= boundary for e in self.pending_writes)
             turn, ended = self.turn, time.monotonic()
             self.turn = TurnState()
             self.turn_open = False
@@ -824,10 +874,7 @@ class ClaudeTopic(Topic):
                 is_error=is_error,
                 cancel_requested=self.cancel_requested,
             )
-            # this turn's mid-turn messages whose replay never came: their acks sit
-            # below the card, so the settle moves the turn's output below them
-            acks = [e for e in mine if not e["is_initiator"]]
-            self._send_in_order(lambda: self._settle_turn(turn, ans, acks, ended))
+            self._send_in_order(lambda: self._settle_turn(turn, ans, below_queued, ended))
             LOGGER.info(
                 "turn end (%s): seq %d→%d, %.0fs, %s tokens, %s, pending=%d",
                 self.name,
@@ -839,18 +886,16 @@ class ClaudeTopic(Topic):
                 len(self.pending_writes),
             )
 
-    async def _settle_turn(self, turn: TurnState, ans, acks: list[dict], ended: float):
+    async def _settle_turn(self, turn: TurnState, ans, below_queued: bool, ended: float):
         """Render a closed turn: the summary line, then the timeline folded into collapsed
         expandable messages, above the answer messages (suggestion
-        buttons on the last), then attachments. Every piece lands, in order."""
+        buttons on the last), then attachments. Every piece lands, in order.
+        `below_queued`: a message ack'd during the turn is still queued, so message 1 is
+        sent below its ack instead of landing on the card above it."""
         card_id = turn.card_id
-        if acks:
-            for entry in acks:
-                if entry.get("bubble_id") is not None:
-                    await self.delete(entry["bubble_id"])
-            if card_id is not None:  # message 1 goes below those mid-turn messages
-                await self.delete(card_id)
-                card_id = None
+        if below_queued and card_id is not None:
+            await self.delete(card_id)
+            card_id = None
         lines, _, _ = render_timeline(turn.timeline, drop_last_text=ans.completed)
         pages = expandable_pages(self._summary(turn, ended, ans.completed), lines)
         md, plain = pages[0]
