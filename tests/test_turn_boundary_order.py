@@ -11,7 +11,19 @@ from __future__ import annotations
 
 import asyncio
 
-from claude_fakes import FakeProc, client, drain, replay, result, screen, texts, window
+from claude_fakes import (
+    FakeProc,
+    assistant_text,
+    client,
+    drain,
+    replay,
+    result,
+    screen,
+    texts,
+    window,
+)
+
+from tgforge.plugins.claude.driver import UNDELIVERED_NOTE
 
 
 def _queued_ack(c, t):
@@ -21,27 +33,185 @@ def _queued_ack(c, t):
     return entry
 
 
-def test_finalized_output_lands_below_a_this_turn_midturn_message(tmp_path):
-    """result-before-echo: the mid-turn message was acknowledged by this turn but its
-    replay never arrived before the result; the turn's output goes below its ack."""
+def _user_message(c, text):
+    """The user's own message in the thread (inbound, so the bot never sent it)."""
+    mid = c.bot._id()
+    c.bot.created.append((mid, 555, text))
+    return mid
+
+
+def _replies(c):
+    """Message id → the message id it replies to, for every bot send."""
+    real_send = c.bot.send_message
+    replies = {}
+
+    async def send(chat_id, text, **kw):
+        sent = await real_send(chat_id, text, **kw)
+        if kw.get("reply_parameters") is not None:
+            replies[sent.message_id] = kw["reply_parameters"].message_id
+        return sent
+
+    c.bot.send_message = send
+    return replies
+
+
+async def _midturn_message(c, t, text="also do this"):
+    """A message the user sends while the turn runs: their message, then its ack."""
+    user_msg = _user_message(c, text)
+    entry = _queued_ack(c, t)
+    entry["reply_to"] = user_msg
+    entry["bubble_id"] = await t.send("queued ✓", reply_to=user_msg)
+    return user_msg, entry
+
+
+def test_an_unreplayed_midturn_message_starts_the_next_turn(tmp_path):
+    """The CLI runs a prompt written while it streams plain text as its own next turn:
+    `result`, then the prompt's replay, then that turn. The process is kept and the ack
+    stays until the replay opens the turn below the finalized reply."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        replies = _replies(c)
+        t._open_holder()
+        await drain(c, t)
+        card = t.turn.card_id
+        user_msg, entry = await _midturn_message(c, t)
+        ack = entry["bubble_id"]
+        echo, second_result = asyncio.Event(), asyncio.Event()
+        proc = FakeProc(
+            [
+                result("REPLYTOKEN"),
+                echo,
+                replay("also do this"),
+                second_result,
+                result("SECONDTOKEN"),
+            ]
+        )
+        t.proc = proc
+        reader = asyncio.create_task(t._reader())
+        await asyncio.sleep(0.05)
+        await drain(c, t)
+
+        reply = next(mid for mid, text in screen(c) if "REPLYTOKEN" in text)
+        assert proc.returncode is None  # kept: the queued prompt is still to run
+        assert t.pending_writes == [entry] and t.busy
+        assert ack not in c.bot.deleted  # still queued, its ack stays
+        assert card in c.bot.deleted and reply > ack  # the output went below the ack
+
+        echo.set()  # the CLI starts the queued turn
+        await asyncio.sleep(0.05)
+        await drain(c, t)
+        assert ack in c.bot.deleted
+        assert t.turn_open and t.turn.card_id > reply
+        assert replies[t.turn.card_id] == user_msg  # the card replies to the user's message
+
+        second_result.set()
+        await asyncio.wait_for(reader, 5)
+        await drain(c, t)
+        second = next(mid for mid, text in screen(c) if "SECONDTOKEN" in text)
+        assert second > reply
+        assert proc.returncode == -9 and not t.pending_writes  # idle now: ended
+        assert UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_queued_turn_with_no_replay_is_the_queued_message_turn(tmp_path):
+    """A local slash command written late runs as the next turn with no replay
+    (`assistant`, `result`): its first event opens the queued message's turn."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        replies = _replies(c)
+        t._open_holder()
+        await drain(c, t)
+        user_msg, entry = await _midturn_message(c, t, "/cost")
+        proc = FakeProc([result("REPLYTOKEN"), assistant_text("cost: 1%"), result("COSTTOKEN")])
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        reply = next(mid for mid, text in screen(c) if "REPLYTOKEN" in text)
+        cost = next(mid for mid, text in screen(c) if "COSTTOKEN" in text)
+        assert entry["bubble_id"] in c.bot.deleted
+        assert cost > reply
+        assert user_msg in replies.values()  # the slash turn's card replied to it
+        assert proc.returncode == -9 and not t.pending_writes
+        assert UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_replayed_midturn_message_folds_and_the_proc_ends(tmp_path):
+    """A prompt merged at a tool boundary is replayed before the result: it folds into
+    the turn (ack deleted) and is not kept past the result."""
 
     async def scenario():
         c = client(tmp_path)
         t = window(c, tmp_path)
         t._open_holder()
         await drain(c, t)
-        card = t.turn.card_id
-        ack = await t.send("queued ✓")
-        entry = _queued_ack(c, t)
-        entry["bubble_id"] = ack
-        t.proc = FakeProc([result("REPLYTOKEN")])
+        _user_msg, entry = await _midturn_message(c, t)
+        proc = FakeProc([replay("also do this"), result("REPLYTOKEN")])
+        t.proc = proc
         await asyncio.wait_for(t._reader(), timeout=5)
         await drain(c, t)
 
         reply = next(mid for mid, text in screen(c) if "REPLYTOKEN" in text)
-        assert reply > ack
-        assert ack in c.bot.deleted  # the folded ack went
-        assert card in c.bot.deleted  # the card above the ack was replaced below it
+        assert entry["bubble_id"] in c.bot.deleted and reply > entry["bubble_id"]
+        assert proc.returncode == -9 and not t.pending_writes
+        assert UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_queued_message_whose_proc_dies_is_flagged_not_delivered(tmp_path):
+    """The process exits with a queued message never run (this turn's, or one queued
+    after the boundary): its ack is swapped for a notice replying to the message."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        replies = _replies(c)
+        t._open_holder()
+        await drain(c, t)
+        this_turn, entry = await _midturn_message(c, t)
+        next_turn = _user_message(c, "after the boundary")
+        later = {"is_initiator": False, "reply_to": next_turn, "turn_seq": t.turn_seq + 1}
+        later["bubble_id"] = await t.send("queued ✓", reply_to=next_turn)
+        t.pending_writes.append(later)
+        t.proc = FakeProc([result("REPLYTOKEN")])  # then the stream ends: the CLI died
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        notes = [mid for mid, text in screen(c) if text == UNDELIVERED_NOTE]
+        assert len(notes) == 2
+        assert sorted(replies[mid] for mid in notes) == [this_turn, next_turn]
+        assert entry["bubble_id"] in c.bot.deleted and later["bubble_id"] in c.bot.deleted
+        assert not t.pending_writes and not t.busy
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_reader_posts_no_undelivered_notice(tmp_path):
+    """The window is closing (its reader cancelled): nothing is posted into it."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        t._open_holder()
+        await drain(c, t)
+        await _midturn_message(c, t)
+        t.proc = FakeProc([asyncio.Event()])
+        reader = asyncio.create_task(t._reader())
+        await asyncio.sleep(0.05)
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        await drain(c, t)
+
+        assert UNDELIVERED_NOTE not in texts(c)
 
     asyncio.run(scenario())
 
@@ -79,25 +249,6 @@ def test_finalize_keeps_busy_until_the_reader_settles(tmp_path):
         await t._finalize_turn("a reply")
         assert t.busy is True
         assert t.turn_open is False
-
-    asyncio.run(scenario())
-
-
-def test_late_echo_after_finalize_does_not_reopen_a_phantom_turn(tmp_path):
-    async def scenario():
-        c = client(tmp_path)
-        t = window(c, tmp_path)
-        t._open_holder()
-        await drain(c, t)
-        entry = _queued_ack(c, t)
-        entry["bubble_id"] = await t.send("queued ✓")
-        t.proc = FakeProc([result("REPLYTOKEN"), replay("ok")])
-        await asyncio.wait_for(t._reader(), timeout=5)
-        await drain(c, t)
-
-        assert t.busy is False and t.turn_open is False
-        assert not any("exited mid-turn" in text for text in texts(c))
-        assert not t.pending_writes
 
     asyncio.run(scenario())
 
