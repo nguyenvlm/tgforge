@@ -469,6 +469,19 @@ def test_tgf_routes_like_the_telegram_slash(tmp_path, typed, seen):
     asyncio.run(scenario())
 
 
+def test_a_mention_before_a_command_routes_it_like_the_telegram_slash(tmp_path):
+    async def scenario():
+        core = _kernel(tmp_path)
+        _own(core, SLACK_WINDOW)
+        adapter = core.transports[1].adapter
+        # a message led by the bot's mention is not a Slack slash command, so it reaches
+        # the bot, which runs the rest as the typed command
+        await core.handle_message(await adapter.to_inbound(_slack_message("<@B0> /model opus")))
+        assert SEEN == [("model", "opus")]
+
+    asyncio.run(scenario())
+
+
 def test_a_bare_tgf_opens_the_menu(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
