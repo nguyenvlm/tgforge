@@ -53,7 +53,7 @@ def test_mention_opens_window_and_command_replies():
         tid = bot.window
         assert tid is not None and bot.core.owners[tid] == "demo"
         assert "demo ready" in bot.replies
-        await bot.send("/hi", thread_id=tid)  # inline class command, typed → sent
+        await bot.send("/hi", window=tid)  # inline class command, typed → sent
         await bot.settle()
         assert "hi there" in bot.replies
 
@@ -64,7 +64,7 @@ def test_universal_runs_in_window():
     async def scenario():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
-        await bot.send("/ping", thread_id=bot.window)
+        await bot.send("/ping", window=bot.window)
         await bot.settle()
         assert "pong" in bot.replies
 
@@ -76,7 +76,7 @@ def test_menu_tap_back_loop_via_tester():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
         tid = bot.window
-        await bot.send("/", thread_id=tid)  # opens the context menu
+        await bot.send("/", window=tid)  # opens the context menu
         assert "👋 Hi" in bot.buttons  # the class command is a button
         await bot.tap("👋 Hi")  # inline → renders in place (an edit) + Back
         assert "hi there" in bot.edits
@@ -94,7 +94,7 @@ def test_submenu_nests_with_back_and_pick_returns_to_parent():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
         tid = bot.window
-        await bot.send("/", thread_id=tid)  # the context menu (nav root)
+        await bot.send("/", window=tid)  # the context menu (nav root)
         assert "🎯 Pick" in bot.buttons
         await bot.tap("🎯 Pick")  # a command that opens a menu → pushes a submenu
         assert "🍎 Apple" in bot.buttons  # the submenu's options
@@ -112,7 +112,7 @@ def test_submenu_back_returns_without_picking():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
         tid = bot.window
-        await bot.send("/", thread_id=tid)
+        await bot.send("/", window=tid)
         await bot.tap("🎯 Pick")
         assert "⬅ Back" in bot.buttons
         await bot.tap("⬅ Back")  # pop the submenu → back at the parent, nothing picked
@@ -127,7 +127,7 @@ def test_typed_menu_is_top_level_no_back():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
         tid = bot.window
-        await bot.send("/pick", thread_id=tid)  # typed → top-level menu, no parent
+        await bot.send("/pick", window=tid)  # typed → top-level menu, no parent
         assert "🍎 Apple" in bot.buttons
         assert "⬅ Back" not in bot.buttons  # depth 1 (root) → no Back affordance
         await bot.tap("🍌 Banana")
@@ -142,8 +142,8 @@ def test_escape_prefix_reaches_the_window_via_tester():
         bot = TestClient(Demo())
         await bot.send("@bot /demo")
         tid = bot.window
-        await bot.send("/ping", thread_id=tid)  # normal → the bot universal
-        await bot.send("//ping", thread_id=tid)  # escaped → bypass it → the window
+        await bot.send("/ping", window=tid)  # normal → the bot universal
+        await bot.send("//ping", window=tid)  # escaped → bypass it → the window
         await bot.settle()
         assert "pong" in bot.replies  # the universal ran once
         assert "skill: /ping" in bot.replies  # the escaped one reached the window

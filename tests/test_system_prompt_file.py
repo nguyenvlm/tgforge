@@ -12,11 +12,11 @@ import stat
 from pathlib import Path
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
+from tgforge.base.telegram import TelegramAdapter
 from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.plugins.claude.config import system_prompt_file
-from tgforge.plugins.claude.driver import SESSION_BRIEF
-from tgforge.testing import MockBot
+from tgforge.plugins.claude.driver import session_brief
+from tgforge.testing import MockBot, telegram_kernel
 
 _FAKE_CLI = """#!/usr/bin/env python3
 import sys, json
@@ -26,6 +26,8 @@ for line in sys.stdin:
     print(json.dumps({"type": "result", "result": "ok",
           "subtype": "success", "is_error": False}), flush=True)
 """
+
+TELEGRAM_BRIEF = session_brief(TelegramAdapter)  # the brief as a Telegram window gets it
 
 
 def test_lookup_finds_file_in_workspace(tmp_path):
@@ -78,11 +80,11 @@ def _spawn_run(tmp_path, monkeypatch, workspace, prompts=("hi",), brief=None, re
 
     async def scenario():
         cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
-        core = Kernel(MockBot(), cfg, [Claude(brief=brief)])
+        core = telegram_kernel(MockBot(), cfg, [Claude(brief=brief)])
         claude = core.plugin_by_id["claude"]
         claude.claude_bin = str(fake)
         claude.claude_dir = tmp_path / ".claude"
-        topic = core._instantiate(ClaudeTopic, 555, "work")
+        topic = core._instantiate(ClaudeTopic, "555", "work")
         topic.workspace = str(workspace)
         if resume:
             jsonl = topic._jsonl()
@@ -144,7 +146,7 @@ def test_spawn_appends_the_telegram_note_with_the_param_brief(tmp_path, monkeypa
     note = _note(run)
     assert note.startswith("[via Telegram bot · ")
     assert f"home {tmp_path}]" in note
-    assert note.endswith(f"] {SESSION_BRIEF}\nhouse rules here")
+    assert note.endswith(f"] {TELEGRAM_BRIEF}\nhouse rules here")
     path = run[0][run[0].index("--append-system-prompt-file") + 1]
     assert path.startswith(f"{tmp_path}/")  # in the bot home
     assert not run[2]["note_left"]  # closing the window removes it
@@ -155,13 +157,13 @@ def test_spawn_appends_the_bot_home_session_brief(tmp_path, monkeypatch):
     workspace.mkdir()
     (tmp_path / "session_brief.md").write_text("from the home file\n")
     note = _note(_spawn_run(tmp_path, monkeypatch, workspace))
-    assert note.endswith(f"] {SESSION_BRIEF}\nfrom the home file")
+    assert note.endswith(f"] {TELEGRAM_BRIEF}\nfrom the home file")
 
 
 def test_spawn_note_without_an_app_brief_ends_at_session_brief(tmp_path, monkeypatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    assert _note(_spawn_run(tmp_path, monkeypatch, workspace)).endswith(f"] {SESSION_BRIEF}")
+    assert _note(_spawn_run(tmp_path, monkeypatch, workspace)).endswith(f"] {TELEGRAM_BRIEF}")
 
 
 def test_a_brief_past_the_argument_cap_still_spawns(tmp_path, monkeypatch):
@@ -181,7 +183,7 @@ def test_spawn_note_sits_alongside_the_system_prompt_file(tmp_path, monkeypatch)
     cmd = run[0]
     flag = cmd.index("--system-prompt-file")
     assert cmd[flag + 1] == str(workspace / "system_prompt.txt")
-    assert _note(run).endswith(f"{SESSION_BRIEF}\nextra")
+    assert _note(run).endswith(f"{TELEGRAM_BRIEF}\nextra")
 
 
 def test_a_resumed_session_spawn_carries_the_note(tmp_path, monkeypatch):
@@ -189,7 +191,7 @@ def test_a_resumed_session_spawn_carries_the_note(tmp_path, monkeypatch):
     workspace.mkdir()
     run = _spawn_run(tmp_path, monkeypatch, workspace, brief="house rules", resume=True)
     assert "--resume" in run[0] and "--session-id" not in run[0]
-    assert _note(run).endswith(f"{SESSION_BRIEF}\nhouse rules")
+    assert _note(run).endswith(f"{TELEGRAM_BRIEF}\nhouse rules")
 
 
 def test_plain_and_slash_prompts_reach_the_cli_exactly_as_typed(tmp_path, monkeypatch):

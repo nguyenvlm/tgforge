@@ -1,16 +1,18 @@
 """The Kernel — the runtime plugins register into, an operating system for windows.
 
-This module is the whole framework core: the process probes + subprocess reaper,
-persistence (`AppDB`, one SQLite file; `SavedDict`, namespaced dict-like views),
-the plugin declaration decorators, the `Topic` and `Plugin` bases, the `Transport`
-(aiogram send/edit wrappers with MarkdownV2 fallback and chunking, one pacer and
-flood-wait deadline, and the frame-skip output for live messages and titles), the
-command registry (built once at startup; aborts the launch on any
-name clash), the per-call `Context` a handler receives, and the `Kernel` itself.
-The kernel owns the chain-of-responsibility router, the owner binding, window
-ownership and lifecycle (open / adopt / release / close), the interaction helpers
-(button/text prompts), cross-plugin services, daily usage counts, and the reconcile
-sweep that drops manually-deleted topics. A plugin never receives the kernel — it
+This module is the whole platform-neutral framework core: the process probes +
+subprocess reaper, persistence (`AppDB`, one SQLite file; `SavedDict`, namespaced
+dict-like views), the plugin declaration decorators, the `Topic` and `Plugin` bases,
+the neutral event types (`Inbound`, `Tap`) and call outcomes an adapter reports, the
+`Transport` (one platform adapter behind one pacer and flood-wait deadline, with the
+rich-then-plain retry, chunking, and the frame-skip output for live messages and
+titles), the command registry (built once at startup; aborts the launch on any name
+clash), the per-call `Context` a handler receives, and the `Kernel` itself. The kernel
+holds one `Transport` per configured platform and picks a window's by its key; it owns
+the chain-of-responsibility router, the owner binding, window ownership and lifecycle
+(open / adopt / release / close), the interaction helpers (button/text prompts),
+cross-plugin services, daily usage counts, and the reconcile sweep that drops
+manually-deleted windows. A plugin never receives the kernel — it
 works through a per-call `Context` and its `Topic` instance. The built-in commands
 (`/`, `/new`, `/close`, `/usage`, `/help`, `/init`, `/restart`) ride an implicit plugin
 (`_CorePlugin`) declared here, so routing never special-cases them.
@@ -35,38 +37,26 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
-
-from aiogram import Bot as AioBot
-from aiogram.exceptions import (
-    TelegramAPIError,
-    TelegramBadRequest,
-    TelegramNetworkError,
-    TelegramRetryAfter,
-    TelegramServerError,
-)
-from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InputMediaPhoto,
-    Message,
-    ReplyParameters,
-)
 
 from tgforge.base import ui
 from tgforge.base.config import BotConfig
-from tgforge.base.ui import MAX_MSG, chunks, md_chunks, to_md
+from tgforge.base.ui import MAX_MSG, chunks, md_chunks
 
 LOGGER = logging.getLogger("tgforge")
 
 _NOT_MODIFIED = object()  # a benign edit no-op: the new content already matches the message
-_FLOODED = object()  # a call Telegram flood-waited; the deadline is in `flood_until`
+_FLOODED = object()  # a call the platform flood-waited; the deadline is in `flood_until`
 # a delete's outcome (`_attempt(delete_outcome=True)`), besides a landed True and _FLOODED
 _GONE = object()  # "message to delete not found": the message is not there
 _UNSURE = object()  # transient retries ran out: the message may still be there
 _REFUSED = object()  # any other rejection: the message stays
 STUB_TEXT = "·"  # what an undeletable bottom-frame copy is edited down to
 FRAME_MEMORY = 256  # landed message frames kept for the no-op check (oldest forgotten)
+
+
+def _first_page(pages: ui.Pages) -> ui.Pages:
+    """`pages` cut to its first page: what a card's frame shows (rendered alone)."""
+    return ui.Pages(pages.summary, pages.pages[:1], pages.note)
 
 
 def _resolve(waiters: list, landed: bool) -> None:
@@ -76,7 +66,7 @@ def _resolve(waiters: list, landed: bool) -> None:
 
 
 def _cap(text: str) -> str:
-    """Last-resort MAX_MSG guard before an aiogram call. A hit means a caller sent an
+    """Last-resort MAX_MSG guard before an adapter call. A hit means a caller sent an
     oversized body and the tail (an answer's final words) is being lost mid-word — that
     is a composition bug, so log it loudly instead of cutting silently."""
     if len(text) > MAX_MSG:
@@ -96,13 +86,13 @@ PACE_BURST = 3  # bucket capacity: how many may fire back-to-back before pacing 
 TITLE_MIN_INTERVAL = 5.0  # s between renames of one topic (each posts a service message)
 SPARE_SLOT_POLL = 0.1  # s: how often a frame push re-checks for a spare slot
 SHUTDOWN_FLUSH = 10.0  # s: how long a graceful stop waits for pending frames to land
-TRANSIENT_RETRIES = 3  # retries of a call hit by a network error or a Telegram 5xx
+TRANSIENT_RETRIES = 3  # retries of a call hit by a `Transient` error (network or 5xx)
 TRANSIENT_BACKOFF = 1.0  # s before the first such retry, doubling (1, 2, 4 s)
 BOTTOM_RESEND_ATTEMPTS = 3  # failed (non-flood) re-sends of a bottom frame before it waits
 
 
 class _Pacer:
-    """A shared token bucket that paces every outbound Telegram call so we stay under
+    """A shared token bucket that paces every outbound call of one platform so we stay under
     the per-group rate. An essential call (`take`) waits for a slot; a frame push
     (`take_spare`) also waits until no essential call is pending, so a reply never
     loses its slot to a spinner tick. `per_min<=0` disables pacing entirely."""
@@ -387,8 +377,8 @@ def plugin_ns(plugin_id: str) -> str:
     return f"plugin:{plugin_id}"
 
 
-def window_ns(class_id: str, thread_id: int) -> str:
-    return f"win:{class_id}:{thread_id}"
+def window_ns(class_id: str, window: str) -> str:
+    return f"win:{class_id}:{window}"
 
 
 class SavedDict:
@@ -652,9 +642,9 @@ class Topic:
                 setattr(cls, attr, fn)
         return ext
 
-    def __init__(self, core, thread_id: int, name: str, saved: SavedDict):
+    def __init__(self, core, window: str, name: str, saved: SavedDict):
         self._core = core
-        self.thread_id = thread_id
+        self.window = window  # the window key (see `Inbound.window`)
         self.name = name
         self.saved = saved
         self.plugin = None  # the owning Plugin (set by the kernel); for its store/roots
@@ -688,7 +678,7 @@ class Topic:
         once: the rename is a frame-skip title (see `Transport.show_title`), skipped
         when unchanged, so a burst of state changes gives one rename. `immediate` (an
         explicit rename) skips the spacing between renames."""
-        self._core.refresh_title(self.thread_id, immediate=immediate)
+        self._core.refresh_title(self.window, immediate=immediate)
 
     # ── Lifecycle hooks (override as needed) ───────────────────────
     async def on_open(self) -> None:
@@ -711,153 +701,133 @@ class Topic:
     # ── Window control ─────────────────────────────────────────────
     async def release(self) -> None:
         """Return this window to the `core` class, keeping its history."""
-        await self._core.release_window(self.thread_id)
+        await self._core.release_window(self.window)
 
     async def close(self) -> None:
         """Delete this window."""
-        await self._core.close_window(self.thread_id)
+        await self._core.close_window(self.window)
 
     async def rename(self, name: str) -> None:
         """An explicit rename: lands as soon as a slot is free (no rename spacing)."""
-        self._core.rename_topic(self.thread_id, name, immediate=True)
+        self._core.rename_topic(self.window, name, immediate=True)
         self.name = name
 
-    # ── Replies bound to this window's thread ──────────────────────
+    # ── Replies bound to this window ───────────────────────────────
+    @property
+    def _tx(self) -> Transport:
+        return self._core.transport_for(self.window)
+
+    @property
+    def adapter(self):
+        """This window's platform adapter, for its name, limits and size measures."""
+        return self._tx.adapter
+
+    async def download_file(self, attachment, dest):
+        """Download an inbound attachment of this window to `dest` (None on failure)."""
+        return await self._tx.download_file(attachment, dest)
+
     async def run_message_call(self, call):
-        """Run `call`, a zero-arg factory of a Telegram call that posts or deletes a
+        """Run `call`, a zero-arg factory of a transport call that posts or deletes a
         message in this window (the kernel's menus and prompts come here too). Default:
         at once; a window that orders its messages overrides it."""
         return await call()
 
     async def send(self, text, reply_to=None):
-        chat_id = self._core.chat_id
-        return await self.run_message_call(
-            lambda: self._core.send(chat_id, text, self.thread_id, reply_to=reply_to)
-        )
+        tx, window = self._tx, self.window
+        return await self.run_message_call(lambda: tx.send(window, text, reply_to=reply_to))
 
-    async def send_temporary(self, text, lifetime: float) -> int | None:
+    async def send_temporary(self, text, lifetime: float):
         """Send a brief notice and delete it `lifetime` seconds later; the window's bottom
         frames stay where they are."""
-        chat_id = self._core.chat_id
-        msg_id = await self.run_message_call(
-            lambda: self._core.send(chat_id, text, self.thread_id, buries_bottom=False)
-        )
+        tx, window = self._tx, self.window
+        msg_id = await self.run_message_call(lambda: tx.send(window, text, buries_bottom=False))
         if msg_id is not None:
             task = asyncio.get_running_loop().create_task(self._delete_after(msg_id, lifetime))
             self._timed_deletes.add(task)
             task.add_done_callback(self._timed_deletes.discard)
         return msg_id
 
-    async def _delete_after(self, msg_id: int, lifetime: float) -> None:
+    async def _delete_after(self, msg_id, lifetime: float) -> None:
         await asyncio.sleep(lifetime)
         await self.delete(msg_id)
 
     async def send_rich(self, text, reply_to=None, reply_markup=None):
-        chat_id = self._core.chat_id
+        tx, window = self._tx, self.window
         return await self.run_message_call(
-            lambda: self._core.send_rich(
-                chat_id, text, self.thread_id, reply_to=reply_to, reply_markup=reply_markup
-            )
+            lambda: tx.send_rich(window, text, reply_to=reply_to, reply_markup=reply_markup)
         )
 
     async def edit(self, msg_id, text, reply_markup=None):
-        return await self._core.edit(self._core.chat_id, msg_id, text, reply_markup=reply_markup)
+        return await self._tx.edit(self.window, msg_id, text, reply_markup=reply_markup)
 
     async def edit_md(self, msg_id, md, plain, reply_markup=None):
-        return await self._core.edit_md(
-            self._core.chat_id, msg_id, md, plain, reply_markup=reply_markup
-        )
+        return await self._tx.edit_md(self.window, msg_id, md, plain, reply_markup=reply_markup)
 
     async def edit_rich(self, msg_id, text):
-        return await self._core.edit_rich(self._core.chat_id, msg_id, text)
+        return await self._tx.edit_rich(self.window, msg_id, text)
 
-    async def send_md(self, md, plain, reply_to=None, silent=False, reply_markup=None):
-        chat_id = self._core.chat_id
+    async def send_md(
+        self, md, plain=None, reply_to=None, silent=False, reply_markup=None, first_id=None
+    ):
+        """Send standard Markdown or `Pages` (`Transport.send_md`)."""
+        tx, window = self._tx, self.window
         return await self.run_message_call(
-            lambda: self._core.send_md(
-                chat_id,
+            lambda: tx.send_md(
+                window,
                 md,
                 plain,
-                self.thread_id,
                 reply_to=reply_to,
                 silent=silent,
                 reply_markup=reply_markup,
+                first_id=first_id,
             )
         )
 
     def show_frame(self, msg_id, plain, md=None, reply_markup=None) -> None:
         """Frame-skip update of a live message in this window (`Transport.show_frame`)."""
-        self._core.show_frame(
-            self._core.chat_id,
-            msg_id,
-            plain,
-            md,
-            reply_markup=reply_markup,
-            thread_id=self.thread_id,
-        )
+        self._tx.show_frame(self.window, msg_id, plain, md, reply_markup=reply_markup)
 
     def land_frame(self, msg_id, plain, md=None, reply_markup=None):
         """A finalizing edit of a message in this window (`Transport.land_frame`);
         returns a future of whether it landed."""
-        return self._core.land_frame(
-            self._core.chat_id,
-            msg_id,
-            plain,
-            md,
-            reply_markup=reply_markup,
-            thread_id=self.thread_id,
-        )
+        return self._tx.land_frame(self.window, msg_id, plain, md, reply_markup=reply_markup)
 
     def show_bottom_frame(self, name: str, plain, md=None, reply_markup=None) -> None:
         """Keep this window's message `name` as its bottom-most message (see
         `Transport.show_bottom_frame`); `plain=None` deletes it."""
-        self._core.show_bottom_frame(
-            self._core.chat_id,
-            self.thread_id,
-            f"{self.thread_id}:{name}",
-            plain,
-            md,
-            reply_markup=reply_markup,
+        self._tx.show_bottom_frame(
+            self.window, f"{self.window}:{name}", plain, md, reply_markup=reply_markup
         )
 
-    def bottom_frame_id(self, name: str) -> int | None:
-        return self._core.bottom_frame_id(f"{self.thread_id}:{name}")
+    def bottom_frame_id(self, name: str):
+        return self._tx.bottom_frame_id(f"{self.window}:{name}")
 
     async def set_markup(self, msg_id, reply_markup):
-        """Attach/replace an inline keyboard on an existing message."""
-        await self._core._call(
-            lambda: self._core.bot.edit_message_reply_markup(
-                chat_id=self._core.chat_id, message_id=msg_id, reply_markup=reply_markup
-            )
-        )
+        """Attach/replace the buttons of an existing message (None: no buttons)."""
+        await self._tx.set_buttons(self.window, msg_id, reply_markup)
 
     async def send_file(self, path):
-        chat_id = self._core.chat_id
-        return await self.run_message_call(
-            lambda: self._core.send_file(chat_id, path, self.thread_id)
-        )
+        tx, window = self._tx, self.window
+        return await self.run_message_call(lambda: tx.send_file(window, path))
 
     async def send_photo(self, media_type, b64, reply_markup=None):
-        chat_id = self._core.chat_id
+        tx, window = self._tx, self.window
         return await self.run_message_call(
-            lambda: self._core.send_photo_b64(
-                chat_id, media_type, b64, self.thread_id, reply_markup=reply_markup
-            )
+            lambda: tx.send_photo_b64(window, media_type, b64, reply_markup=reply_markup)
         )
 
     async def edit_photo(self, msg_id, media_type, b64, reply_markup=None):
-        return await self._core.edit_photo_b64(
-            self._core.chat_id, msg_id, media_type, b64, reply_markup=reply_markup
+        return await self._tx.edit_photo_b64(
+            self.window, msg_id, media_type, b64, reply_markup=reply_markup
         )
 
     async def delete(self, msg_id) -> None:
-        chat_id = self._core.chat_id
-        await self.run_message_call(lambda: self._core.delete_msg(chat_id, msg_id))
+        tx, window = self._tx, self.window
+        await self.run_message_call(lambda: tx.delete_msg(window, msg_id))
 
     async def ask_buttons(self, text, options, timeout=300, announce=None, cancel=True):
         return await self._core.ask_buttons(
-            self._core.chat_id,
-            self.thread_id,
+            self.window,
             text,
             options,
             timeout=timeout,
@@ -868,12 +838,10 @@ class Topic:
     async def menu(self, title, options):
         """Single-choice menu; returns the chosen value (None if backed out). Nests as
         a submenu when opened from a menu tap. See `Context.menu`."""
-        return await self._core.menu(self._core.chat_id, self.thread_id, title, options)
+        return await self._core.menu(self.window, title, options)
 
     async def ask_text(self, prompt=None, timeout=180):
-        return await self._core.ask_text(
-            self._core.chat_id, self.thread_id, prompt, timeout=timeout
-        )
+        return await self._core.ask_text(self.window, prompt, timeout=timeout)
 
     async def pick_dir(self, start=None, title="📂 Pick a folder"):
         """Browse folders in one in-place message; return the chosen directory (None if
@@ -905,11 +873,9 @@ class Topic:
                 opts.append(("next ›", "pg:+1"))
             opts.append(("✖ Cancel", "cancel"))
             header = f"{title}\n{cwd}" + (f"  ·  p{page + 1}/{pages}" if pages > 1 else "")
-            choice, msg_id = await self._core._prompt_tap(
-                self._core.chat_id, self.thread_id, header, opts, msg_id
-            )
+            choice, msg_id = await self._core._prompt_tap(self.window, header, opts, msg_id)
             if choice in (None, "cancel", "use"):
-                await self._core._strip_markup(self._core.chat_id, msg_id)
+                await self._core._strip_markup(self.window, msg_id)
                 return cwd if choice == "use" else None
             if choice == "up":
                 cwd, page = os.path.dirname(cwd) or "/", 0
@@ -944,63 +910,156 @@ class Plugin:
         raise TypeError("extend a Topic class, not a Plugin")
 
 
-# ── Transport: aiogram send/edit wrappers + frame-skip output ──────
+# ── Neutral events, call outcomes, and the platform adapter ────────
+# An adapter (`base/telegram.py`, `base/slack.py`) is the only code that talks to a
+# platform: it turns updates into `Inbound` / `Tap`, makes the calls below, renders
+# standard Markdown, `Pages` and `ui.Keyboard`, and sorts a call's error into one of
+# the outcomes here. A window key is a string; the key prefix picks the adapter.
+#
+# Adapter calls: send(window, text, buttons, reply_to, silent=, thread=) -> message id;
+# edit(window, message id, text, buttons) (text None: buttons only); delete(window,
+# message id); send_file(window, path, caption); send_photo(window, data, caption,
+# buttons=, name=); edit_photo(window, message id, data, buttons=, name=);
+# download(attachment, dest); create_window(title) -> key; rename_window(window,
+# title); close_window(window); window_alive(window, title) -> bool; answer_tap(tap);
+# identity() -> bot name; bind_owner(user id); render(markdown) -> (rich or None,
+# plain); render_pages(pages) -> [(rich or None, plain)]; measure(markdown) ->
+# rendered size; page_size(head, body, first) -> rendered page size; classify(error);
+# run(on message, on tap); close() (after the drain). Attributes: platform, bot_name,
+# key_prefix, general, owner_id, command_prefix, pages_in_thread, renders_tables,
+# max_message, safe_chunk, photo_max, upload_max, download_max.
+
+
+@dataclass
+class Attachment:
+    """A file on an inbound message: its name ("" when the platform gives none), its
+    kind ("photo" or "document") and the adapter's handle to download it."""
+
+    name: str
+    kind: str
+    handle: object
+
+
+@dataclass
+class Inbound:
+    """One user message, as an adapter hands it to the kernel. `text` keeps its raw
+    whitespace; `mentioned_user_ids` are the users it names (the bot left out);
+    `in_thread` marks a message posted in a reply thread (it never moves a bottom frame);
+    `echo` marks a command the platform did not show in the window."""
+
+    window: str
+    message_id: int | str | None
+    user_id: int | str | None
+    text: str
+    mentioned: bool = False
+    replied_text: str | None = None
+    replied_author: str | None = None
+    replied_user_id: int | str | None = None
+    replied_attachments: list[Attachment] = field(default_factory=list)
+    quote: str | None = None
+    forward_source: str | None = None
+    album: str | None = None
+    attachments: list[Attachment] = field(default_factory=list)
+    mentioned_user_ids: list[int | str] = field(default_factory=list)  # users named in it
+    in_thread: bool = False
+    echo: bool = False
+
+
+@dataclass
+class Tap:
+    """A button tap: the window and message it was on, the button's data, the tapping
+    user, and the platform's id for answering it."""
+
+    window: str
+    message_id: int | str | None
+    data: str
+    user_id: int | str | None
+    tap_id: str = ""
+
+
+@dataclass
+class Flood:
+    """The platform asked for no calls for `seconds`."""
+
+    seconds: float
+
+
+@dataclass
+class Transient:
+    """A network error or a server-side failure: worth a bounded retry."""
+
+
+@dataclass
+class NotModified:
+    """An edit whose content already matches the message."""
+
+
+@dataclass
+class NotFound:
+    """The message to delete is not there."""
+
+
+@dataclass
+class Refused:
+    """Any other rejection."""
+
+
+# ── Transport: one platform's calls + frame-skip output ────────────
 
 
 @dataclass
 class _Frame:
     """The newest wanted content of one live message; the frame task pushes it."""
 
-    chat_id: int
-    thread_id: int | None
-    message_id: int | None  # None: a bottom frame with no copy on screen
+    window: str
+    message_id: int | str | None  # None: a bottom frame with no copy on screen
     plain: str | None  # None: a bottom frame to delete
-    md: str | None = None
+    md: object = None  # standard Markdown or `ui.Pages`
     reply_markup: object = None
     must_land: bool = False  # pushed ahead of the other frames
-    bottom: bool = False  # kept as its thread's bottom-most message
+    bottom: bool = False  # kept as its window's bottom-most message
     resend: bool = False  # a bottom frame buried under a newer message
     waiters: list = field(default_factory=list)  # futures resolved when this content lands
     shown: tuple | None = None  # the content that last landed
     failures: int = 0  # consecutive failed (non-flood) re-sends of a bottom frame
-    vacated: tuple[int, float] | None = None  # a moved bottom frame's (old id, delete issued at)
+    vacated: tuple | None = None  # a moved bottom frame's (old id, delete issued at)
 
 
 @dataclass
 class _Title:
-    """The newest wanted name of one topic."""
+    """The newest wanted name of one window."""
 
-    chat_id: int
-    thread_id: int
+    window: str
     name: str
     immediate: bool = False  # an explicit rename: no TITLE_MIN_INTERVAL wait
 
 
 class Transport:
-    """aiogram calls behind one pacer and one flood-wait deadline, in two kinds.
+    """One platform's adapter behind one pacer and one flood-wait deadline, in two kinds
+    of calls.
 
     Essential calls (`_call`: new messages, deletes, one-off edits) are never skipped:
     they go out in issue order, wait for a pacer slot, wait out a flood-wait in full
-    (`retry_after`, never retried early) and retry until they land.
+    (never retried early) and retry until they land.
 
     Frame-skip output (`show_frame`, `show_bottom_frame`, `show_title`) is for anything
     updated over time: the call only records the newest wanted content and returns at
     once. One frame task pushes each recorded content when a slot is spare (no essential
     call pending) and no flood-wait runs; content replaced before it was pushed is
-    skipped, never sent, so local work never waits on Telegram.
+    skipped, never sent, so local work never waits on the platform.
     """
 
-    def __init__(self, bot: AioBot, pace_per_min: float = 0, pace_burst: float = PACE_BURST):
-        self.bot = bot
+    def __init__(self, adapter, pace_per_min: float = 0, pace_burst: float = PACE_BURST):
+        self.adapter = adapter
         self.flood_until = 0.0  # monotonic deadline of the last flood-wait: no call before it
         self._pacer = _Pacer(pace_per_min, pace_burst)
         self._send_order = asyncio.Lock()  # FIFO: essential calls go out in issue order
-        # thread_id → the newest message id seen there, sent or received (ids only grow
-        # within a chat, so any message above a given id landed below that message)
-        self.latest_message_ids: dict[int | None, int] = {}
+        # window → the newest message id seen there, sent or received (ids grow within a
+        # window, so any message above a given id landed below that message)
+        self.latest_message_ids: dict[str, int | str] = {}
         self._frames: dict[tuple, _Frame] = {}
-        self._titles: dict[int, _Title] = {}
-        self._title_landed_at: dict[int, float] = {}
+        self._titles: dict[str, _Title] = {}
+        self._title_landed_at: dict[str, float] = {}
         # keys awaiting a push, oldest first → (first recorded at, times replaced since)
         self._dirty: dict[tuple, tuple[float, int]] = {}
         self._frame_wakeup = asyncio.Event()
@@ -1008,23 +1067,34 @@ class Transport:
         self._frames_idle.set()
         self._frame_task: asyncio.Task | None = None
         self._pushing = False  # a push is in flight (its key already left `_dirty`)
+        self.on_title_landed = None  # called with (window, name) once a rename lands
+        self.bot_name = ""  # the adapter's identity, learned at startup
 
-    def note_message(self, thread_id: int | None, message_id: int | None) -> None:
-        """Record `message_id` as seen in `thread_id`; a replayed message (a tapped
+    def note_message(self, window: str, message_id) -> None:
+        """Record `message_id` as seen in `window`; a replayed message (a tapped
         suggestion) may carry no id. A bottom frame it lands below is re-sent, and so
         is one with no copy on screen (its re-send gave up after the old copy's delete)."""
-        if not isinstance(message_id, int):
+        if message_id is None:
             return
-        if message_id <= self.latest_message_ids.get(thread_id, 0):
+        latest = self.latest_message_ids.get(window)
+        if latest is not None and message_id <= latest:
             return
-        self.latest_message_ids[thread_id] = message_id
+        self.latest_message_ids[window] = message_id
         for key, frame in self._frames.items():
             if (
                 frame.bottom
-                and frame.thread_id == thread_id
+                and frame.window == window
                 and frame.plain is not None
                 and (frame.message_id is None or frame.message_id < message_id)
             ):
+                frame.resend = True
+                self._mark_dirty(key)
+
+    def bury_bottom_frames(self, window: str) -> None:
+        """Mark every bottom frame of `window` buried: a message the bot never receives
+        (a rename's notice) landed below them."""
+        for key, frame in self._frames.items():
+            if frame.bottom and frame.window == window and frame.plain is not None:
                 frame.resend = True
                 self._mark_dirty(key)
 
@@ -1037,56 +1107,54 @@ class Transport:
 
     async def _attempt(
         self,
-        make_coro,
+        make_call,
         ok_not_modified=False,
         spare=True,
         paced=True,
-        buries_bottom=True,
+        sent_to=None,
         delete_outcome=False,
     ):
-        """Issue one aiogram call (its slot already taken). Returns its result,
+        """Issue one adapter call (its slot already taken). Returns its result,
         `_FLOODED` on a flood-wait (the deadline is recorded), `_NOT_MODIFIED` on a benign
-        "message is not modified" edit when `ok_not_modified`, or None on any other API
-        error. A network error or a Telegram 5xx is retried up to TRANSIENT_RETRIES times
-        (1, 2, 4 s apart), each retry clearing the flood deadline and taking a pacer
-        slot like the first try (`_clear_to_call` in the caller's mode: a spare slot for
-        the frame task, the default; `_call` passes its own); then given up with a
-        warning; a 4xx gets one try. A retried send whose first try did reach Telegram
-        can post twice. `buries_bottom=False` sends a message that leaves the thread's
-        bottom frames where they are (a notice deleted soon). `delete_outcome` (a delete)
-        replaces None with `_GONE` ("message to delete not found"), `_UNSURE` (transient
-        retries ran out) or `_REFUSED` (any other rejection)."""
+        "not modified" edit when `ok_not_modified`, or None on any other rejection. A
+        `Transient` error is retried up to TRANSIENT_RETRIES times (1, 2, 4 s apart),
+        each retry clearing the flood deadline and taking a pacer slot like the first try
+        (`_clear_to_call` in the caller's mode: a spare slot for the frame task, the
+        default; `_call` passes its own); then given up with a warning; any other error
+        gets one try. A retried send whose first try did reach the platform can post
+        twice. `sent_to` (a send's window) records the new message there, so the window's
+        bottom frames move below it. `delete_outcome` (a delete) replaces None with
+        `_GONE` (not found), `_UNSURE` (transient retries ran out) or `_REFUSED`."""
         backoff = TRANSIENT_BACKOFF
         for attempt in range(TRANSIENT_RETRIES + 1):
             try:
-                result = await make_coro()
-            except TelegramRetryAfter as e:
-                LOGGER.warning("flood-wait %ss", e.retry_after)
-                self.flood_until = max(self.flood_until, time.monotonic() + e.retry_after)
-                return _FLOODED
-            except TelegramBadRequest as e:
-                if ok_not_modified and "message is not modified" in str(e):
+                result = await make_call()
+            except Exception as e:
+                kind = self.adapter.classify(e)
+                if kind is None:
+                    raise
+                if isinstance(kind, Flood):
+                    LOGGER.warning("flood-wait %ss", kind.seconds)
+                    self.flood_until = max(self.flood_until, time.monotonic() + kind.seconds)
+                    return _FLOODED
+                if isinstance(kind, Transient):
+                    if attempt == TRANSIENT_RETRIES:
+                        LOGGER.warning("call failed after %d retries: %r", attempt, e)
+                        return _UNSURE if delete_outcome else None
+                    LOGGER.warning("call failed (%r), retry in %.0fs", e, backoff)
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    await self._clear_to_call(spare=spare, paced=paced)
+                    continue
+                if isinstance(kind, NotModified) and ok_not_modified:
                     return _NOT_MODIFIED
-                LOGGER.debug("telegram api error: %r", e)
+                LOGGER.debug("call rejected: %r", e)
                 if delete_outcome:
-                    return _GONE if "message to delete not found" in str(e) else _REFUSED
+                    return _GONE if isinstance(kind, NotFound) else _REFUSED
                 return None
-            except (TelegramNetworkError, TelegramServerError) as e:
-                if attempt == TRANSIENT_RETRIES:
-                    LOGGER.warning("telegram call failed after %d retries: %r", attempt, e)
-                    return _UNSURE if delete_outcome else None
-                LOGGER.warning("telegram call failed (%r), retry in %.0fs", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff *= 2
-                await self._clear_to_call(spare=spare, paced=paced)
-                continue
-            except TelegramAPIError as e:
-                LOGGER.debug("telegram api error: %r", e)
-                return _REFUSED if delete_outcome else None
             break
-        message_id = getattr(result, "message_id", None)
-        if buries_bottom and isinstance(message_id, int):  # a sent (or edited) message
-            self.note_message(getattr(result, "message_thread_id", None), message_id)
+        if sent_to is not None and result is not None:
+            self.note_message(sent_to, result)
         return result
 
     async def _wait_flood(self) -> None:
@@ -1108,102 +1176,117 @@ class Transport:
             if paced:
                 self._pacer.give_back()
 
-    async def _call(self, make_coro, ok_not_modified=False, paced=True, buries_bottom=True):
-        """An essential aiogram call; returns its result. `make_coro` is a zero-arg
-        factory (`lambda: self.bot.send_message(...)`) so a retry issues a fresh
-        coroutine — awaiting the same one twice is a RuntimeError. Calls go out in issue
-        order; a flood-waited call waits the full `retry_after` and retries until it
-        lands. Swallows other API errors, returning None (or `_NOT_MODIFIED`, see
-        `_attempt`). `paced=False` (a button-tap answer, which posts no message) skips
-        the pacer slot and the order queue but still waits out a flood-wait."""
+    async def _call(self, make_call, ok_not_modified=False, paced=True, sent_to=None):
+        """An essential adapter call; returns its result. `make_call` is a zero-arg
+        factory (`lambda: self.adapter.send(...)`) so a retry issues a fresh coroutine —
+        awaiting the same one twice is a RuntimeError. Calls go out in issue order; a
+        flood-waited call waits the full flood and retries until it lands. Swallows other
+        rejections, returning None (or `_NOT_MODIFIED`, see `_attempt`). `paced=False` (a
+        button-tap answer, which posts no message) skips the pacer slot and the order
+        queue but still waits out a flood-wait."""
         self._pacer.waiting += 1
         try:
             async with self._send_order if paced else contextlib.nullcontext():
                 while True:
                     await self._clear_to_call(paced=paced)
                     result = await self._attempt(
-                        make_coro,
+                        make_call,
                         ok_not_modified,
                         spare=False,
                         paced=paced,
-                        buries_bottom=buries_bottom,
+                        sent_to=sent_to,
                     )
                     if result is not _FLOODED:
                         return result
         finally:
             self._pacer.waiting -= 1
 
+    # ── Rendering ──────────────────────────────────────────────────
+
+    def _rich(self, md):
+        """The adapter's rich render of standard Markdown, or of the first message of
+        `Pages` (only that one rendered); None when it does not fit (the plain body goes
+        instead)."""
+        if isinstance(md, ui.Pages):
+            return self.adapter.render_pages(_first_page(md))[0][0]
+        return self.adapter.render(md)[0]
+
+    def _plain(self, plain, md) -> str:
+        """The caller's plain body, else the plain render of `md`."""
+        if plain is not None:
+            return plain
+        if isinstance(md, ui.Pages):
+            return self.adapter.render_pages(_first_page(md))[0][1]
+        return self.adapter.render(md)[1]
+
     # ── Frame-skip output ──────────────────────────────────────────
 
-    def show_frame(
-        self, chat_id, message_id, plain, md=None, reply_markup=None, thread_id=None
-    ) -> None:
+    def show_frame(self, window, message_id, plain, md=None, reply_markup=None) -> None:
         """Record the newest content of a live message and return at once (nothing to
         await: a newer frame replaces it, or it lands when a slot is spare)."""
-        self._record_frame(chat_id, thread_id, message_id, plain, md, reply_markup)
+        self._record_frame(window, message_id, plain, md, reply_markup)
 
-    def land_frame(
-        self, chat_id, message_id, plain, md=None, reply_markup=None, thread_id=None
-    ) -> asyncio.Future:
+    def land_frame(self, window, message_id, plain, md=None, reply_markup=None) -> asyncio.Future:
         """Record a finalizing edit: pushed ahead of the other frames, kept first and
-        pending through flood-waits until it lands. The future resolves True once this
-        content (or a newer one) landed, False if Telegram rejected it."""
-        frame = self._record_frame(chat_id, thread_id, message_id, plain, md, reply_markup)
+        pending through flood-waits until it lands. `md` may be `Pages` (its first
+        message lands). The future resolves True once this content (or a newer one)
+        landed, False if the platform rejected it."""
+        frame = self._record_frame(window, message_id, plain, md, reply_markup)
         frame.must_land = True
         waiter = asyncio.get_running_loop().create_future()
         frame.waiters.append(waiter)
         return waiter
 
-    def _record_frame(self, chat_id, thread_id, message_id, plain, md, reply_markup) -> _Frame:
-        key = ("msg", chat_id, message_id)
+    def _record_frame(self, window, message_id, plain, md, reply_markup) -> _Frame:
+        plain = self._plain(plain, md)
+        key = ("msg", window, message_id)
         frame = self._frames.get(key)
         if frame is None:
-            frame = _Frame(chat_id=chat_id, thread_id=thread_id, message_id=message_id, plain=plain)
+            frame = _Frame(window=window, message_id=message_id, plain=plain)
             self._frames[key] = frame
             self._forget_old_frames()
         frame.plain, frame.md, frame.reply_markup = plain, md, reply_markup
         self._mark_dirty(key)
         return frame
 
-    def show_bottom_frame(
-        self, chat_id, thread_id, key: str, plain, md=None, reply_markup=None
-    ) -> None:
-        """Keep a message as the bottom-most of its thread: the first content sends it
-        (silently), later ones edit it, and a newer message in the thread re-sends it
+    def show_bottom_frame(self, window, key: str, plain, md=None, reply_markup=None) -> None:
+        """Keep a message as the bottom-most of its window: the first content sends it
+        (silently), later ones edit it, and a newer message in the window re-sends it
         below and deletes the old copy. `plain=None` deletes it. Returns at once."""
         frame_key = ("bottom", key)
         frame = self._frames.get(frame_key)
         if frame is None:
             if plain is None:
                 return
-            frame = _Frame(chat_id=chat_id, thread_id=thread_id, message_id=None, plain=plain)
+            frame = _Frame(window=window, message_id=None, plain=plain)
             frame.bottom = True
             self._frames[frame_key] = frame
         frame.plain, frame.md, frame.reply_markup = plain, md, reply_markup
         self._mark_dirty(frame_key)
 
-    def bottom_frame_id(self, key: str) -> int | None:
+    def bottom_frame_id(self, key: str):
         """The message id currently holding a bottom frame (None if not sent)."""
         frame = self._frames.get(("bottom", key))
         return frame.message_id if frame else None
 
-    def show_title(self, chat_id, thread_id: int, name: str, immediate=False) -> None:
-        """Record a topic's newest wanted name and return at once; renames of one topic
-        land at least TITLE_MIN_INTERVAL apart (each posts a "topic renamed" service
-        message), so a burst gives one rename to the last name. `immediate` skips that
-        wait (an explicit rename)."""
-        self._titles[thread_id] = _Title(chat_id, thread_id, name, immediate)
-        self._mark_dirty(("title", thread_id))
+    def show_title(self, window: str, name: str, immediate=False) -> None:
+        """Record a window's newest wanted name and return at once; renames of one window
+        land at least TITLE_MIN_INTERVAL apart (each posts a rename notice), so a burst
+        gives one rename to the last name. `immediate` skips that wait (an explicit
+        rename)."""
+        self._titles[window] = _Title(window, name, immediate)
+        self._mark_dirty(("title", window))
 
-    def drop_title(self, thread_id: int) -> None:
-        """Forget a recorded rename (the wanted name is already the topic's)."""
-        self._titles.pop(thread_id, None)
-        self._dirty.pop(("title", thread_id), None)
+    def drop_title(self, window: str) -> None:
+        """Forget a recorded rename (the wanted name is already the window's)."""
+        self._titles.pop(window, None)
+        self._dirty.pop(("title", window), None)
 
-    def _title_landed(self, thread_id: int, name: str) -> None:
-        # the rename posts a service message we never receive: count it as newer than
-        # anything seen, so a bottom frame it buried is re-sent
-        self.note_message(thread_id, self.latest_message_ids.get(thread_id, 0) + 1)
+    def _title_landed(self, window: str, name: str) -> None:
+        # the rename posts a notice we never receive: the bottom frames sit above it
+        self.bury_bottom_frames(window)
+        if self.on_title_landed is not None:
+            self.on_title_landed(window, name)
 
     async def flush_frames(self) -> None:
         """Wait until every recorded frame and title has been pushed."""
@@ -1212,9 +1295,9 @@ class Transport:
             self._frames_idle.clear()
             await self._frames_idle.wait()
 
-    def drop_thread_frames(self, thread_id: int) -> None:
-        """Forget every pending frame of a thread (its window went away)."""
-        for key in [k for k, frame in self._frames.items() if frame.thread_id == thread_id]:
+    def drop_window_frames(self, window: str) -> None:
+        """Forget every pending frame of a window (it went away)."""
+        for key in [k for k, frame in self._frames.items() if frame.window == window]:
             self._drop_frame(key)
 
     def _drop_frame(self, key: tuple) -> None:
@@ -1242,7 +1325,7 @@ class Transport:
 
     def _next_dirty(self) -> tuple | None:
         """The next key to push: a must-land frame first, else the oldest one ready (a
-        title waits out TITLE_MIN_INTERVAL since its topic's last rename)."""
+        title waits out TITLE_MIN_INTERVAL since its window's last rename)."""
         for key in self._dirty:
             frame = self._frames.get(key)
             if frame is not None and frame.must_land:
@@ -1253,13 +1336,13 @@ class Transport:
                 return key
         return None
 
-    def _title_ready_at(self, thread_id: int) -> float:
-        """When a topic's recorded rename may go out: TITLE_MIN_INTERVAL after its last
+    def _title_ready_at(self, window: str) -> float:
+        """When a window's recorded rename may go out: TITLE_MIN_INTERVAL after its last
         rename (an immediate one: now)."""
-        title = self._titles.get(thread_id)
+        title = self._titles.get(window)
         if title is None or title.immediate:
             return 0.0
-        return self._title_landed_at.get(thread_id, -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL
+        return self._title_landed_at.get(window, -TITLE_MIN_INTERVAL) + TITLE_MIN_INTERVAL
 
     def _title_wait(self) -> float | None:
         """Seconds until the earliest waiting title is ready (None when none waits)."""
@@ -1331,11 +1414,11 @@ class Transport:
 
     def _frame_label(self, key: tuple) -> str:
         frame = self._frames.get(key)
-        thread = f" thread {frame.thread_id}" if frame and frame.thread_id is not None else ""
+        window = f" thread {frame.window}" if frame else ""
         if key[0] == "msg":
-            return f"msg {key[2]}{thread}"
+            return f"msg {key[2]}{window}"
         if key[0] == "bottom":
-            return f"bottom {key[1]}{thread}"
+            return f"bottom {key[1]}{window}"
         return f"title thread {key[1]}"
 
     async def _push(self, key: tuple) -> None:
@@ -1348,11 +1431,7 @@ class Transport:
         title = self._titles.get(key[1])
         if title is None:
             return
-        result = await self._attempt(
-            lambda: self.bot.edit_forum_topic(
-                chat_id=title.chat_id, message_thread_id=title.thread_id, name=title.name
-            )
-        )
+        result = await self._attempt(lambda: self.adapter.rename_window(title.window, title.name))
         if self._titles.get(key[1]) is not title:
             return  # a newer name arrived meanwhile; it is already queued
         if result is _FLOODED:
@@ -1360,8 +1439,8 @@ class Transport:
             return
         del self._titles[key[1]]
         if result is not None:
-            self._title_landed_at[title.thread_id] = time.monotonic()
-            self._title_landed(title.thread_id, title.name)
+            self._title_landed_at[title.window] = time.monotonic()
+            self._title_landed(title.window, title.name)
 
     async def _push_frame(self, key: tuple) -> None:
         frame = self._frames.get(key)
@@ -1369,8 +1448,8 @@ class Transport:
             return
         if frame.plain is None:  # a bottom frame to retire
             if frame.message_id is not None:
-                chat_id, message_id = frame.chat_id, frame.message_id
-                result = await self._attempt(lambda: self.bot.delete_message(chat_id, message_id))
+                window, message_id = frame.window, frame.message_id
+                result = await self._attempt(lambda: self.adapter.delete(window, message_id))
                 if result is _FLOODED:
                     self._mark_dirty(key)
                     return
@@ -1386,7 +1465,7 @@ class Transport:
         if content == frame.shown:
             _resolve(waiters, True)
             return
-        result = await self._edit_attempt(frame.chat_id, frame.message_id, *content)
+        result = await self._edit_attempt(frame.window, frame.message_id, *content)
         if result is _FLOODED:
             frame.waiters = waiters + frame.waiters
             frame.must_land = frame.must_land or must_land  # stays first until it lands
@@ -1398,9 +1477,9 @@ class Transport:
             _resolve(waiters, True)
 
     async def _resend_bottom(self, key: tuple, frame: _Frame) -> None:
-        """Send a bottom frame below the thread's newest message. A buried copy moves
+        """Send a bottom frame below the window's newest message. A buried copy moves
         with the two slots the frame task holds (one slot each when the burst is under
-        2): the old copy's delete, then the new send right after it, so the thread never
+        2): the old copy's delete, then the new send right after it, so the window never
         shows two copies and the gap without one is one call. Only a landed delete or
         "not found" frees the old copy; an undeletable one is edited to a stub first."""
         if frame.message_id is not None:
@@ -1411,19 +1490,20 @@ class Transport:
                 return
         content = (frame.plain, frame.md, frame.reply_markup)  # the newest, read at the send
         plain, md, markup = content
-        kw = {"disable_notification": True, "reply_markup": markup}
-        if frame.thread_id is not None:
-            kw["message_thread_id"] = frame.thread_id
+        window = frame.window
         result = None
-        if md is not None and len(md) <= MAX_MSG:
+        rich = self._rich(md) if md is not None else None
+        if rich is not None:
             result = await self._attempt(
-                lambda: self.bot.send_message(frame.chat_id, md, parse_mode="MarkdownV2", **kw)
+                lambda: self.adapter.send(window, rich, markup, None, silent=True),
+                sent_to=window,
             )
-            if result is None:  # the markup was rejected: a second, plain attempt
+            if result is None:  # the rich body was rejected: a second, plain attempt
                 await self._clear_to_call(spare=True)
         if result is None:
             result = await self._attempt(
-                lambda: self.bot.send_message(frame.chat_id, _cap(plain), **kw)
+                lambda: self.adapter.send(window, _cap(plain), markup, None, silent=True),
+                sent_to=window,
             )
         if result is _FLOODED:
             LOGGER.info("bottom frame %s: re-send flood-waited, retrying", key[1])
@@ -1433,13 +1513,14 @@ class Transport:
             self._count_bottom_failure(key, frame, "re-send")
             return
         frame.failures = 0
-        frame.message_id = result.message_id
+        frame.message_id = result
         frame.shown = content
         old, deleted_at = frame.vacated or (None, None)
         frame.vacated = None
         gap = "" if deleted_at is None else f" (gap {time.monotonic() - deleted_at:.1f}s)"
         LOGGER.info("bottom frame %s: re-anchored %s → %s%s", key[1], old, frame.message_id, gap)
-        frame.resend = self.latest_message_ids.get(frame.thread_id, 0) > frame.message_id
+        latest = self.latest_message_ids.get(window)
+        frame.resend = latest is not None and latest > frame.message_id
         if frame.resend or (frame.plain, frame.md, frame.reply_markup) != content:
             self._mark_dirty(key)
         else:  # the send's own id marked it buried; nothing is left to push
@@ -1452,11 +1533,9 @@ class Transport:
         the send's slot held. False when the copy stays, holding no slot: a flood-wait
         retries the move, an unconfirmed delete or a failed stub counts as a failure."""
         paired = self._pacer.fits_pair
-        chat_id, old = frame.chat_id, frame.message_id
+        window, old = frame.window, frame.message_id
         deleted_at = time.monotonic()
-        outcome = await self._attempt(
-            lambda: self.bot.delete_message(chat_id, old), delete_outcome=True
-        )
+        outcome = await self._attempt(lambda: self.adapter.delete(window, old), delete_outcome=True)
         if outcome is _FLOODED or outcome is _UNSURE:
             if paired:
                 self._pacer.give_back()
@@ -1475,7 +1554,7 @@ class Transport:
             else:
                 await self._clear_to_call(spare=True)
             stub = await self._attempt(
-                lambda: self.bot.edit_message_text(STUB_TEXT, chat_id=chat_id, message_id=old),
+                lambda: self.adapter.edit(window, old, STUB_TEXT, None),
                 ok_not_modified=True,
             )
             if stub is None or stub is _FLOODED:
@@ -1514,210 +1593,232 @@ class Transport:
             LOGGER.warning("bottom frame %s: %s failed %d times", key[1], what, frame.failures)
             frame.failures = 0
 
-    async def _edit_attempt(self, chat_id, msg_id, plain, md, reply_markup):
-        """One edit of a frame: the MarkdownV2 body when it fits, else (or when Telegram
-        rejects the markup) the plain one. An over-limit md is never sent: a hard cut
-        mid-escape could land on valid markup and silently drop the final words."""
-        if md is not None and len(md) <= MAX_MSG:
+    async def _edit_attempt(self, window, msg_id, plain, md, reply_markup):
+        """One edit of a frame: the rich render when it fits, else (or when the platform
+        rejects it) the plain body. An over-limit render is never sent: a hard cut could
+        land on valid markup and silently drop the final words."""
+        rich = self._rich(md) if md is not None else None
+        if rich is not None:
             result = await self._attempt(
-                lambda: self.bot.edit_message_text(
-                    md,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    parse_mode="MarkdownV2",
-                    reply_markup=reply_markup,
-                ),
+                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
                 ok_not_modified=True,
             )
             if result is not None:
                 return result
             await self._clear_to_call(spare=True)
         return await self._attempt(
-            lambda: self.bot.edit_message_text(
-                _cap(plain), chat_id=chat_id, message_id=msg_id, reply_markup=reply_markup
-            ),
+            lambda: self.adapter.edit(window, msg_id, _cap(plain), reply_markup),
             ok_not_modified=True,
         )
 
     # ── Essential sends / edits ────────────────────────────────────
 
-    async def send(
-        self, chat_id, text, thread_id=None, reply_to=None, buries_bottom=True
-    ) -> int | None:
+    async def send(self, window, text, reply_to=None, buries_bottom=True, reply_markup=None):
+        """Send plain text, split to fit; `reply_markup` rides the last piece."""
         mid = None
-        for i, chunk in enumerate(chunks(text)):
-            kw = {}
-            if thread_id is not None:
-                kw["message_thread_id"] = thread_id
-            if reply_to is not None and i == 0:
-                kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
-            msg = await self._call(
-                lambda chunk=chunk, kw=kw: self.bot.send_message(chat_id, _cap(chunk), **kw),
-                buries_bottom=buries_bottom,
+        pieces = chunks(text)
+        sent_to = window if buries_bottom else None
+        for i, chunk in enumerate(pieces):
+            buttons = reply_markup if i == len(pieces) - 1 else None
+            reply = reply_to if i == 0 else None
+            result = await self._call(
+                lambda chunk=chunk, buttons=buttons, reply=reply: self.adapter.send(
+                    window, _cap(chunk), buttons, reply
+                ),
+                sent_to=sent_to,
             )
-            mid = msg.message_id if msg else mid
+            mid = result if result is not None else mid
         return mid
 
-    async def edit(self, chat_id, msg_id, text, reply_markup=None) -> bool:
-        msg = await self._call(
-            lambda: self.bot.edit_message_text(
-                _cap(text),
-                chat_id=chat_id,
-                message_id=msg_id,
-                reply_markup=reply_markup,
-            ),
+    async def edit(self, window, msg_id, text, reply_markup=None) -> bool:
+        """Replace a message's text (plain); its buttons become `reply_markup`."""
+        result = await self._call(
+            lambda: self.adapter.edit(window, msg_id, _cap(text), reply_markup),
             ok_not_modified=True,
         )
-        return msg is not None
+        return result is not None
 
-    async def send_rich(
-        self, chat_id, text, thread_id=None, reply_to=None, reply_markup=None
-    ) -> int | None:
-        """Send Markdown as MarkdownV2 (plain fallback per chunk), split to fit; the
-        `reply_markup` goes on the last chunk."""
+    async def set_buttons(self, window, msg_id, reply_markup=None) -> bool:
+        """Replace a message's buttons, its text unchanged (None: no buttons)."""
+        result = await self._call(
+            lambda: self.adapter.edit(window, msg_id, None, reply_markup),
+            ok_not_modified=True,
+        )
+        return result is not None
+
+    async def send_rich(self, window, text, reply_to=None, reply_markup=None):
+        """Send standard Markdown, rendered by the adapter (plain fallback per piece),
+        split to fit; the `reply_markup` goes on the last piece."""
         mid = None
-        pieces = md_chunks(text)
+        pieces = md_chunks(text, self.adapter.measure, self.adapter.safe_chunk)
         for i, raw in enumerate(pieces):
-            kw = {}
-            if thread_id is not None:
-                kw["message_thread_id"] = thread_id
-            if reply_to is not None and i == 0:
-                kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
-            if reply_markup is not None and i == len(pieces) - 1:
-                kw["reply_markup"] = reply_markup
-            msg = await self._call(
-                lambda raw=raw, kw=kw: self.bot.send_message(
-                    chat_id, _cap(to_md(raw)), parse_mode="MarkdownV2", **kw
-                )
-            )
-            if msg is None:
-                msg = await self._call(
-                    lambda raw=raw, kw=kw: self.bot.send_message(chat_id, _cap(raw), **kw)
-                )
-            mid = msg.message_id if msg else mid
+            buttons = reply_markup if i == len(pieces) - 1 else None
+            reply = reply_to if i == 0 else None
+            result = await self._send_rendered(window, raw, None, buttons, reply)
+            mid = result if result is not None else mid
         return mid
 
+    async def _send_rendered(self, window, md, plain, buttons, reply_to, silent=False):
+        """One message: the rich render of `md` when it fits, else (or when the platform
+        rejects it) the plain body."""
+        rendered_rich, rendered_plain = self.adapter.render(md)
+        plain = rendered_plain if plain is None else plain
+        result = None
+        if rendered_rich is not None:
+            result = await self._call(
+                lambda: self.adapter.send(window, rendered_rich, buttons, reply_to, silent=silent),
+                sent_to=window,
+            )
+        if result is None:
+            result = await self._call(
+                lambda: self.adapter.send(window, _cap(plain), buttons, reply_to, silent=silent),
+                sent_to=window,
+            )
+        return result
+
     async def send_md(
-        self, chat_id, md, plain, thread_id=None, reply_to=None, silent=False, reply_markup=None
-    ) -> int | None:
-        """Send a pre-rendered MarkdownV2 body with a plain fallback (mirrors edit_md).
-        The caller keeps `md`/`plain` within MAX_MSG — no chunking. `silent` sends
-        without a notification."""
-        kw = {}
-        if silent:
-            kw["disable_notification"] = True
-        if thread_id is not None:
-            kw["message_thread_id"] = thread_id
-        if reply_to is not None:
-            kw["reply_parameters"] = ReplyParameters(message_id=reply_to)
-        if reply_markup is not None:
-            kw["reply_markup"] = reply_markup
-        msg = None
-        if len(md) <= MAX_MSG:
-            msg = await self._call(
-                lambda: self.bot.send_message(chat_id, _cap(md), parse_mode="MarkdownV2", **kw)
+        self,
+        window,
+        md,
+        plain=None,
+        reply_to=None,
+        silent=False,
+        reply_markup=None,
+        first_id=None,
+    ):
+        """Send standard Markdown with a plain fallback (mirrors `edit_md`); the caller
+        keeps both within MAX_MSG — no chunking. `md` may be `Pages`: each message per
+        the adapter's layout, the later ones in the first one's thread where the adapter
+        threads pages; `first_id` is a first message already on screen (a landed card),
+        so only the rest are sent. Returns the first message's id. `silent` sends without
+        a notification."""
+        if not isinstance(md, ui.Pages):
+            return await self._send_rendered(window, md, plain, reply_markup, reply_to, silent)
+        messages = self.adapter.render_pages(md)
+        if first_id is None:
+            first_rich, first_plain = messages[0]
+            first_id = await self._send_pages_message(
+                window, first_rich, first_plain, reply_to, None, silent
             )
-        if msg is None:
-            msg = await self._call(lambda: self.bot.send_message(chat_id, _cap(plain), **kw))
-        return msg.message_id if msg else None
+        thread = first_id if self.adapter.pages_in_thread else None
+        for rich, page_plain in messages[1:]:
+            await self._send_pages_message(window, rich, page_plain, None, thread, silent)
+        return first_id
 
-    async def edit_rich(self, chat_id, msg_id, text) -> bool:
-        md = to_md(text)
-        msg = None
-        if len(md) <= MAX_MSG:  # never send a tail-cut md; fall to plain (see edit_md)
-            msg = await self._call(
-                lambda: self.bot.edit_message_text(
-                    md,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    parse_mode="MarkdownV2",
+    async def _send_pages_message(self, window, rich, plain, reply_to, thread, silent):
+        """One page of `Pages`; a page posted in a thread is not a new message of the
+        window's timeline, so it moves no bottom frame."""
+        sent_to = None if thread is not None else window
+        result = None
+        if rich is not None:
+            result = await self._call(
+                lambda: self.adapter.send(
+                    window, rich, None, reply_to, silent=silent, thread=thread
                 ),
+                sent_to=sent_to,
+            )
+        if result is None:
+            result = await self._call(
+                lambda: self.adapter.send(
+                    window, _cap(plain), None, reply_to, silent=silent, thread=thread
+                ),
+                sent_to=sent_to,
+            )
+        return result
+
+    async def edit_rich(self, window, msg_id, text) -> bool:
+        """Edit a message to standard Markdown (plain fallback)."""
+        return await self.edit_md(window, msg_id, text, text)
+
+    async def edit_md(self, window, msg_id, md, plain, reply_markup=None) -> bool:
+        """Edit a message to standard Markdown with a caller-bounded plain fallback. An
+        over-limit render goes straight to the plain body, never cut."""
+        rich = self._rich(md)
+        result = None
+        if rich is not None:
+            result = await self._call(
+                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
                 ok_not_modified=True,
             )
-        if msg is not None:
+        if result is not None:
             return True
-        return await self.edit(chat_id, msg_id, text)
+        return await self.edit(window, msg_id, self._plain(plain, md), reply_markup=reply_markup)
 
-    async def edit_md(self, chat_id, msg_id, md, plain, reply_markup=None) -> bool:
-        # an over-limit md would be hard-cut mid-escape and, if the cut happened to
-        # land on valid markup, silently drop the message's final words — go straight
-        # to the (caller-bounded) plain render instead of ever sending a cut md.
-        msg = None
-        if len(md) <= MAX_MSG:
-            msg = await self._call(
-                lambda: self.bot.edit_message_text(
-                    md,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    parse_mode="MarkdownV2",
-                    reply_markup=reply_markup,
-                ),
-                ok_not_modified=True,
-            )
-        if msg is not None:
-            return True
-        return await self.edit(chat_id, msg_id, plain, reply_markup=reply_markup)
+    async def delete_msg(self, window, msg_id) -> None:
+        """Delete a message (its pending frame is dropped); a rejection (the message is
+        already gone) counts as done."""
+        self._drop_frame(("msg", window, msg_id))
+        await self._call(lambda: self.adapter.delete(window, msg_id))
 
-    async def delete_msg(self, chat_id, msg_id) -> None:
-        """Delete a message (its pending frame is dropped); an API error (the message
-        is already gone) counts as done."""
-        self._drop_frame(("msg", chat_id, msg_id))
-        await self._call(lambda: self.bot.delete_message(chat_id, msg_id))
-
-    async def send_photo_b64(self, chat_id, media_type, b64, thread_id=None, reply_markup=None):
+    async def send_photo_b64(self, window, media_type, b64, reply_markup=None):
         raw = base64.b64decode(b64)
-        if len(raw) > 10 * 1024 * 1024:
+        if len(raw) > self.adapter.photo_max:
             return None
-        ext = media_type.split("/")[-1] or "png"
-        kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-        if reply_markup is not None:
-            kw["reply_markup"] = reply_markup
-        msg = await self._call(
-            lambda: self.bot.send_photo(chat_id, BufferedInputFile(raw, f"image.{ext}"), **kw)
+        name = f"image.{media_type.split('/')[-1] or 'png'}"
+        return await self._upload(
+            window,
+            lambda: self.adapter.send_photo(window, raw, None, buttons=reply_markup, name=name),
         )
-        return msg.message_id if msg else None
 
-    async def edit_photo_b64(self, chat_id, msg_id, media_type, b64, reply_markup=None) -> bool:
+    async def _upload(self, window, make_call):
+        """An essential upload. One the platform took without reporting its message id
+        still lands below the window's bottom frames: they are marked buried."""
+        posted = []
+
+        async def call():
+            result = await make_call()
+            posted.append(True)
+            return result
+
+        result = await self._call(call, sent_to=window)
+        if result is None and posted:
+            self.bury_bottom_frames(window)
+        return result
+
+    async def edit_photo_b64(self, window, msg_id, media_type, b64, reply_markup=None) -> bool:
         """Replace an existing photo message's image in place (keeps one live frame
         instead of a growing pile). Returns False if the edit was rejected."""
         raw = base64.b64decode(b64)
-        if len(raw) > 10 * 1024 * 1024:
+        if len(raw) > self.adapter.photo_max:
             return False
-        ext = media_type.split("/")[-1] or "png"
-        media = InputMediaPhoto(media=BufferedInputFile(raw, f"image.{ext}"))
-        msg = await self._call(
-            lambda: self.bot.edit_message_media(
-                media=media, chat_id=chat_id, message_id=msg_id, reply_markup=reply_markup
-            )
+        name = f"image.{media_type.split('/')[-1] or 'png'}"
+        result = await self._call(
+            lambda: self.adapter.edit_photo(window, msg_id, raw, buttons=reply_markup, name=name)
         )
-        return msg is not None
+        return result is not None
 
-    async def download_file(self, file_id: str, dest: Path) -> Path | None:
-        """Download a Telegram file (photo/document) to `dest`. Returns the path, or
-        None on failure (e.g. over the 20MB bot-API download cap)."""
+    async def download_file(self, attachment, dest: Path) -> Path | None:
+        """Download an inbound attachment to `dest`. Returns the path, or None on failure
+        (e.g. over the platform's download cap)."""
         try:
-            info = await self.bot.get_file(file_id)
-            buf = await self.bot.download_file(info.file_path)
-        except TelegramAPIError:
-            LOGGER.warning("getFile failed for %s (over the 20MB bot limit?)", file_id)
+            return await self.adapter.download(attachment, dest)
+        except Exception as e:
+            if self.adapter.classify(e) is None:
+                raise
+            LOGGER.warning(
+                "download failed for %s (over the %dMB cap?)",
+                attachment.name or attachment.kind,
+                self.adapter.download_max // (1024 * 1024),
+            )
             return None
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(buf.read())
-        return dest
 
-    async def send_file(self, chat_id, path: Path, thread_id=None):
+    async def send_file(self, window, path: Path):
         if not path.is_file():
             raise RuntimeError(f"no such file: {path}")
         size = path.stat().st_size
-        if size > 50 * 1024 * 1024:
-            raise RuntimeError(f"{path.name} is {size / 1e6:.0f}MB — over the 50MB cap")
+        cap = self.adapter.upload_max
+        if size > cap:
+            raise RuntimeError(
+                f"{path.name} is {size / 1e6:.0f}MB — over the {cap // (1024 * 1024)}MB cap"
+            )
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-        data = BufferedInputFile(path.read_bytes(), path.name)
-        if media_type.startswith("image/") and size <= 10 * 1024 * 1024:
-            await self._call(lambda: self.bot.send_photo(chat_id, data, **kw))
+        if media_type.startswith("image/") and size <= self.adapter.photo_max:
+            data = path.read_bytes()
+            await self._upload(
+                window, lambda: self.adapter.send_photo(window, data, None, name=path.name)
+            )
         else:
-            await self._call(lambda: self.bot.send_document(chat_id, data, **kw))
+            await self._upload(window, lambda: self.adapter.send_file(window, path, None))
 
 
 # ── Command registry ───────────────────────────────────────────────
@@ -1853,11 +1954,10 @@ def build_registry(plugins: list) -> Registry:
 
 
 class Context:
-    def __init__(self, core, chat_id, thread_id, message, text, args, topic, saved, user_id=None):
+    def __init__(self, core, window, message, text, args, topic, saved, user_id=None):
         self._core = core
-        self.chat_id = chat_id
-        self.thread_id = thread_id
-        self.message = message
+        self.window = window  # the window key the event came from
+        self.message: Inbound | None = message
         self.text = text
         self.args = args
         self.user_id = user_id  # the acting user's id (None for a service call)
@@ -1866,8 +1966,12 @@ class Context:
 
     @property
     def is_admin(self) -> bool:
-        """True if the acting user is the bound owner (the bot's admin)."""
-        return self.user_id is not None and self.user_id == self._core.owner_id
+        """True if the acting user is the bound owner of this window's platform."""
+        return self.user_id is not None and self.user_id == self._core.owner_for(self.window)
+
+    @property
+    def _tx(self) -> Transport:
+        return self._core.transport_for(self.window)
 
     # ── Replies ────────────────────────────────────────────────────
     # Inside a window, new messages and deletes go through the window's own methods,
@@ -1875,37 +1979,37 @@ class Context:
     async def send(self, text, reply_to=None):
         if self.topic is not None:
             return await self.topic.send(text, reply_to=reply_to)
-        return await self._core.send(self.chat_id, text, self.thread_id, reply_to=reply_to)
+        return await self._tx.send(self.window, text, reply_to=reply_to)
 
     async def send_rich(self, text, reply_to=None):
         if self.topic is not None:
             return await self.topic.send_rich(text, reply_to=reply_to)
-        return await self._core.send_rich(self.chat_id, text, self.thread_id, reply_to=reply_to)
+        return await self._tx.send_rich(self.window, text, reply_to=reply_to)
 
     async def edit(self, msg_id, text, reply_markup=None):
-        return await self._core.edit(self.chat_id, msg_id, text, reply_markup=reply_markup)
+        return await self._tx.edit(self.window, msg_id, text, reply_markup=reply_markup)
 
     async def edit_md(self, msg_id, md, plain, reply_markup=None):
-        return await self._core.edit_md(self.chat_id, msg_id, md, plain, reply_markup=reply_markup)
+        return await self._tx.edit_md(self.window, msg_id, md, plain, reply_markup=reply_markup)
 
     async def send_file(self, path):
         if self.topic is not None:
             return await self.topic.send_file(path)
-        return await self._core.send_file(self.chat_id, path, self.thread_id)
+        return await self._tx.send_file(self.window, path)
 
-    async def download_file(self, file_id, dest):
-        return await self._core.download_file(file_id, dest)
+    async def download_file(self, attachment, dest):
+        return await self._tx.download_file(attachment, dest)
 
     async def send_photo(self, media_type, b64):
         if self.topic is not None:
             return await self.topic.send_photo(media_type, b64)
-        return await self._core.send_photo_b64(self.chat_id, media_type, b64, self.thread_id)
+        return await self._tx.send_photo_b64(self.window, media_type, b64)
 
     async def delete(self, msg_id):
         if self.topic is not None:
             await self.topic.delete(msg_id)
         else:
-            await self._core.delete_msg(self.chat_id, msg_id)
+            await self._tx.delete_msg(self.window, msg_id)
 
     # ── Subprocesses ───────────────────────────────────────────────
     async def spawn(self, *args, **kwargs):
@@ -1918,8 +2022,7 @@ class Context:
     # ── Ask ────────────────────────────────────────────────────────
     async def ask_buttons(self, text, options, timeout=300, announce=None, cancel=True):
         return await self._core.ask_buttons(
-            self.chat_id,
-            self.thread_id,
+            self.window,
             text,
             options,
             timeout=timeout,
@@ -1931,31 +2034,29 @@ class Context:
         """Show a single-choice menu; return the chosen value (None if backed out).
         Nested automatically: opened from a menu tap, it renders as a submenu with
         Back to the parent. Use for pickers; `ask_buttons` stays for yes/no confirms."""
-        return await self._core.menu(self.chat_id, self.thread_id, title, options)
+        return await self._core.menu(self.window, title, options)
 
     async def ask_text(self, prompt=None, timeout=180):
-        return await self._core.ask_text(self.chat_id, self.thread_id, prompt, timeout=timeout)
+        return await self._core.ask_text(self.window, prompt, timeout=timeout)
 
     def await_next(self, handler):
-        self._core.await_next(self.thread_id, handler)
+        self._core.await_next(self.window, handler)
 
     # ── Windows + cross-plugin ─────────────────────────────────────
     async def open(self, topic_class, name=None):
-        """Create a window of `topic_class` (name deduped by the core) and return
-        its live instance."""
-        return await self._core.open_window(self.chat_id, topic_class, name)
+        """Create a window of `topic_class` on this window's platform (name deduped by
+        the core) and return its live instance."""
+        return await self._core.open_window(topic_class, name, origin=self.window)
 
     async def call_service(self, name, *args):
-        """Invoke another plugin's @service for the current thread."""
-        return await self._core.call_service(name, self.chat_id, self.thread_id, *args)
+        """Invoke another plugin's @service for the current window."""
+        return await self._core.call_service(name, self.window, *args)
 
     def has_service(self, name) -> bool:
         return self._core.has_service(name)
 
     async def offer_handoff(self, message_id, payload, service, label):
-        await self._core.offer_handoff(
-            self.chat_id, self.thread_id, message_id, payload, service, label
-        )
+        await self._core.offer_handoff(self.window, message_id, payload, service, label)
 
 
 @launch("/new", "open a plain window")
@@ -1989,7 +2090,7 @@ class _CorePlugin(Plugin):
     )
     async def close(self, ctx):
         if ctx.topic is None:
-            await ctx.send("run /close inside a topic")
+            await ctx.send("run /close inside a window")
             return
         choice, _ = await ctx.ask_buttons(
             "Close this window?",
@@ -2004,11 +2105,11 @@ class _CorePlugin(Plugin):
 
     @universal("/", "open the menu", menu="none", aliases=("/menu",))
     async def menu(self, ctx):
-        await self._kernel.show_menu(ctx.chat_id, ctx.thread_id)
+        await self._kernel.show_menu(ctx.window)
 
     @universal("/help", "what you can do here", menu="none", inline=True, aliases=("/?",))
     async def help(self, ctx):
-        return self._kernel.help_text(ctx.thread_id)
+        return self._kernel.help_text(ctx.window)
 
     @universal("/usage", "show usage counts", icon="📊", inline=True)
     async def usage(self, ctx):
@@ -2035,37 +2136,43 @@ class _CorePlugin(Plugin):
             await ctx.send("cancelled")
             return
         await ctx.send("restarting… back shortly (🟢 online here + in General when up)")
-        detached_restart(service, self._kernel.config.home_path, announce_thread=ctx.thread_id)
+        detached_restart(service, self._kernel.config.home_path, announce_window=ctx.window)
 
 
-class Kernel(Transport):
-    def __init__(self, bot: AioBot, config: BotConfig, plugins: list | None = None):
-        super().__init__(bot)
+class Kernel:
+    """The router and window manager over one `Transport` per configured platform."""
+
+    def __init__(
+        self,
+        config: BotConfig,
+        plugins: list | None = None,
+        transports: list[Transport] | None = None,
+    ):
         self.config = config
-        self.owner_id: int | None = config.owner_id
-        self.chat_id: int | None = config.chat_id
-        self.bot_username = config.bot_username
+        self.transports: list[Transport] = list(transports or [])
+        for tx in self.transports:
+            tx.on_title_landed = self._title_landed
         self.shutting_down = False  # set on a graceful stop so drivers stay quiet
         self._start_mono = time.monotonic()
         self.db = AppDB(config.db_file)
         self.saved = self.db.saved(core_ns())
         # inline-button prompts awaiting a tap, keyed by prompt id
         self.pending_callbacks: dict[str, asyncio.Future] = {}
-        # menu navigation stack per thread (the UINavigationController model): a list
+        # menu navigation stack per window (the UINavigationController model): a list
         # of screen titles = the depth; the message every level edits; a push counter
         # so a menu can tell whether a tapped command navigated or just acted
-        self._nav: dict[int, list[str]] = {}
-        self._menu_msg: dict[int, int | None] = {}
-        self._nav_pushes: dict[int, int] = {}
-        self._menu_owner: dict[int, object] = {}  # token of the live menu session per thread
-        self._active_prompt: dict[int, str] = {}  # pid of the tap a thread is awaiting now
-        # a thread awaiting the owner's next plain message (ask_text / await_next)
-        self._await_input: dict[int, Fallback] = {}
+        self._nav: dict[str, list[str]] = {}
+        self._menu_msg: dict[str, object] = {}
+        self._nav_pushes: dict[str, int] = {}
+        self._menu_owner: dict[str, object] = {}  # token of the live menu session per window
+        self._active_prompt: dict[str, str] = {}  # pid of the tap a window is awaiting now
+        # a window awaiting the owner's next plain message (ask_text / await_next)
+        self._await_input: dict[str, Fallback] = {}
         # pending handoff taps
         self._handoffs: dict[str, tuple] = {}
         # ownership + live instances
-        self.owners: dict[int, str] = {}  # thread_id -> class id
-        self.instances: dict[int, Topic] = {}  # thread_id -> live Topic
+        self.owners: dict[str, str] = {}  # window key -> class id
+        self.instances: dict[str, Topic] = {}  # window key -> live Topic
         # plugins (core plugin first so its universals always exist)
         self._core_plugin = _CorePlugin(self)
         self.plugins: list = [self._core_plugin, *(plugins or [])]
@@ -2078,19 +2185,60 @@ class Kernel(Transport):
             self.plugin_saved[p.plugin_id] = p.saved
         self._reconcile_task: asyncio.Task | None = None
 
+    # ── Platforms ──────────────────────────────────────────────────
+
+    def find_transport(self, window: str) -> Transport | None:
+        """The transport whose adapter owns `window`: the longest key prefix that leaves
+        a bare id (no further `:`); None when no configured platform owns it."""
+        best = None
+        for tx in self.transports:
+            prefix = tx.adapter.key_prefix
+            if not window.startswith(prefix) or ":" in window[len(prefix) :]:
+                continue
+            if best is None or len(prefix) > len(best.adapter.key_prefix):
+                best = tx
+        return best
+
+    def transport_for(self, window: str) -> Transport:
+        tx = self.find_transport(window)
+        if tx is None:
+            raise KeyError(f"no platform owns window {window!r}")
+        return tx
+
+    def is_general(self, window: str) -> bool:
+        """Whether `window` is its platform's General (outside any window)."""
+        tx = self.find_transport(window)
+        return tx is not None and window == tx.adapter.general
+
+    def owner_for(self, window: str):
+        """The bound owner of `window`'s platform (None before `/init`)."""
+        tx = self.find_transport(window)
+        return tx.adapter.owner_id if tx is not None else None
+
+    def enable_pacing(self) -> None:
+        for tx in self.transports:
+            tx.enable_pacing()
+
+    async def flush_frames(self) -> None:
+        """Wait until every platform's recorded frames and titles have been pushed."""
+        await asyncio.gather(*(tx.flush_frames() for tx in self.transports))
+
     # ── Name registry (persisted in the core store) ────────────────
 
-    def _names(self) -> dict[int, str]:
-        return {int(k): v for k, v in self.saved.get("names", {}).items()}
+    def _names(self) -> dict[str, str]:
+        return dict(self.saved.get("names", {}))
 
-    def _save_names(self, names: dict[int, str]) -> None:
-        self.saved["names"] = {str(k): v for k, v in names.items()}
+    def _save_names(self, names: dict[str, str]) -> None:
+        self.saved["names"] = names
 
     def _save_owners(self) -> None:
-        self.saved["owners"] = {str(k): v for k, v in self.owners.items()}
+        self.saved["owners"] = dict(self.owners)
 
-    def _dedup_name(self, name: str) -> str:
-        existing = set(self._names().values())
+    def _dedup_name(self, name: str, tx: Transport) -> str:
+        """`name`, or `name #k` when a window on the same platform already has it."""
+        existing = {
+            title for window, title in self._names().items() if self.find_transport(window) is tx
+        }
         if name not in existing:
             return name
         k = 2
@@ -2098,47 +2246,52 @@ class Kernel(Transport):
             k += 1
         return f"{name} #{k}"
 
-    def owner_of(self, thread_id: int | None) -> str | None:
-        return self.owners.get(thread_id) if thread_id is not None else None
+    def owner_of(self, window: str | None) -> str | None:
+        return self.owners.get(window) if window is not None else None
 
     # ── Topic + window ops ─────────────────────────────────────────
 
-    async def create_topic(self, name: str) -> tuple[int, str] | None:
-        """Create a forum topic (deduped name). Returns (thread_id, actual)."""
-        actual = self._dedup_name(name)
-        t = await self._call(lambda: self.bot.create_forum_topic(chat_id=self.chat_id, name=actual))
-        if not t:
+    async def create_topic(self, name: str, tx: Transport) -> tuple[str, str] | None:
+        """Create a window on `tx`'s platform (deduped name). Returns (window, actual)."""
+        actual = self._dedup_name(name, tx)
+        window = await tx._call(lambda: tx.adapter.create_window(actual))
+        if not window:
             return None
         names = self._names()
-        names[t.message_thread_id] = actual
+        names[window] = actual
         self._save_names(names)
-        return t.message_thread_id, actual
+        return window, actual
 
-    def _instantiate(self, cls: type[Topic], thread_id: int, name: str) -> Topic:
-        saved = self.db.saved(window_ns(cls.id, thread_id))
-        inst = cls(self, thread_id, name, saved)
+    def _instantiate(self, cls: type[Topic], window: str, name: str) -> Topic:
+        saved = self.db.saved(window_ns(cls.id, window))
+        inst = cls(self, window, name, saved)
         entry = self.registry.classes.get(cls.id)
         inst.plugin = self.plugin_by_id.get(entry.plugin_id) if entry else None
-        self.instances[thread_id] = inst
+        self.instances[window] = inst
         return inst
 
     def _window_title(self, cls: type[Topic], name: str | None) -> str:
-        """A topic's display name: the class icon + a capitalized base (the given
+        """A window's display name: the class icon + a capitalized base (the given
         name, else the class's menu label or its id title-cased)."""
         base = name or cls.menu_label or cls.id.title()
         if cls.icon and not base.startswith(cls.icon):
             base = f"{cls.icon} {base}"
         return base
 
-    async def open_window(self, chat_id, topic_class: type[Topic], name=None) -> Topic | None:
-        created = await self.create_topic(self._window_title(topic_class, name))
+    async def open_window(
+        self, topic_class: type[Topic], name=None, *, origin: str
+    ) -> Topic | None:
+        """Open a window of `topic_class` on the platform of `origin`, the window key the
+        request came from."""
+        tx = self.transport_for(origin)
+        created = await self.create_topic(self._window_title(topic_class, name), tx)
         if created is None:
-            await self.send(chat_id, "couldn't create topic", None)
+            await tx.send(origin, "couldn't create window")
             return None
-        tid, actual = created
-        self.owners[tid] = topic_class.id
+        window, actual = created
+        self.owners[window] = topic_class.id
         self._save_owners()
-        inst = self._instantiate(topic_class, tid, actual)
+        inst = self._instantiate(topic_class, window, actual)
         base = actual
         if topic_class.icon and base.startswith(topic_class.icon):
             base = base[len(topic_class.icon) :].strip()
@@ -2146,17 +2299,17 @@ class Kernel(Transport):
         await inst.on_open()
         return inst
 
-    async def adopt(self, thread_id: int, topic_class: type[Topic]) -> Topic:
-        """Transform a window (a core window) into `topic_class`, keeping thread +
-        name + history. The inverse of release()."""
-        old = self.instances.get(thread_id)
+    async def adopt(self, window: str, topic_class: type[Topic]) -> Topic:
+        """Transform a window (a core window) into `topic_class`, keeping its key, name
+        and history. The inverse of release()."""
+        old = self.instances.get(window)
         if old is not None:
             await self._teardown(old)
-            self.db.drop(window_ns(self.owners.get(thread_id, "core"), thread_id))
-        name = self._names().get(thread_id, topic_class.id)
-        self.owners[thread_id] = topic_class.id
+            self.db.drop(window_ns(self.owners.get(window, "core"), window))
+        name = self._names().get(window, topic_class.id)
+        self.owners[window] = topic_class.id
         self._save_owners()
-        inst = self._instantiate(topic_class, thread_id, name)
+        inst = self._instantiate(topic_class, window, name)
         await inst.on_open()
         return inst
 
@@ -2165,43 +2318,44 @@ class Kernel(Transport):
         path, so no close/release/transform can leak a subprocess or push a frame."""
         await inst.on_close()
         await inst.reap_all()
-        self.drop_thread_frames(inst.thread_id)
+        self.transport_for(inst.window).drop_window_frames(inst.window)
 
-    async def release_window(self, thread_id: int) -> None:
-        inst = self.instances.get(thread_id)
-        cls_id = self.owners.get(thread_id, "core")
+    async def release_window(self, window: str) -> None:
+        inst = self.instances.get(window)
+        cls_id = self.owners.get(window, "core")
         if inst is not None:
             await self._teardown(inst)
-        self.db.drop(window_ns(cls_id, thread_id))
-        self.owners[thread_id] = "core"
+        self.db.drop(window_ns(cls_id, window))
+        self.owners[window] = "core"
         self._save_owners()
-        name = self._names().get(thread_id, "window")
-        self._instantiate(_CoreTopic, thread_id, name)
+        name = self._names().get(window, "window")
+        self._instantiate(_CoreTopic, window, name)
 
-    async def close_window(self, thread_id: int) -> None:
-        inst = self.instances.get(thread_id)
-        cls_id = self.owners.get(thread_id, "core")
+    async def close_window(self, window: str) -> None:
+        inst = self.instances.get(window)
+        cls_id = self.owners.get(window, "core")
         if inst is not None:
             await self._teardown(inst)
-        deleted = await self._call(
-            lambda: self.bot.delete_forum_topic(chat_id=self.chat_id, message_thread_id=thread_id)
-        )
-        if deleted is None:
-            # the delete failed but the topic is still in Telegram — keep it owned so it
-            # isn't forgotten into an orphaned, unowned window. The reconcile sweep does not
-            # retry the delete; it only drops this window once the topic is actually gone
-            # (re-run /close to retry the delete itself).
-            LOGGER.warning("delete_forum_topic failed for %s; kept owned", thread_id)
+        tx = self.transport_for(window)
+        closed = await tx._call(lambda: tx.adapter.close_window(window))
+        if closed is None:
+            # the close failed but the window is still there — keep it owned so it isn't
+            # forgotten into an orphaned, unowned window. The reconcile sweep does not
+            # retry the close; it only drops this window once it is actually gone
+            # (re-run /close to retry the close itself).
+            LOGGER.warning("closing window %s failed; kept owned", window)
             return
-        self.db.drop(window_ns(cls_id, thread_id))
-        self._forget(thread_id)
+        self.db.drop(window_ns(cls_id, window))
+        self._forget(window)
 
-    def _forget(self, thread_id: int) -> None:
-        self.drop_title(thread_id)
-        self.instances.pop(thread_id, None)
-        self.owners.pop(thread_id, None)
+    def _forget(self, window: str) -> None:
+        tx = self.find_transport(window)
+        if tx is not None:
+            tx.drop_title(window)
+        self.instances.pop(window, None)
+        self.owners.pop(window, None)
         names = self._names()
-        names.pop(thread_id, None)
+        names.pop(window, None)
         self._save_names(names)
         self._save_owners()
 
@@ -2211,73 +2365,68 @@ class Kernel(Transport):
         a "#2" survives a title refresh."""
         return f"{base} · {suffix}" if suffix else base
 
-    def refresh_title(self, thread_id: int, immediate: bool = False) -> None:
+    def refresh_title(self, window: str, immediate: bool = False) -> None:
         """Rebuild a window's title from its live `title_suffix()`, keeping its deduped
         base name."""
-        inst = self.instances.get(thread_id)
+        inst = self.instances.get(window)
         if inst is not None:
             base = inst.saved.get("base_name") or (type(inst).menu_label or type(inst).id.title())
             title = self._compose_title(base, inst.title_suffix())
-            self.rename_topic(thread_id, title, immediate=immediate)
+            self.rename_topic(window, title, immediate=immediate)
 
-    def rename_topic(self, thread_id: int, name: str, immediate: bool = False) -> None:
-        """Record a topic's wanted name (a frame-skip title, see `show_title`) and
-        return at once; a name equal to the topic's current one makes no call."""
-        inst = self.instances.get(thread_id)
+    def rename_topic(self, window: str, name: str, immediate: bool = False) -> None:
+        """Record a window's wanted name (a frame-skip title, see `show_title`) and
+        return at once; a name equal to the window's current one makes no call."""
+        inst = self.instances.get(window)
         if inst and inst.icon and not name.startswith(inst.icon):
-            name = f"{inst.icon} {name}"  # a renamed topic keeps its class icon
-        if self._names().get(thread_id) == name:
-            self.drop_title(thread_id)  # unchanged → no API call
+            name = f"{inst.icon} {name}"  # a renamed window keeps its class icon
+        tx = self.transport_for(window)
+        if self._names().get(window) == name:
+            tx.drop_title(window)  # unchanged → no API call
             return
-        self.show_title(self.chat_id, thread_id, name, immediate=immediate)
+        tx.show_title(window, name, immediate=immediate)
 
-    def _title_landed(self, thread_id: int, name: str) -> None:
-        super()._title_landed(thread_id, name)
+    def _title_landed(self, window: str, name: str) -> None:
         names = self._names()
-        names[thread_id] = name
+        names[window] = name
         self._save_names(names)
-        inst = self.instances.get(thread_id)
+        inst = self.instances.get(window)
         if inst is not None:
             inst.name = name  # keep the live instance's name in sync with the title
 
     # ── Services + handoff ─────────────────────────────────────────
 
-    async def call_service(self, name: str, chat_id, thread_id, *args) -> None:
+    async def call_service(self, name: str, window: str, *args) -> None:
         """Invoke a registered @service as handler(ctx, *args) with a context for
-        the target thread."""
+        the target window."""
         entry = self.registry.services.get(name)
         if entry is None:
             return
         pid, attr = entry
         plugin = self.plugin_by_id[pid]
-        instance = self.instances.get(thread_id) if thread_id is not None else None
-        ctx = self._ctx(pid, None, chat_id, thread_id, "", "", instance)
+        instance = self.instances.get(window)
+        ctx = self._ctx(pid, None, window, "", "", instance)
         await getattr(plugin, attr)(ctx, *args)
 
     def has_service(self, name: str) -> bool:
         return name in self.registry.services
 
-    async def offer_handoff(self, chat_id, thread_id, message_id, payload, service, label):
+    async def offer_handoff(self, window, message_id, payload, service, label):
         token = uuid.uuid4().hex[:8]
-        self._handoffs[token] = (service, chat_id, thread_id, payload)
+        self._handoffs[token] = (service, window, payload)
         kb = ui.stacked([ui.cta(label, "handoff", token)])
-        ok = await self._call(
-            lambda: self.bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=message_id, reply_markup=kb
-            )
-        )
-        if ok is None:
+        if not await self.transport_for(window).set_buttons(window, message_id, kb):
             self._handoffs.pop(token, None)
 
     async def _on_handoff(self, arg: str) -> None:
         info = self._handoffs.pop(arg, None)
         if info is not None:
-            service, chat_id, thread_id, payload = info
-            await self.call_service(service, chat_id, thread_id, payload)
+            service, window, payload = info
+            await self.call_service(service, window, payload)
 
-    async def _in_window(self, thread_id, call):
-        """Run a message-posting call through the thread's window (its send order)."""
-        inst = self.instances.get(thread_id) if thread_id is not None else None
+    async def _in_window(self, window, call):
+        """Run a message-posting call through the window's own send order."""
+        inst = self.instances.get(window)
         return await (inst.run_message_call(call) if inst is not None else call())
 
     def uptime(self) -> float:
@@ -2285,9 +2434,7 @@ class Kernel(Transport):
 
     # ── Interaction helpers ────────────────────────────────────────
 
-    async def ask_buttons(
-        self, chat_id, thread_id, text, options, timeout=300, announce=None, cancel=True
-    ):
+    async def ask_buttons(self, window, text, options, timeout=300, announce=None, cancel=True):
         """Ask a one-tap choice. A Cancel option is appended by default — pass
         `cancel=False` to omit it, or a string to relabel it; tapping it (or a
         timeout) returns None. `announce(label) -> str` rewrites the prompt in place
@@ -2297,19 +2444,14 @@ class Kernel(Transport):
             opts.append((cancel if isinstance(cancel, str) else "Cancel", CANCEL))
         pid = uuid.uuid4().hex[:8]
         kb = ui.stacked_choices([label for label, _v in opts], pid)
-        kw = {"message_thread_id": thread_id} if thread_id is not None else {}
+        tx = self.transport_for(window)
         # registered before the prompt is visible, so even an instant tap is caught; the
         # cleanup covers the send too (a window closing while it is queued cancels it)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending_callbacks[pid] = fut
         try:
-            msg = await self._in_window(
-                thread_id,
-                lambda: self._call(
-                    lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)
-                ),
-            )
-            if msg is None:
+            msg_id = await self._in_window(window, lambda: tx.send(window, text, reply_markup=kb))
+            if msg_id is None:
                 return None, None  # the prompt never rendered — don't hang for the timeout
             try:
                 idx = await asyncio.wait_for(fut, timeout)
@@ -2317,34 +2459,26 @@ class Kernel(Transport):
                 idx = None
         finally:
             self.pending_callbacks.pop(pid, None)
-        if msg:
-            await self._settle_prompt(chat_id, msg.message_id, opts, idx, announce)
+        await self._settle_prompt(window, msg_id, opts, idx, announce)
         value = opts[idx][1] if idx is not None else None
-        return (None if value == CANCEL else value), (msg.message_id if msg else None)
+        return (None if value == CANCEL else value), msg_id
 
-    async def _settle_prompt(self, chat_id, message_id, options, idx, announce) -> None:
+    async def _settle_prompt(self, window, message_id, options, idx, announce) -> None:
+        tx = self.transport_for(window)
         if announce is not None:
             text = announce(options[idx][0]) if idx is not None else "⏱ timed out"
-            await self._call(
-                lambda: self.bot.edit_message_text(
-                    chat_id=chat_id, message_id=message_id, text=text
-                )
-            )
+            await tx.edit(window, message_id, text)
         else:
-            await self._call(
-                lambda: self.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id)
-            )
+            await tx.set_buttons(window, message_id, None)
 
-    async def edit_text(self, chat_id, message_id, text) -> None:
+    async def edit_text(self, window, message_id, text) -> None:
         """Rewrite a prior message in place (buttons drop) — used to announce the
         result of a tapped menu once its action has run."""
         if message_id is None:
             return
-        await self._call(
-            lambda: self.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-        )
+        await self.transport_for(window).edit(window, message_id, text)
 
-    async def ask_text(self, chat_id, thread_id, prompt=None, timeout=180):
+    async def ask_text(self, window, prompt=None, timeout=180):
         """Await a typed reply. A prompt carries a ✖ Cancel button; tapping it (or a
         timeout) resolves None. The typed feeder and the tap share one future — a str
         result is the text, an int result is the Cancel tap."""
@@ -2354,65 +2488,73 @@ class Kernel(Transport):
             if not fut.done():
                 fut.set_result(text)
 
-        key = thread_id or 0
         pid = uuid.uuid4().hex[:8]
-        self._await_input[key] = _feed
+        self._await_input[window] = _feed
+        tx = self.transport_for(window)
         msg_id = None
         result = None
         try:  # the cleanup covers the prompt's send too (it can be cancelled while queued)
             if prompt:
                 kb = ui.stacked_choices(["✖ Cancel"], pid)
-                kw = {"message_thread_id": thread_id} if thread_id is not None else {}
                 self.pending_callbacks[pid] = fut  # before the prompt is visible
-                msg = await self._in_window(
-                    thread_id,
-                    lambda: self._call(
-                        lambda: self.bot.send_message(chat_id, prompt, reply_markup=kb, **kw)
-                    ),
+                msg_id = await self._in_window(
+                    window, lambda: tx.send(window, prompt, reply_markup=kb)
                 )
-                if msg is None:
+                if msg_id is None:
                     return None  # the prompt never rendered — don't hang for the timeout
-                msg_id = msg.message_id
             try:
                 result = await asyncio.wait_for(fut, timeout)
             except TimeoutError:
                 result = None
         finally:
-            if self._await_input.get(key) is _feed:
-                del self._await_input[key]
+            if self._await_input.get(window) is _feed:
+                del self._await_input[window]
             self.pending_callbacks.pop(pid, None)
-            await self._strip_markup(chat_id, msg_id)
+            await self._strip_markup(window, msg_id)
         return None if isinstance(result, int) else result
 
-    def await_next(self, thread_id: int | None, handler: Fallback) -> None:
-        self._await_input[thread_id or 0] = handler
+    def await_next(self, window: str, handler: Fallback) -> None:
+        self._await_input[window] = handler
 
     # ── Help + usage text ──────────────────────────────────────────
 
-    def help_text(self, thread_id: int | None) -> str:
-        cls_id = self.owner_of(thread_id)
-        lines: list[str] = ["Tap / (or /menu) for the button menu. Or type:"]
+    def help_text(self, window: str) -> str:
+        """What can be typed here, each command quoted with the platform's command
+        prefix (`/` on Telegram, `/tgf ` on Slack)."""
+        tx = self.find_transport(window)
+        prefix = tx.adapter.command_prefix if tx is not None else "/"
+
+        def typed(name: str) -> str:
+            return prefix + name.lstrip("/")
+
+        # a one-token command (`/menu`) is a link in the chat; one after a slash command
+        # (`/tgf menu`) can only be typed
+        verb = "Type" if prefix.endswith(" ") else "Tap"
+        cls_id = self.owner_of(window)
+        lines: list[str] = [
+            f"{verb} {prefix.strip()} (or {typed('/menu')}) for the button menu. Or type:"
+        ]
         if cls_id and cls_id in self.registry.classes and cls_id != "core":
             entry = self.registry.classes[cls_id]
             if entry.commands:
                 lines.append(f"commands in this {cls_id} window:")
                 for name, (_attr, help, _icon, _inline) in sorted(entry.commands.items()):
-                    lines.append(f"  {name} — {help}")
+                    lines.append(f"  {typed(name)} — {help}")
         lines.append("commands anywhere:")
         for name, (_pid, _attr, help, _icon, _menu, _inline) in sorted(
             self.registry.universals.items()
         ):
-            lines.append(f"  {name} — {help}")
+            lines.append(f"  {typed(name)} — {help}")
         if not cls_id or cls_id == "core":
             lines.append("open a window:")
             for name, (_cid, help) in sorted(self.registry.launches.items()):
-                lines.append(f"  {name} — {help}")
+                lines.append(f"  {typed(name)} — {help}")
         return "\n".join(lines)
 
-    def _menu_header(self, thread_id: int | None) -> str:
-        """The menu's title — the window's own icon+name in a topic, else a neutral
+    def _menu_header(self, window: str) -> str:
+        """The menu's title — the window's own icon+name in a window, else a neutral
         desktop title. Never a lone emoji (no jumbo render)."""
-        cls_id = self.owner_of(thread_id)
+        cls_id = self.owner_of(window)
         if cls_id and cls_id != "core" and cls_id in self.registry.classes:
             return self.registry.classes[cls_id].cls.menu_entry()
         return ui.DESKTOP_MENU_TITLE
@@ -2421,14 +2563,14 @@ class Kernel(Transport):
         """A window's own say over which commands run in it (default: all)."""
         return instance is None or instance.command_allowed(kind, name)
 
-    def _menu_options(self, thread_id: int | None) -> list[tuple[str, str]]:
+    def _menu_options(self, window: str) -> list[tuple[str, str]]:
         """The buttons for this context: the current window's own commands, or the
         launchers on the desktop, plus the universals allowed here — each with its
         icon (a fallback if it declared none). The window filters its own set via
         `command_allowed`. The kernel curates nothing."""
-        cls_id = self.owner_of(thread_id)
-        instance = self.instances.get(thread_id) if thread_id is not None else None
-        in_window = thread_id is not None
+        cls_id = self.owner_of(window)
+        instance = self.instances.get(window)
+        in_window = not self.is_general(window)
         opts: list[tuple[str, str]] = []
         if cls_id and cls_id != "core":  # an app window → its own commands
             entry = self.registry.classes[cls_id]
@@ -2452,50 +2594,41 @@ class Kernel(Transport):
             opts.append((ui.menu_glyph(icon, name), f"cmd:{name}"))
         return opts + [("📋 Help", "cmd:/help")]
 
-    async def _prompt_tap(self, chat_id, thread_id, text, options, msg_id):
+    async def _prompt_tap(self, window, text, options, msg_id):
         """Render a one-tap keyboard — a fresh message, or in place on `msg_id` —
-        and await the tap. Returns (value, msg_id); the markup is left for the
+        and await the tap. Returns (value, msg_id); the buttons are left for the
         caller to re-render (a menu loops, a leaf swaps to Back)."""
         pid = uuid.uuid4().hex[:8]
         solo_back = bool(options) and options[-1][1] == MENU_BACK
         kb = ui.stacked_choices([label for label, _v in options], pid, solo_last=solo_back)
+        tx = self.transport_for(window)
         # the tap future is registered before the keyboard is visible, so even an instant
-        # tap is caught; the prompt becomes the thread's active one (which a newer menu
+        # tap is caught; the prompt becomes the window's active one (which a newer menu
         # supersedes) only once it is on screen; the cleanup covers the send too
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending_callbacks[pid] = fut
-        key = thread_id or 0
         idx = None
         try:
             if msg_id is None:
-                kw = {"message_thread_id": thread_id} if thread_id is not None else {}
-                msg = await self._in_window(
-                    thread_id,
-                    lambda: self._call(
-                        lambda: self.bot.send_message(chat_id, text, reply_markup=kb, **kw)
-                    ),
+                msg_id = await self._in_window(
+                    window, lambda: tx.send(window, text, reply_markup=kb)
                 )
-                if msg is None:
+                if msg_id is None:
                     return None, None  # the menu never rendered — don't hang for the timeout
-                msg_id = msg.message_id
             else:
-                await self._call(
-                    lambda: self.bot.edit_message_text(
-                        chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb
-                    )
-                )
-            self._active_prompt[key] = pid  # the tap this thread awaits — supersede can dismiss it
+                await tx.edit(window, msg_id, text, reply_markup=kb)
+            self._active_prompt[window] = pid  # the awaited tap: a newer menu can dismiss it
             try:
                 idx = await asyncio.wait_for(fut, 120)
             except TimeoutError:
                 idx = None
         finally:
             self.pending_callbacks.pop(pid, None)
-            if self._active_prompt.get(key) == pid:
-                del self._active_prompt[key]
+            if self._active_prompt.get(window) == pid:
+                del self._active_prompt[window]
         return (options[idx][1] if idx is not None else None), msg_id
 
-    def _is_inline(self, choice: str, thread_id: int | None) -> bool:
+    def _is_inline(self, choice: str, window: str) -> bool:
         """Whether a tapped entry is inline-able (returns text → render in place with
         Back) vs. one-off (mark triggered, it does its own output). Read from each
         command's own declaration — no list. `open:` (a launcher) is never inline."""
@@ -2504,148 +2637,139 @@ class Kernel(Transport):
             entry = self.registry.universals.get(val)
             return bool(entry and entry[5])
         if kind == "ccmd":
-            cls_id = self.owner_of(thread_id)
+            cls_id = self.owner_of(window)
             entry = self.registry.classes.get(cls_id) if cls_id else None
             return bool(entry and val in entry.commands and entry.commands[val][3])
         return False
 
-    def _supersede_prompt(self, key: int) -> None:
-        """Dismiss the tap a thread is currently awaiting (resolve it to None), so a
+    def _supersede_prompt(self, window: str) -> None:
+        """Dismiss the tap a window is currently awaiting (resolve it to None), so a
         second menu opened concurrently doesn't share the first's live nav state."""
-        pid = self._active_prompt.get(key)
+        pid = self._active_prompt.get(window)
         fut = self.pending_callbacks.get(pid) if pid else None
         if fut is not None and not fut.done():
             fut.set_result(None)
 
     @contextlib.asynccontextmanager
-    async def _menu_frame(self, chat_id, thread_id, title):
-        """Push one screen onto this thread's navigation stack for the duration; pop on
+    async def _menu_frame(self, window, title):
+        """Push one screen onto this window's navigation stack for the duration; pop on
         exit. A fresh session (a true root, or a concurrent one opened while another is
         awaiting a tap) supersedes any live prompt and gets its own list + owner token, so
         the superseded session cleans up only its own state, never the newcomer's."""
-        key = thread_id or 0
-        fresh = self._active_prompt.get(key) is not None or not self._nav.get(key)
+        fresh = self._active_prompt.get(window) is not None or not self._nav.get(window)
         if fresh:
-            self._supersede_prompt(key)
-            self._nav[key] = []  # a new list; a superseded session keeps its own reference
-            self._menu_msg[key] = None
+            self._supersede_prompt(window)
+            self._nav[window] = []  # a new list; a superseded session keeps its own reference
+            self._menu_msg[window] = None
             token = object()
-            self._menu_owner[key] = token
+            self._menu_owner[window] = token
         else:
-            token = self._menu_owner.get(key)
-        stack = self._nav[key]
+            token = self._menu_owner.get(window)
+        stack = self._nav[window]
         stack.append(title)
-        self._nav_pushes[key] = self._nav_pushes.get(key, 0) + 1
+        self._nav_pushes[window] = self._nav_pushes.get(window, 0) + 1
         try:
             yield
         finally:
             stack.pop()
-            if not stack and self._menu_owner.get(key) is token:
-                await self._strip_markup(chat_id, self._menu_msg.get(key))
-                self._menu_msg.pop(key, None)
-                self._nav.pop(key, None)
-                self._nav_pushes.pop(key, None)
-                self._menu_owner.pop(key, None)
+            if not stack and self._menu_owner.get(window) is token:
+                await self._strip_markup(window, self._menu_msg.get(window))
+                self._menu_msg.pop(window, None)
+                self._nav.pop(window, None)
+                self._nav_pushes.pop(window, None)
+                self._menu_owner.pop(window, None)
 
-    async def _screen(self, chat_id, thread_id, title, options) -> object:
-        """Render the top screen on this thread's shared menu message (fresh the first
+    async def _screen(self, window, title, options) -> object:
+        """Render the top screen on this window's shared menu message (fresh the first
         time), adding a Back button when the stack is deeper than its root. Returns
         the chosen option value, MENU_BACK, or None (dismiss)."""
-        key = thread_id or 0
         opts = list(options)
-        if len(self._nav.get(key, [])) > 1:
+        if len(self._nav.get(window, [])) > 1:
             opts.append(("⬅ Back", MENU_BACK))
-        choice, msg_id = await self._prompt_tap(
-            chat_id, thread_id, title, opts, self._menu_msg.get(key)
-        )
-        self._menu_msg[key] = msg_id
+        choice, msg_id = await self._prompt_tap(window, title, opts, self._menu_msg.get(window))
+        self._menu_msg[window] = msg_id
         return choice
 
-    async def menu(self, chat_id, thread_id, title, options) -> object:
+    async def menu(self, window, title, options) -> object:
         """Show a single-choice menu; return the chosen value (None if backed out or
-        dismissed). Nested automatically: opened while a menu is already live on this
-        thread, it renders as a submenu with Back to the parent (the nav-stack model —
+        dismissed). Nested automatically: opened while a menu is already live in this
+        window, it renders as a submenu with Back to the parent (the nav-stack model —
         a command that opens a menu becomes a submenu)."""
-        async with self._menu_frame(chat_id, thread_id, title):
-            choice = await self._screen(chat_id, thread_id, title, options)
+        async with self._menu_frame(window, title):
+            choice = await self._screen(window, title, options)
             return None if choice == MENU_BACK else choice
 
-    async def show_menu(self, chat_id: int, thread_id: int | None) -> None:
+    async def show_menu(self, window: str) -> None:
         """Drive the context menu as the root of the navigation stack. A tapped command
         that opens its own menu (via ctx.menu) pushes a child screen — Back returns
         here. An inline command shows its output as a child screen with Back. A plain
         one-off marks this screen triggered and dismisses the stack."""
-        key = thread_id or 0
-        async with self._menu_frame(chat_id, thread_id, "menu"):
+        async with self._menu_frame(window, "menu"):
             while True:
-                options = self._menu_options(thread_id)
+                options = self._menu_options(window)
                 label_of = {value: label for label, value in options}
-                choice = await self._screen(
-                    chat_id, thread_id, self._menu_header(thread_id), options
-                )
+                choice = await self._screen(window, self._menu_header(window), options)
                 if choice is None or choice == MENU_BACK:
                     return  # dismissed, or backed out of the root
-                mid = self._menu_msg[key]
+                mid = self._menu_msg[window]
                 kind, _, val = choice.partition(":")
                 if kind == "open":  # a launcher takes over → mark triggered, dismiss
-                    await self.edit_text(chat_id, mid, ui.triggered(label_of[choice]))
-                    await self._route_launch(chat_id, thread_id, val, "", self.owner_of(thread_id))
+                    await self.edit_text(window, mid, ui.triggered(label_of[choice]))
+                    await self._route_launch(window, val, "", self.owner_of(window))
                     return
-                if self._is_inline(choice, thread_id):
-                    body = await self._run_choice(chat_id, thread_id, kind, val)
+                if self._is_inline(choice, window):
+                    body = await self._run_choice(window, kind, val)
                     text = body if isinstance(body, str) and body.strip() else "done"
-                    async with self._menu_frame(chat_id, thread_id, "result"):
-                        back = await self._screen(chat_id, thread_id, text, [])
+                    async with self._menu_frame(window, "result"):
+                        back = await self._screen(window, text, [])
                     if back is None:  # dismissed on the result screen
                         return
                     continue  # Back → re-render the menu
                 # a command: it may open its own submenu(s) via ctx.menu. If it pushed a
                 # screen we stay here (Back from the submenu landed back on us); if it
                 # only acted, mark this screen triggered and dismiss.
-                before = self._nav_pushes.get(key, 0)
-                await self._run_choice(chat_id, thread_id, kind, val)
-                if self._nav_pushes.get(key, 0) > before:
+                before = self._nav_pushes.get(window, 0)
+                await self._run_choice(window, kind, val)
+                if self._nav_pushes.get(window, 0) > before:
                     continue
-                await self.edit_text(chat_id, mid, ui.triggered(label_of[choice]))
+                await self.edit_text(window, mid, ui.triggered(label_of[choice]))
                 return
 
-    async def _strip_markup(self, chat_id: int, msg_id: int | None) -> None:
+    async def _strip_markup(self, window: str, msg_id) -> None:
         if msg_id is not None:
-            await self._call(
-                lambda: self.bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id)
-            )
+            await self.transport_for(window).set_buttons(window, msg_id, None)
 
-    async def _run_choice(self, chat_id, thread_id, kind, val):
+    async def _run_choice(self, window, kind, val):
         """Run a tapped menu entry; return the handler's result (a str body for an
         inline command, else None)."""
         if kind == "cmd":
-            return await self._run_universal(chat_id, thread_id, val)
+            return await self._run_universal(window, val)
         if kind == "ccmd":
-            return await self._run_class_command(chat_id, thread_id, val)
+            return await self._run_class_command(window, val)
         return None
 
-    async def _run_universal(self, chat_id: int, thread_id: int | None, name: str):
+    async def _run_universal(self, window: str, name: str):
         entry = self.registry.universals.get(name)
         if entry is None:
             return None
         pid, attr, _help, _icon, _menu, _inline = entry
-        instance = self.instances.get(thread_id) if thread_id is not None else None
+        instance = self.instances.get(window)
         if not self._allowed(instance, "universal", name):
             return None
-        ctx = self._ctx(pid, None, chat_id, thread_id, name, "", instance)
+        ctx = self._ctx(pid, None, window, name, "", instance)
         self._bump(pid, name)
         return await getattr(self.plugin_by_id[pid], attr)(ctx)
 
-    async def _run_class_command(self, chat_id: int, thread_id: int | None, name: str):
-        instance = self.instances.get(thread_id) if thread_id is not None else None
-        cls_id = self.owner_of(thread_id)
+    async def _run_class_command(self, window: str, name: str):
+        instance = self.instances.get(window)
+        cls_id = self.owner_of(window)
         entry = self.registry.classes.get(cls_id) if cls_id else None
         if instance is None or entry is None or name not in entry.commands:
             return None
         if not self._allowed(instance, "class", name):
             return None
         attr, _help, _icon, _inline = entry.commands[name]
-        ctx = self._ctx(entry.plugin_id, None, chat_id, thread_id, name, "", instance)
+        ctx = self._ctx(entry.plugin_id, None, window, name, "", instance)
         self._bump(cls_id, name)
         return await getattr(instance, attr)(ctx)
 
@@ -2664,43 +2788,67 @@ class Kernel(Transport):
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
-    async def startup(self) -> None:
-        me = await self.bot.get_me()
-        self.bot_username = me.username
-        self.config.bot_username = me.username
-        self.config.save()
-        # rebuild live windows from persisted ownership
-        self.owners = {int(k): v for k, v in self.saved.get("owners", {}).items()}
-        names = self._names()
-        for tid, cls_id in list(self.owners.items()):
-            cls = self._class_by_id(cls_id)
-            if cls is None:
+    async def startup(self) -> list[Transport]:
+        """Connect each platform, revive the windows of those that connected and announce
+        the bot online. Returns the platforms that failed to connect: logged and left out
+        until `rejoin`."""
+        live, failed = [], []
+        for tx in self.transports:
+            try:
+                tx.bot_name = await tx.adapter.identity()
+            except Exception:
+                LOGGER.exception("%s failed to start; serving without it", tx.adapter.platform)
+                failed.append(tx)
                 continue
-            inst = self._instantiate(cls, tid, names.get(tid, cls_id))
+            live.append(tx)
+        self.transports = live
+        # rebuild live windows from persisted ownership (a window of a platform not
+        # connected now keeps its state and revives when that platform is back)
+        self.owners = dict(self.saved.get("owners", {}))
+        for tx in live:
+            await self._revive(tx)
+        await self._announce_online()
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        return failed
+
+    async def rejoin(self, tx: Transport, bot_name: str) -> None:
+        """A platform that failed at startup connected: serve it and revive its windows."""
+        tx.bot_name = bot_name
+        self.transports.append(tx)
+        await self._revive(tx)
+
+    async def _revive(self, tx: Transport) -> None:
+        """Bring back every owned window of `tx`'s platform from its saved state."""
+        names = self._names()
+        for window, cls_id in list(self.owners.items()):
+            cls = self._class_by_id(cls_id)
+            if cls is None or self.find_transport(window) is not tx:
+                continue
+            inst = self._instantiate(cls, window, names.get(window, cls_id))
             try:
                 await inst.on_revive()
             except Exception:
-                LOGGER.exception("on_revive failed for %s (%s)", tid, cls_id)
-        await self._announce_online()
-        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+                LOGGER.exception("on_revive failed for %s (%s)", window, cls_id)
 
     async def _announce_online(self) -> None:
-        """A readiness ping in General on every startup (the lobby heartbeat), plus a
-        ping in the topic that asked for the restart, if one recorded itself."""
-        if self.chat_id is None:
-            return
-        await self.send(self.chat_id, f"🟢 @{self.bot_username} online", None)
+        """A readiness ping in each bound platform's General on every startup (the lobby
+        heartbeat), plus a ping in the window that asked for the restart, if one recorded
+        itself."""
+        for tx in self.transports:
+            if tx.adapter.owner_id is not None:
+                await tx.send(tx.adapter.general, f"🟢 @{tx.bot_name} online")
         from tgforge.base.service import pop_restart_announce
 
-        tid = pop_restart_announce(self.config.home_path)
-        if tid is not None:
-            await self.send(self.chat_id, "🟢 back online after a restart", tid)
-            inst = self.instances.get(tid)
+        window = pop_restart_announce(self.config.home_path)
+        tx = self.find_transport(window) if window is not None else None
+        if tx is not None:
+            await tx.send(window, "🟢 back online after a restart")
+            inst = self.instances.get(window)
             if inst is not None:
                 try:
                     await inst.on_restarted()
                 except Exception:
-                    LOGGER.exception("on_restarted failed for %s", tid)
+                    LOGGER.exception("on_restarted failed for %s", window)
 
     async def broadcast_shutdown(self) -> None:
         """A graceful stop: flag it (drivers skip crash warnings) and let every live
@@ -2710,7 +2858,7 @@ class Kernel(Transport):
             try:
                 await inst.on_shutdown()
             except Exception:
-                LOGGER.exception("on_shutdown failed (%s)", inst.thread_id)
+                LOGGER.exception("on_shutdown failed (%s)", inst.window)
         try:
             await asyncio.wait_for(self.flush_frames(), SHUTDOWN_FLUSH)
         except TimeoutError:
@@ -2725,48 +2873,41 @@ class Kernel(Transport):
     async def _reconcile_loop(self) -> None:
         while True:
             await asyncio.sleep(RECONCILE_INTERVAL)
-            for tid in list(self.owners):
-                if not await self._thread_alive(tid):
-                    await self._drop_deleted(tid)
+            for window in list(self.owners):
+                if self.find_transport(window) is None:
+                    continue
+                if not await self._window_alive(window):
+                    await self._drop_deleted(window)
 
-    async def _thread_alive(self, thread_id: int) -> bool:
-        """Probe a thread invisibly by re-setting its own current title (a no-op edit, so
-        no "typing…" flicker every sweep); only an explicit 'thread not found' means gone.
-        A transient error is not treated as deletion. Untitled → the visible typing probe."""
-        name = self._names().get(thread_id)
-        await self._wait_flood()  # no call to the chat inside a flood-wait
+    async def _window_alive(self, window: str) -> bool:
+        """Probe a window through its adapter; only the adapter's explicit "gone" drops
+        it — an error is not treated as deletion."""
+        tx = self.transport_for(window)
+        await tx._wait_flood()  # no call inside a flood-wait
         try:
-            if name:
-                await self.bot.edit_forum_topic(
-                    chat_id=self.chat_id, message_thread_id=thread_id, name=name
-                )
-            else:
-                await self.bot.send_chat_action(
-                    chat_id=self.chat_id, action="typing", message_thread_id=thread_id
-                )
+            return await tx.adapter.window_alive(window, self._names().get(window))
+        except Exception as e:
+            if tx.adapter.classify(e) is None:
+                raise
             return True
-        except TelegramAPIError as e:
-            return "not found" not in str(e).lower()
 
-    async def _drop_deleted(self, thread_id: int) -> None:
-        inst = self.instances.get(thread_id)
+    async def _drop_deleted(self, window: str) -> None:
+        inst = self.instances.get(window)
         if inst is not None:
             try:
                 await self._teardown(inst)
             except Exception:
-                LOGGER.exception("on_close failed on delete (%s)", thread_id)
-        self.db.drop(window_ns(self.owners.get(thread_id, "core"), thread_id))
-        self._forget(thread_id)
+                LOGGER.exception("on_close failed on delete (%s)", window)
+        self.db.drop(window_ns(self.owners.get(window, "core"), window))
+        self._forget(window)
 
     # ── Routing ────────────────────────────────────────────────────
 
-    def _ctx(self, plugin_id, message, chat_id, thread_id, text, args, instance):
-        from_user = getattr(message, "from_user", None) if message else None
-        user_id = from_user.id if from_user else None
+    def _ctx(self, plugin_id, message, window, text, args, instance):
+        user_id = message.user_id if message is not None else None
         return Context(
             self,
-            chat_id,
-            thread_id,
+            window,
             message,
             text,
             args,
@@ -2789,92 +2930,81 @@ class Kernel(Transport):
             await ctx.send(result)  # through the window, like any reply
         return True
 
-    async def handle_message(self, message: Message) -> None:
-        self.note_message(message.message_thread_id, message.message_id)
-        text = (message.text or message.caption or "").strip()
-        has_media = bool(message.photo or message.document)
-        if not text and not has_media:
+    async def handle_message(self, message: Inbound) -> None:
+        window = message.window
+        tx = self.find_transport(window)
+        if tx is None:
             return
-        user_id = message.from_user.id if message.from_user else None
+        if not message.in_thread:
+            tx.note_message(window, message.message_id)
+        text = message.text.strip()
+        has_media = bool(message.attachments)
+        mentioned = message.mentioned
+        if not text and not has_media and not mentioned:
+            return
+        user_id = message.user_id
         if user_id is None:
             return
-        chat_id = message.chat.id
-        thread_id = message.message_thread_id
-        mentioned = f"@{self.bot_username}" in text
-        text = text.replace(f"@{self.bot_username}", "").strip()
 
-        if self.owner_id is None:
+        if tx.adapter.owner_id is None:
             if mentioned and text.lower().startswith("/init"):
-                self.owner_id = user_id
-                self.chat_id = chat_id
-                self.config.owner_id = user_id
-                self.config.chat_id = chat_id
-                self.config.save()
-                await self.send(chat_id, f"@{self.bot_username} initialized", thread_id)
+                await tx.adapter.bind_owner(user_id)
+                await tx.send(window, f"@{tx.bot_name} initialized")
             return
-        if chat_id != self.chat_id:
-            return  # user authorization is enforced by the auth middleware
-        if thread_id is not None and thread_id not in self.owners:
-            # a topic this bot doesn't own: when bots share one forum group both pass the
-            # chat_id check, so the non-owner must bow out here or it replies with help noise.
+        in_general = window == tx.adapter.general
+        if not in_general and window not in self.owners:
+            # a window this bot doesn't own: when bots share one group, the non-owner must
+            # bow out here or it replies with help noise.
             return
+        if message.echo:  # a command the platform did not show: post it first
+            echo = f"› {text}"
+            message.message_id = await self._in_window(window, lambda: tx.send(window, echo))
 
         # 1. a pending prompt (await_next / ask_text) wins first
-        pending = self._await_input.get(thread_id or 0)
+        pending = self._await_input.get(window)
         if pending is not None:
             if has_media and not text:
                 return  # a media-only message must not feed "" and cancel a text prompt
-            del self._await_input[thread_id or 0]
+            del self._await_input[window]
             await pending(text)
             return
 
-        in_general = thread_id is None
         if in_general and not mentioned:
             return  # General acts only on a mention
 
-        instance = self.instances.get(thread_id) if thread_id is not None else None
-        cls_id = self.owner_of(thread_id)
+        instance = self.instances.get(window)
+        cls_id = self.owner_of(window)
 
         if mentioned and not text and not has_media:
-            await self.show_menu(chat_id, thread_id)  # a bare @mention → summon the menu
+            await self.show_menu(window)  # a bare mention → summon the menu
             return
 
         # a window may take slashes as raw input (a shell): route them as text, not
         # commands. A mentioned slash still runs as a command (an explicit escape).
         raw_slash = instance is not None and not instance.slash_commands and not mentioned
         if text.startswith("/") and not raw_slash:
-            await self._route_slash(message, chat_id, thread_id, text, instance, cls_id)
+            await self._route_slash(message, window, text, instance, cls_id)
         else:
-            await self._route_text(message, chat_id, thread_id, text, instance, cls_id)
+            await self._route_text(message, window, text, instance, cls_id)
 
-    async def route_as_user(
-        self, thread_id: int | None, text: str, reply_to: int | None = None
-    ) -> None:
-        """Replay `text` through the router as if the owner typed it in `thread_id`,
+    async def route_as_user(self, window: str, text: str, reply_to=None) -> None:
+        """Replay `text` through the router as if the owner typed it in `window`,
         so a source other than a keystroke (a tapped suggestion) still hits slash/
         prefix routing — a `!cmd` button runs a shell, not an agent prompt.
         `reply_to` is the message id the replayed turn should reply to (the visible
         ack of a tapped suggestion)."""
-        msg = SimpleNamespace(
-            text=text,
-            caption=None,
-            photo=None,
-            document=None,
-            media_group_id=None,
-            message_id=reply_to,
-            from_user=SimpleNamespace(id=self.owner_id),
-            chat=SimpleNamespace(id=self.chat_id),
-            message_thread_id=thread_id,
+        message = Inbound(
+            window=window, message_id=reply_to, user_id=self.owner_for(window), text=text
         )
-        await self.handle_message(msg)
+        await self.handle_message(message)
 
     def _split(self, text: str) -> tuple[str, str]:
         parts = text.split(maxsplit=1)
-        cmd = parts[0].lower().split("@")[0]
+        cmd = parts[0].lower()
         args = parts[1].strip() if len(parts) > 1 else ""
         return cmd, args
 
-    async def _route_slash(self, message, chat_id, thread_id, text, instance, cls_id):
+    async def _route_slash(self, message, window, text, instance, cls_id):
         cmd, args = self._split(text)
         # escape prefix: N leading slashes bypass N-1 matching handler tiers, so a
         # command a higher tier would eat can be forced to the next one (e.g. //usage
@@ -2898,7 +3028,7 @@ class Kernel(Transport):
             cname = entry.resolve(cmd)
             if cname and self._allowed(instance, "class", cname) and not _skip():
                 attr, _help, _icon, inline = entry.commands[cname]
-                ctx = self._ctx(entry.plugin_id, message, chat_id, thread_id, text, args, instance)
+                ctx = self._ctx(entry.plugin_id, message, window, text, args, instance)
                 self._bump(cls_id, cname)
                 if await self._run_command(getattr(instance, attr), ctx, inline):
                     return
@@ -2911,7 +3041,7 @@ class Kernel(Transport):
             allowed = allowed and self._allowed(instance, "universal", uname)
             if allowed and not _skip():
                 plugin = self.plugin_by_id[pid]
-                ctx = self._ctx(pid, message, chat_id, thread_id, text, args, instance)
+                ctx = self._ctx(pid, message, window, text, args, instance)
                 self._bump(pid, uname)
                 if await self._run_command(getattr(plugin, attr), ctx, inline):
                     return
@@ -2919,80 +3049,80 @@ class Kernel(Transport):
         # launch command (new window / transform / ignored, by context)
         lname = self.registry.resolve_launch(cmd)
         if lname and not _skip():
-            if await self._route_launch(chat_id, thread_id, lname, args, cls_id):
+            if await self._route_launch(window, lname, args, cls_id):
                 return
 
         # on_message (sees slashes) then on_unknown, then the General-only fallback
-        if await self._route_catch(message, chat_id, thread_id, text, instance, cls_id, args):
+        if await self._route_catch(message, window, text, instance, cls_id, args):
             return
-        await self._unhandled(chat_id, thread_id)
+        await self._unhandled(window)
 
-    async def _route_launch(self, chat_id, thread_id, cmd, args, cls_id) -> bool:
+    async def _route_launch(self, window, cmd, args, cls_id) -> bool:
         cls = self.registry.launch_class[cmd]
         self._bump("core", cmd)
-        if thread_id is None:  # General → always a new window
-            await self.open_window(chat_id, cls, args or None)
+        if self.is_general(window):  # General → always a new window
+            await self.open_window(cls, args or None, origin=window)
             return True
         if cls_id == "core":  # a core window → new or transform (core class: always new)
             if cls.id == "core":
-                await self.open_window(chat_id, cls, args or None)
+                await self.open_window(cls, args or None, origin=window)
                 return True
             choice, _ = await self.ask_buttons(
-                chat_id,
-                thread_id,
+                window,
                 f"Open {cls.id}:",
                 [("New window", "new"), ("Transform this window", "transform")],
                 timeout=60,
                 announce=lambda label: f"🪄 {label}",
             )
             if choice == "new":
-                await self.open_window(chat_id, cls, args or None)
+                await self.open_window(cls, args or None, origin=window)
             elif choice == "transform":
-                await self.adopt(thread_id, cls)
+                await self.adopt(window, cls)
             return True
         return False  # any other window ignores the launch (falls through)
 
-    async def _route_catch(self, message, chat_id, thread_id, text, instance, cls_id, args) -> bool:
+    async def _route_catch(self, message, window, text, instance, cls_id, args) -> bool:
         if cls_id and cls_id in self.registry.classes and instance is not None:
             entry = self.registry.classes[cls_id]
             for attr in (entry.on_message, entry.on_unknown):
                 if attr is None:
                     continue
-                ctx = self._ctx(entry.plugin_id, message, chat_id, thread_id, text, args, instance)
+                ctx = self._ctx(entry.plugin_id, message, window, text, args, instance)
                 if await self._run(getattr(instance, attr), ctx):
                     return True
         return False
 
-    async def _route_text(self, message, chat_id, thread_id, text, instance, cls_id):
+    async def _route_text(self, message, window, text, instance, cls_id):
         # prefixes (universal, e.g. claude's ! / !!)
         for char, (pid, attr, _help) in self._sorted_prefixes():
             if text.startswith(char):
                 plugin = self.plugin_by_id[pid]
                 allowed = instance is None or instance.allow_universal
                 if allowed:
-                    ctx = self._ctx(pid, message, chat_id, thread_id, text, text, instance)
+                    ctx = self._ctx(pid, message, window, text, text, instance)
                     self._bump(pid, char)
                     if await self._run(getattr(plugin, attr), ctx):
                         return
-        if await self._route_catch(message, chat_id, thread_id, text, instance, cls_id, text):
+        if await self._route_catch(message, window, text, instance, cls_id, text):
             return
-        await self._unhandled(chat_id, thread_id)
+        await self._unhandled(window)
 
-    async def _unhandled(self, chat_id: int, thread_id: int | None) -> None:
+    async def _unhandled(self, window: str) -> None:
         """Input nothing consumed → the help text (which points at `/` for the menu).
         A plain reply, never the interactive menu: a stray keystroke should not pop a
         keyboard, and going silent leaves the user stuck."""
-        text = self.help_text(thread_id)
-        await self._in_window(thread_id, lambda: self.send(chat_id, text, thread_id))
+        text = self.help_text(window)
+        tx = self.transport_for(window)
+        await self._in_window(window, lambda: tx.send(window, text))
 
     def _sorted_prefixes(self):
         # longer prefixes first so `!!` beats `!`
         return sorted(self.registry.prefixes.items(), key=lambda kv: -len(kv[0]))
 
-    # ── Callbacks ──────────────────────────────────────────────────
+    # ── Taps ───────────────────────────────────────────────────────
 
-    async def handle_callback(self, callback: CallbackQuery) -> None:
-        data = callback.data or ""
+    async def handle_tap(self, tap: Tap) -> None:
+        data = tap.data or ""
         head = data.split(":")[0]
         if head in self.pending_callbacks:
             fut = self.pending_callbacks.get(head)
@@ -3004,23 +3134,22 @@ class Kernel(Transport):
             if cta is not None and cta[0] == "handoff":
                 await self._on_handoff(cta[1])
             elif act is not None:
-                await self._route_action(callback, act[0], act[1])
-        await self._call(lambda: callback.answer(), paced=False)  # a tap answer posts no message
+                await self._route_action(tap, act[0], act[1])
+        tx = self.find_transport(tap.window)
+        if tx is not None:  # a tap answer posts no message
+            await tx._call(lambda: tx.adapter.answer_tap(tap), paced=False)
 
-    async def _route_action(self, callback, name, arg) -> None:
-        msg = callback.message
-        thread_id = msg.message_thread_id if msg else None
-        instance = self.instances.get(thread_id) if thread_id is not None else None
-        cls_id = self.owner_of(thread_id)
+    async def _route_action(self, tap: Tap, name, arg) -> None:
+        window = tap.window
+        instance = self.instances.get(window)
+        cls_id = self.owner_of(window)
         if instance is None or not cls_id:
             return
         entry = self.registry.classes.get(cls_id)
         attr = entry.actions.get(name) if entry else None
         if attr is None:
             return
-        chat_id = msg.chat.id if msg else self.chat_id
-        ctx = self._ctx(entry.plugin_id, msg, chat_id, thread_id, "", arg, instance)
-        tapper = getattr(callback, "from_user", None)
-        if tapper is not None:
-            ctx.user_id = tapper.id  # the tapping user, not the bot that authored the message
+        # the tapped message, acted on by the tapping user
+        message = Inbound(window=window, message_id=tap.message_id, user_id=tap.user_id, text="")
+        ctx = self._ctx(entry.plugin_id, message, window, "", arg, instance)
         await getattr(instance, attr)(ctx, arg)

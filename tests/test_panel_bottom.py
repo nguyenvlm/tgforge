@@ -86,7 +86,8 @@ def test_a_mid_turn_message_re_anchors_without_a_heartbeat_paint(tmp_path):
         first = _panel_id(t)
         incoming = c.bot._id()
         c.bot.created.append((incoming, 555, "the user's message mid-turn"))
-        c.core.note_message(555, incoming)  # as handle_message records an inbound one
+        # as handle_message records an inbound one
+        c.core.transports[0].note_message("555", incoming)
         await drain(c, t)
         assert _panel_id(t) > incoming and first in c.bot.deleted
 

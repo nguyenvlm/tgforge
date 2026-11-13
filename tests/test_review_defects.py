@@ -86,7 +86,7 @@ def test_login_spawns_through_the_window(tmp_path):
 def test_gcloud_spawns_through_the_window(tmp_path):
     async def scenario():
         c = TestClient(Gcloud(), home=str(tmp_path))
-        inst = await c.core.open_window(c.core.chat_id, ShellTopic, "w")
+        inst = await c.core.open_window(ShellTopic, "w", origin="0")
         spawned = []
         real_spawn = inst.spawn
 
@@ -95,7 +95,7 @@ def test_gcloud_spawns_through_the_window(tmp_path):
             return await real_spawn("/bin/echo", "no url here", **kwargs)
 
         inst.spawn = spawn
-        ctx = c.core._ctx("gcloud", None, c.core.chat_id, inst.thread_id, "", "adc", inst)
+        ctx = c.core._ctx("gcloud", None, inst.window, "", "adc", inst)
         await c.core.plugin_by_id["gcloud"].gcloud(ctx)
         assert spawned and "gcloud" in spawned[0] and "--update-adc" in spawned[0]
         await inst._kill()
@@ -129,7 +129,7 @@ def test_the_shell_window_starts_in_the_agents_root(tmp_path):
         root.mkdir()
         write_roots(tmp_path, [str(root)])
         c = TestClient(Shell(), home=str(tmp_path))
-        inst = await c.core.open_window(c.core.chat_id, ShellTopic, "w")
+        inst = await c.core.open_window(ShellTopic, "w", origin="0")
         try:
             assert inst.saved["cwd"] == str(root.resolve())
         finally:

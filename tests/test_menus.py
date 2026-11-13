@@ -14,7 +14,7 @@ from tgforge.testing import TestClient
 def _topic(client, workspaces):
     claude = client.core.plugin_by_id["claude"]
     claude.workspaces = list(workspaces)
-    t = client.core._instantiate(ClaudeTopic, 555, "work")
+    t = client.core._instantiate(ClaudeTopic, "555", "work")
     t.workspace = str(workspaces[0]) if workspaces else ""
     t._save()
     return claude, t

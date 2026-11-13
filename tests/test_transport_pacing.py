@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from tgforge.base.kernel import Transport, _Pacer
+from tgforge.base.kernel import _Pacer
+from tgforge.testing import telegram_transport
 
 
 def _fake_clock(monkeypatch):
@@ -77,9 +78,10 @@ def test_call_essential_waits_for_a_slot_then_sends(monkeypatch):
             sent.append(text)
             return SimpleNamespace(message_id=1)
 
-        t = Transport(bot=SimpleNamespace(edit_message_text=rec), pace_per_min=60, pace_burst=1)
+        bot = SimpleNamespace(edit_message_text=rec)
+        t = telegram_transport(bot, pace_per_min=60, pace_burst=1)
         t._pacer.tokens = 0  # empty → an essential edit must wait a refill
-        landed = await t.edit(7, 42, "the reply")
+        landed = await t.edit("0", 42, "the reply")
         assert landed is True
         assert sent == ["the reply"]  # delivered, not dropped
         assert slept and slept[0] > 0  # it paced instead of racing to a 429
@@ -101,7 +103,7 @@ def test_pacer_concurrent_essentials_serialize(monkeypatch):
 
 
 def test_enable_pacing_flips_it_on():
-    t = Transport(bot=SimpleNamespace())
+    t = telegram_transport(SimpleNamespace())
     assert t._pacer.enabled is False  # off by default so tests never pace
     t.enable_pacing()
     assert t._pacer.enabled is True  # the live run turns it on

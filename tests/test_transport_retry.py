@@ -16,7 +16,8 @@ from aiogram.exceptions import (
     TelegramServerError,
 )
 
-from tgforge.base.kernel import TRANSIENT_BACKOFF, TRANSIENT_RETRIES, Transport
+from tgforge.base.kernel import TRANSIENT_BACKOFF, TRANSIENT_RETRIES
+from tgforge.testing import telegram_transport
 
 
 class _Flood(TelegramRetryAfter):
@@ -56,7 +57,7 @@ def _fake_clock(monkeypatch, start=1000.0):
 
 def test_call_reissues_after_flood_wait():
     async def scenario():
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _flooding(1)
         result = await t._call(lambda: attempt())
         assert result == "sent"  # the retry succeeded, no RuntimeError
@@ -71,7 +72,7 @@ def test_essential_waits_the_full_retry_after_then_lands_once(monkeypatch):
 
     async def scenario():
         slept = _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _flooding(1, retry_after=45)
         out = await t._call(lambda: attempt())
         assert out == "sent"
@@ -84,7 +85,7 @@ def test_essential_waits_the_full_retry_after_then_lands_once(monkeypatch):
 def test_essential_retries_until_it_lands(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _flooding(4, retry_after=1)
         assert await t._call(lambda: attempt()) == "sent"  # never given up on
         assert state["calls"] == 5
@@ -108,7 +109,7 @@ def test_essential_calls_go_out_in_issue_order(monkeypatch):
             order.append(tag)
             return tag
 
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         await asyncio.gather(*[t._call(lambda tag=tag: send(tag)) for tag in ("first", "second")])
         assert order == ["first", "second"]
 
@@ -119,7 +120,7 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
     """An md render over MAX_MSG (MarkdownV2 escaping inflates a live panel past the
     limit) must never be hard-cut and sent — its final words would vanish mid-word.
     edit_md skips the oversized md and edits the caller-bounded plain in full."""
-    from tgforge.base.kernel import MAX_MSG, Transport
+    from tgforge.base.kernel import MAX_MSG
 
     async def scenario():
         sent = []
@@ -128,10 +129,10 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
             sent.append(text)
             return SimpleNamespace(message_id=kw.get("message_id"))
 
-        t = Transport(bot=SimpleNamespace(edit_message_text=rec))
+        t = telegram_transport(SimpleNamespace(edit_message_text=rec))
         md = "*" + "x" * (MAX_MSG + 500) + " MD_TAIL"  # would be cut at MAX_MSG
         plain = "the reply body ends with PLAIN_TAIL_KEPT"
-        landed = await t.edit_md(7, 42, md, plain)
+        landed = await t.edit_md("0", 42, md, plain)
         assert landed is True
         assert len(sent) == 1  # the oversized md attempt was skipped entirely
         assert sent[0] == plain  # full plain, tail intact
@@ -143,7 +144,7 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
 def test_flood_records_the_exact_deadline(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, _ = _flooding(1, retry_after=300)
         assert await t._call(lambda: attempt()) == "sent"
         assert t.flood_until == 1300.0  # the exact retry_after deadline
@@ -193,7 +194,7 @@ def test_a_5xx_or_network_error_is_retried_with_backoff(monkeypatch, caplog):
 
     async def scenario():
         slept = _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _failing([_ServerError(), _NetworkError()])
         with caplog.at_level(logging.WARNING, logger="tgforge"):
             assert await t._call(lambda: attempt()) == "sent"
@@ -207,7 +208,7 @@ def test_a_5xx_or_network_error_is_retried_with_backoff(monkeypatch, caplog):
 def test_a_lasting_5xx_gives_up_after_the_bound(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _failing([_ServerError() for _ in range(10)])
         assert await t._call(lambda: attempt()) is None
         assert state["calls"] == TRANSIENT_RETRIES + 1
@@ -218,7 +219,7 @@ def test_a_lasting_5xx_gives_up_after_the_bound(monkeypatch):
 def test_a_4xx_gets_one_try(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         attempt, state = _failing([_BadRequest()])
         assert await t._call(lambda: attempt()) is None
         assert state["calls"] == 1
@@ -229,7 +230,7 @@ def test_a_4xx_gets_one_try(monkeypatch):
 def test_a_transient_retry_waits_out_a_flood_recorded_during_its_backoff(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace())
+        t = telegram_transport(SimpleNamespace())
         tries = []
 
         async def attempt():
@@ -248,7 +249,7 @@ def test_a_transient_retry_waits_out_a_flood_recorded_during_its_backoff(monkeyp
 def test_a_transient_retry_takes_a_pacer_slot(monkeypatch):
     async def scenario():
         _fake_clock(monkeypatch)
-        t = Transport(bot=SimpleNamespace(), pace_per_min=6, pace_burst=1)  # 10 s refill
+        t = telegram_transport(SimpleNamespace(), pace_per_min=6, pace_burst=1)  # 10 s refill
         tries = []
 
         async def attempt():

@@ -1,13 +1,14 @@
 """In-process test harness: drive a bot with plain calls, read what it sent.
 
-`TestClient` wraps a live Kernel over a `MockBot` (a recording aiogram stand-in),
-so tests exercise routing/menus/prompts with no real Telegram and no network.
+`TestClient` wraps a live Kernel over the real `TelegramAdapter` on a `MockBot` (a
+recording aiogram stand-in), so tests exercise routing/menus/prompts with no real
+Telegram and no network.
 Blocking prompts (a picker, the menu, a Back loop) run as a background task so a
 test can `tap` the button that unblocks them.
 
     bot = TestClient(Shell(), Localfs())
     await bot.send("@bot /shell")          # open a window in General
-    await bot.send("ls", thread_id=bot.window)
+    await bot.send("ls", window=bot.window)
     await bot.tap("🖥 Shell")              # tap a menu button by its label
     assert "pong" in bot.replies
 
@@ -22,8 +23,54 @@ import tempfile
 from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
+from tgforge.base.kernel import Inbound, Kernel, Transport
+from tgforge.base.telegram import TelegramAdapter
 from tgforge.base.ui import blabel
+
+
+def telegram_transport(bot, config: BotConfig | None = None, **pacing) -> Transport:
+    """A `Transport` over the real `TelegramAdapter` on `bot` (chat 1 by default)."""
+    config = config or BotConfig(token="x", chat_id=1)
+    return Transport(TelegramAdapter(bot, config), **pacing)
+
+
+def telegram_kernel(bot, config: BotConfig, plugins: list) -> Kernel:
+    """A `Kernel` serving Telegram alone over `bot`, its identity already known."""
+    transport = telegram_transport(bot, config)
+    transport.bot_name = config.bot_username
+    return Kernel(config, plugins, [transport])
+
+
+def telegram_inbound(
+    text: str,
+    window: str | None = None,
+    user_id: int = 1,
+    chat_id: int = 100,
+    username: str = "bot",
+    message_id: int = 1,
+    **fields,
+) -> Inbound | None:
+    """The `Inbound` the real `TelegramAdapter` makes of a group message (General when
+    `window` is None); `fields` are extra Telegram message attributes."""
+    adapter = TelegramAdapter(None, BotConfig(token="x", chat_id=chat_id, bot_username=username))
+    message = SimpleNamespace(
+        message_id=message_id,
+        text=text,
+        caption=None,
+        photo=None,
+        document=None,
+        from_user=SimpleNamespace(id=user_id),
+        chat=SimpleNamespace(id=chat_id),
+        message_thread_id=adapter._thread(window or adapter.general),
+    )
+    for name, value in fields.items():
+        setattr(message, name, value)
+    return adapter.to_inbound(message)
+
+
+def kernel_bot(kernel: Kernel):
+    """The mock bot behind a `telegram_kernel`."""
+    return kernel.transports[0].adapter.bot
 
 
 class MockBot:
@@ -104,6 +151,9 @@ class MockBot:
     async def send_chat_action(self, **kw):
         return True
 
+    async def answer_callback_query(self, callback_query_id, **kw):
+        return True
+
     async def delete_message(self, chat_id, message_id):
         self.deleted.append(message_id)
         self.screen_log.append(("delete", message_id, None))
@@ -151,15 +201,17 @@ class TestClient:
             chat_id=chat_id,
             bot_username=username,
         )
-        self.core = Kernel(self.bot, cfg, list(plugins))
-        self.core.bot_username = username
+        self.core = telegram_kernel(self.bot, cfg, list(plugins))
+        self.adapter: TelegramAdapter = self.core.transports[0].adapter
         self._chat = chat_id
         self._user = owner_id if owner_id is not None else 1
         self._pending: list[asyncio.Task] = []
 
     # ── Driving ────────────────────────────────────────────────────
-    def _msg(self, text, thread_id):
-        """An owner message; it takes the next id in the chat, as in Telegram."""
+    def _msg(self, text, window):
+        """An owner message in `window`; it takes the next id in the chat, as in
+        Telegram."""
+        thread_id = self.adapter._thread(window or self.adapter.general)
         message_id = self.bot._id()
         self.bot.created.append((message_id, thread_id, text))
         return SimpleNamespace(
@@ -173,11 +225,12 @@ class TestClient:
             message_thread_id=thread_id,
         )
 
-    async def send(self, text: str, thread_id: int | None = None) -> TestClient:
-        """Deliver a message. A message that opens a blocking prompt runs in the
-        background so the test can `tap` to unblock it; a plain command completes
-        before this returns."""
-        task = asyncio.create_task(self.core.handle_message(self._msg(text, thread_id)))
+    async def send(self, text: str, window: str | None = None) -> TestClient:
+        """Deliver a message (General when `window` is None) through the adapter's update
+        conversion. A message that opens a blocking prompt runs in the background so the
+        test can `tap` to unblock it; a plain command completes before this returns."""
+        inbound = self.adapter.to_inbound(self._msg(text, window))
+        task = asyncio.create_task(self.core.handle_message(inbound))
         self._pending.append(task)
         await self._breathe()
         return self
@@ -189,8 +242,10 @@ class TestClient:
             data = self._find_button(label)
             if data is not None:
                 self.bot.last_markup = None
-                cb = SimpleNamespace(data=data, message=None, answer=self._answer)
-                await self.core.handle_callback(cb)
+                cb = SimpleNamespace(
+                    id="tap", data=data, message=None, from_user=SimpleNamespace(id=self._user)
+                )
+                await self.core.handle_tap(self.adapter.to_tap(cb))
                 await self._breathe()
                 return self
         raise AssertionError(f"button {label!r} never rendered")
@@ -214,9 +269,6 @@ class TestClient:
     async def _breathe(self) -> None:
         for _ in range(5):
             await asyncio.sleep(0)
-
-    async def _answer(self, *a, **k):
-        return None
 
     def _find_button(self, label: str) -> str | None:
         kb = self.bot.last_markup
@@ -245,6 +297,6 @@ class TestClient:
         return [btn.text for row in kb.inline_keyboard for btn in row]
 
     @property
-    def window(self) -> int | None:
-        """The most recently opened window's thread id (None if none)."""
+    def window(self) -> str | None:
+        """The most recently opened window's key (None if none)."""
         return next(iter(reversed(list(self.core.owners))), None)

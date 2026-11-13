@@ -43,9 +43,10 @@ from tgforge.base.kernel import (
 from tgforge.base.service import service_manager
 from tgforge.base.ui import (
     MAX_MSG,
+    Pages,
+    code_block,
     expandable_pages,
     fmt_duration,
-    mdv2_escape,
     shell_md,
     shell_view,
 )
@@ -99,6 +100,7 @@ PERMISSION_MODES = ("auto", "acceptEdits", "bypassPermissions", "dontAsk", "manu
 DEFAULT_PERMISSION_MODE = "auto"
 
 
+# the session note's rules; `{…}` fields are the window's platform and its limits
 SESSION_BRIEF = (
     "Interactive tools (AskUserQuestion) are unavailable — "
     "when a decision is needed, state it plainly and stop. Always end your message "
@@ -107,15 +109,33 @@ SESSION_BRIEF = (
     "that sends that text as the user's next message. Files the user attaches or "
     "forwards (any type, photos included) are downloaded locally and their paths "
     "listed in the prompt's [Attached file(s)] block; if the user mentions a sent "
-    "file with no path, look for the newest matching file there (20MB bot-API "
-    "download cap). To send the user a file, end your message with one line per "
-    "file: `[[attach]] /absolute/path` — sent after the text as a photo (images "
-    "≤10MB) or a document (≤50MB); the marker line never renders. Do "
-    "not use Markdown tables in replies — Telegram renders them as raw text, not a "
-    "grid; present tabular data as short labeled lines or a bullet list instead. "
-    "Keep lists one level deep — no nested bullets; group detail into short "
+    "file with no path, look for the newest matching file there ({download_cap} "
+    "{platform} download cap). To send the user a file, end your message with one line "
+    "per file: `[[attach]] /absolute/path` — sent after the text as a photo (images "
+    "≤{photo_cap}) or a document (≤{upload_cap}); the marker line never renders. "
+    "{table_rule}Keep lists one level deep — no nested bullets; group detail into short "
     "paragraphs led by a bold label instead."
 )
+TABLE_RULE = (
+    "Do not use Markdown tables in replies — {platform} renders them as raw text, not a "
+    "grid; present tabular data as short labeled lines or a bullet list instead. "
+)
+
+
+def _size_cap(size: int) -> str:
+    return f"{size // (1024 * 1024 * 1024)}GB" if size >= 1024**3 else f"{size // (1024 * 1024)}MB"
+
+
+def session_brief(adapter) -> str:
+    """`SESSION_BRIEF` filled in with `adapter`'s platform name and limits."""
+    table_rule = "" if adapter.renders_tables else TABLE_RULE.format(platform=adapter.platform)
+    return SESSION_BRIEF.format(
+        platform=adapter.platform,
+        download_cap=_size_cap(adapter.download_max),
+        photo_cap=_size_cap(adapter.photo_max),
+        upload_cap=_size_cap(adapter.upload_max),
+        table_rule=table_rule,
+    )
 
 
 def _project_dir(config_dir: Path, workspace: Path) -> Path:
@@ -146,8 +166,8 @@ class ClaudeTopic(Topic):
     icon = "🤖"
     menu_label = "Claude"
 
-    def __init__(self, core, thread_id, name, saved):
-        super().__init__(core, thread_id, name, saved)
+    def __init__(self, core, window, name, saved):
+        super().__init__(core, window, name, saved)
         # persisted (window store)
         self.session_id = str(uuid.uuid4())
         self.model: str | None = None
@@ -193,20 +213,16 @@ class ClaudeTopic(Topic):
         self._albums: dict[str, dict] = {}
 
     # ── Convenience ────────────────────────────────────────────────
-    @property
-    def bot(self):
-        return self._core.bot
-
-    @property
-    def chat_id(self):
-        return self._core.chat_id
-
     def _env_tag(self) -> str:
-        """The `[via Telegram bot · …]` locator leading the session note: which
-        bot, its process manager, and where it runs. Absent fields are dropped."""
+        """The `[via <platform> bot · …]` locator leading the session note: which
+        bot on which platform, its process manager, and where it runs. Absent fields are
+        dropped."""
         cfg = self._core.config
-        name = (cfg.service or cfg.bot_username or "tgforge").strip()
-        parts = [f"via Telegram bot · {name[:1].upper() + name[1:]}", service_manager()]
+        name = (cfg.service or self.adapter.bot_name or "tgforge").strip()
+        parts = [
+            f"via {self.adapter.platform} bot · {name[:1].upper() + name[1:]}",
+            service_manager(),
+        ]
         if cfg.service:
             parts.append(f"service `{cfg.service}`")
         parts.append(f"home {cfg.home}")
@@ -229,15 +245,16 @@ class ClaudeTopic(Topic):
         return p.brief_resolved
 
     def _session_note(self) -> str:
-        """The Telegram note — env tag, `SESSION_BRIEF`, app brief — every turn of the
+        """The session note — env tag, `SESSION_BRIEF`, app brief — every turn of the
         CLI process runs under (a slash skill too)."""
         extra = self._app_brief()
-        return f"{self._env_tag()} {SESSION_BRIEF}" + (f"\n{extra}" if extra else "")
+        brief = session_brief(self.adapter)
+        return f"{self._env_tag()} {brief}" + (f"\n{extra}" if extra else "")
 
     def _session_note_file(self) -> Path:
         """This window's note file in the bot home, passed as `--append-system-prompt-file`
         (a file, not an argument: a long app brief would pass the kernel's argument cap)."""
-        return self._core.config.home_path / "session_notes" / f"{self.thread_id or 0}.md"
+        return self._core.config.home_path / "session_notes" / f"{self.window}.md"
 
     def _write_session_note(self) -> Path:
         path = self._session_note_file()
@@ -383,8 +400,8 @@ class ClaudeTopic(Topic):
             cmd += ["--system-prompt-file", str(prompt_file)]
         cmd += ["--append-system-prompt-file", str(self._write_session_note())]
         env = self._login_env(self._session_config_dir())
-        env["TELEGRAM_THREAD_ID"] = str(self.thread_id or 0)
-        env["TELEGRAM_BOT_DRIVEN"] = "1"
+        env["TGFORGE_WINDOW"] = self.window
+        env["TGFORGE_BOT_DRIVEN"] = "1"
         proc = await self.spawn(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -420,7 +437,7 @@ class ClaudeTopic(Topic):
         messages) after every step queued before it, as its own task, and return the
         task. Every message of the window goes through here (directly, or via the
         `send`/`delete` family and `run_message_call`), so the order on screen is the order of
-        the queue and no reader or loop ever waits on Telegram."""
+        the queue and no reader or loop ever waits on the platform."""
         previous = self.send_chain
 
         async def run():
@@ -608,9 +625,12 @@ class ClaudeTopic(Topic):
         await self._stop_heartbeat()
         note = "⏸ interrupted by a restart — resuming shortly"
         lines, _, _ = render_timeline(turn.timeline, drop_last_text=False)
-        pages = expandable_pages(self._summary(turn, time.monotonic()), lines)
-        md, plain = pages[0]
-        await self.land_frame(turn.card_id, f"{plain}\n\n{note}", f"{md}\n\n{mdv2_escape(note)}")
+        pages = expandable_pages(
+            self._summary(turn, time.monotonic()), lines, self.adapter.page_size
+        )
+        shown = Pages(pages.summary, pages.pages[:1], note)
+        if await self.land_frame(turn.card_id, None, shown):
+            await self.send_md(shown, first_id=turn.card_id)  # Slack: page 1 in the thread
 
     def _warn_interrupted(self):
         """Flag a turn cut short by a dead process — but stay silent on a graceful
@@ -846,7 +866,7 @@ class ClaudeTopic(Topic):
         self, result_text, subtype="success", is_error=False, context_window=None
     ):
         """The turn boundary, atomic vs submit()'s ack+queue: close the turn and queue
-        its settle (`_settle_turn`) as a send step. No Telegram call under the lock."""
+        its settle (`_settle_turn`) as a send step. No platform call under the lock."""
         async with self.lock:
             # busy stays True; the reader clears it atomically with the kill/keep
             # decision, so a message right after the boundary queues for the next turn
@@ -897,17 +917,18 @@ class ClaudeTopic(Topic):
             await self.delete(card_id)
             card_id = None
         lines, _, _ = render_timeline(turn.timeline, drop_last_text=ans.completed)
-        pages = expandable_pages(self._summary(turn, ended, ans.completed), lines)
-        md, plain = pages[0]
+        pages = expandable_pages(
+            self._summary(turn, ended, ans.completed), lines, self.adapter.page_size
+        )
         landed = False
         if card_id is not None:
-            landed = await self.land_frame(card_id, plain, md)
+            landed = await self.land_frame(card_id, None, pages)
             if not landed:
                 await self.delete(card_id)
-        if not landed:
-            await self.send_md(md, plain, reply_to=turn.reply_to)
-        for md, plain in pages[1:]:
-            await self.send_md(md, plain)
+        if landed:  # the card is message 1: the rest follow it
+            await self.send_md(pages, first_id=card_id)
+        else:
+            await self.send_md(pages, reply_to=turn.reply_to)
         markup = self._suggestion_markup(ans.options) if ans.options else None
         await self.send_rich(ans.text, reply_markup=markup)
         for p in ans.attachments:
@@ -963,15 +984,15 @@ class ClaudeTopic(Topic):
         if info and idx.isdigit():
             option = info["options"][int(idx)]
             # record the pick as a visible message so the tap is confirmed even if
-            # routing fails; the turn then replies to it (Telegram won't post as the user)
+            # routing fails; the turn then replies to it (a bot can't post as the user)
             recorded = await self.send(f"☑️ {option}")
-            await self._core.route_as_user(self.thread_id, option, reply_to=recorded)
+            await self._core.route_as_user(self.window, option, reply_to=recorded)
 
     # ── Mirror (non-driven sessions from the transcript) ───────────
     async def _mirror_loop(self):
         while True:
             await asyncio.sleep(MIRROR_INTERVAL)
-            if self.chat_id is None or self.busy or self.owned:
+            if self.busy or self.owned:
                 continue
             try:
                 if await self._mirror_once():
@@ -1029,7 +1050,7 @@ class ClaudeTopic(Topic):
                 return
             self.mirror_tick += 1
             frame = "✶✸✹✺✹✸"[self.mirror_tick % 6]
-            word = WORDS[(self.thread_id + self.mirror_tick // 8) % len(WORDS)]
+            word = WORDS[(sum(self.window.encode()) + self.mirror_tick // 8) % len(WORDS)]
             elapsed = int(now - self.mirror_start)
             n = self.mirror_tools
             plural = "s" if n != 1 else ""
@@ -1139,10 +1160,10 @@ class ClaudeTopic(Topic):
 
     # ── Media routing ──────────────────────────────────────────────
     def _attach_dir(self) -> Path:
-        return Path(self.workspace) / "tmp" / "telegram"
+        return Path(self.workspace) / "tmp" / "attachments"
 
     async def _route_media(self, message, text):
-        gid = message.media_group_id
+        gid = message.album
         if not gid:
             built = await self._build_prompt([message], text)
             if built:
@@ -1170,32 +1191,19 @@ class ClaudeTopic(Topic):
 
     def _context_prefix(self, message) -> str:
         notes: list[str] = []
-        fo = getattr(message, "forward_origin", None)
-        fname = None
-        if fo is not None:
-            user = getattr(fo, "sender_user", None)
-            chat = getattr(fo, "sender_chat", None) or getattr(fo, "chat", None)
-            fname = (
-                getattr(user, "full_name", None)
-                or getattr(fo, "sender_user_name", None)
-                or getattr(chat, "title", None)
-                or "an unknown source"
-            )
-        if fname:
-            notes.append(f"[Forwarded message from {fname}]")
-        reply = getattr(message, "reply_to_message", None)
-        if reply is not None and not getattr(reply, "forum_topic_created", None):
-            rtext = (reply.text or reply.caption or "").strip()
-            has_file = bool(reply.photo or reply.document)
+        if message.forward_source:
+            notes.append(f"[Forwarded message from {message.forward_source}]")
+        if message.replied_text is not None:
+            rtext = message.replied_text
+            has_file = bool(message.replied_attachments)
             if rtext or has_file:
-                quote = getattr(message, "quote", None)
                 label, quoted = (
-                    ("Quoting", quote.text)
-                    if quote is not None and quote.text
+                    ("Quoting", message.quote)
+                    if message.quote
                     else ("Replying to", rtext or "(attachment)")
                 )
                 tail = " [with attachment]" if has_file and rtext else ""
-                who = reply.from_user.full_name if reply.from_user else "someone"
+                who = message.replied_author or "someone"
                 notes.append(f"[{label} {who}: {quoted}{tail}]")
         return "\n".join(notes)
 
@@ -1206,30 +1214,23 @@ class ClaudeTopic(Topic):
             parts.append(ctx)
         if text:
             parts.append(text)
-        sources = list(msgs) + [getattr(msgs[0], "reply_to_message", None)]
-        paths: list[Path] = []
-        for src in sources:
-            paths += await self._download_attachments(src)
+        attachments = [a for m in msgs for a in m.attachments] + msgs[0].replied_attachments
+        paths = await self._download_attachments(attachments)
         if paths:
             listing = "\n".join(str(p) for p in paths)
             parts.append(f"[Attached file(s), saved locally — Read to view:\n{listing}\n]")
         return "\n\n".join(parts).strip()
 
-    async def _download_attachments(self, message) -> list[Path]:
+    async def _download_attachments(self, attachments) -> list[Path]:
         out: list[Path] = []
-        if message is None:
-            return out
-        if message.photo:
-            dest = self._attach_dir() / f"{uuid.uuid4().hex}.jpg"
-            p = await self._core.download_file(message.photo[-1].file_id, dest)
-            if p:
-                out.append(p)
-        if message.document:
-            safe = Path(message.document.file_name).name if message.document.file_name else ""
-            dest = self._attach_dir() / (
-                f"{uuid.uuid4().hex[:8]}__{safe}" if safe else f"{uuid.uuid4().hex}.bin"
-            )
-            p = await self._core.download_file(message.document.file_id, dest)
+        for attachment in attachments:
+            safe = Path(attachment.name).name if attachment.name else ""
+            if safe:
+                dest = self._attach_dir() / f"{uuid.uuid4().hex[:8]}__{safe}"
+            else:
+                ext = "jpg" if attachment.kind == "photo" else "bin"
+                dest = self._attach_dir() / f"{uuid.uuid4().hex}.{ext}"
+            p = await self.download_file(attachment, dest)
             if p:
                 out.append(p)
         return out
@@ -1539,9 +1540,8 @@ class ClaudeTopic(Topic):
     async def cli(self, ctx):
         cfg = str(self._session_config_dir())
         line = f"cd {self.workspace} && CLAUDE_CONFIG_DIR={cfg} claude --resume {self.session_id}"
-        intro = mdv2_escape("Continue this session on your computer — paste this into a terminal:")
-        fenced = line.replace("\\", "\\\\").replace("`", "\\`")  # a tap-to-copy code block
-        await self.send_rich(f"{intro}\n\n```\n{fenced}\n```")
+        intro = "Continue this session on your computer — paste this into a terminal:"
+        await self.send_rich(f"{intro}\n\n{code_block(line)}")  # a tap-to-copy code block
 
     @command("/rename", "rename this window (auto-titles if no name given)", icon="✏️")
     async def rename_cmd(self, ctx):

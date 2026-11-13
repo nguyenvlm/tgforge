@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from tgforge.plugins.claude import ClaudeTopic
+from tgforge.testing import telegram_inbound
 
 
 def _reply(text=None, caption=None, photo=None, document=None, topic_created=None):
@@ -19,11 +20,8 @@ def _reply(text=None, caption=None, photo=None, document=None, topic_created=Non
 
 
 def _msg(reply, quote=None):
-    return SimpleNamespace(
-        text="what about this?",
-        forward_origin=None,
-        reply_to_message=reply,
-        quote=quote,
+    return telegram_inbound(
+        "what about this?", forward_origin=None, reply_to_message=reply, quote=quote
     )
 
 
@@ -48,13 +46,18 @@ def test_reply_with_selected_part_carries_only_the_quote():
 
 
 def test_quote_of_captioned_attachment_keeps_attachment_tail():
-    reply = _reply(caption="a caption with the selected words", photo=[object()])
+    reply = _reply(
+        caption="a caption with the selected words", photo=[SimpleNamespace(file_id="p")]
+    )
     note = _prefix(_msg(reply, quote=_quote("selected words")))
     assert note == "[Quoting Alice: selected words [with attachment]]"
 
 
 def test_reply_to_media_only_message_is_attachment():
-    assert _prefix(_msg(_reply(document=object()))) == "[Replying to Alice: (attachment)]"
+    assert (
+        _prefix(_msg(_reply(document=SimpleNamespace(file_id="d", file_name=None))))
+        == "[Replying to Alice: (attachment)]"
+    )
 
 
 def test_reply_to_topic_opening_message_adds_no_note():

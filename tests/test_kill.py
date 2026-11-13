@@ -38,7 +38,7 @@ class _FakeProc:
 
 
 def _topic(c, tmp_path, jobs):
-    t = c.core._instantiate(ClaudeTopic, 555, "work")
+    t = c.core._instantiate(ClaudeTopic, "555", "work")
     t.busy = False
     t.background_tasks = {
         bid: {"path": str(tmp_path / f"{bid}.output"), "label": label, "start": 0.0, "done": done}
@@ -218,7 +218,7 @@ def test_kill_mid_turn_keeps_the_card_below_the_note(tmp_path, monkeypatch):
 
         await t._finalize_turn("all done")
         await drain(c, t)
-        shown = screen(c, 555)
+        shown = screen(c, "555")
         ids = [mid for mid, _text in shown]
         note_id = next(mid for mid, text in shown if text == "stopping tests…")
         answer_id = next(mid for mid, text in shown if text == "all done")

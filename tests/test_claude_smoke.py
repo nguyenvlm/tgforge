@@ -9,8 +9,8 @@ import stat
 from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
 from tgforge.plugins.claude import Claude, ClaudeTopic
+from tgforge.testing import kernel_bot, telegram_kernel
 
 FAKE_CLI = """#!/usr/bin/env python3
 import sys, json
@@ -70,7 +70,7 @@ def _fake_cli(tmp_path):
 
 def _kernel(tmp_path):
     cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
-    return Kernel(MockBot(), cfg, [Claude()])
+    return telegram_kernel(MockBot(), cfg, [Claude()])
 
 
 def test_registration(tmp_path):
@@ -89,13 +89,14 @@ def test_one_turn_against_fake_cli(tmp_path):
         claude.claude_dir = tmp_path / ".claude"
         claude.workspaces = [tmp_path]
         # build a window without the interactive on_open pickers
-        t = core._instantiate(ClaudeTopic, 555, "work")
+        t = core._instantiate(ClaudeTopic, "555", "work")
         t.workspace = str(tmp_path)
 
         await t.submit("hello there")
 
         async def answered():
-            return any("ANSWER" in e for e in core.bot.sent)  # the answer is its own message
+            # the answer is its own message
+            return any("ANSWER" in e for e in kernel_bot(core).sent)
 
         waited = 0.0
         while waited < 6.0 and not await answered():

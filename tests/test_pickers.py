@@ -14,7 +14,7 @@ from tgforge.testing import TestClient
 def test_ask_text_typed_reply_returns_the_text(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        task = asyncio.create_task(c.core.ask_text(100, None, "Path?"))
+        task = asyncio.create_task(c.core.ask_text("0", "Path?"))
         await c.pump()
         assert "✖ Cancel" in c.buttons  # a prompt is escapable
         await c.send("some/typed/path")  # feeds the pending prompt
@@ -26,7 +26,7 @@ def test_ask_text_typed_reply_returns_the_text(tmp_path):
 def test_ask_text_cancel_tap_returns_none(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        task = asyncio.create_task(c.core.ask_text(100, None, "Path?"))
+        task = asyncio.create_task(c.core.ask_text("0", "Path?"))
         await c.pump()
         await c.tap("✖ Cancel")
         assert await asyncio.wait_for(task, 2) is None
@@ -38,7 +38,7 @@ def test_ask_text_cancel_tap_returns_none(tmp_path):
 
 
 def _topic(client: TestClient) -> Topic:
-    return Topic(client.core, None, "picker", None)
+    return Topic(client.core, "0", "picker", None)
 
 
 def test_pick_dir_descend_then_use_returns_that_folder(tmp_path):

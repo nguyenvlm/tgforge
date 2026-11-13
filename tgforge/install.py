@@ -13,11 +13,11 @@ import json
 import time
 from pathlib import Path
 
-from aiogram import Bot as AioBot
+from tgforge.base.telegram import make_bot
 
 
 async def _verify_token(token: str) -> str:
-    bot = AioBot(token)
+    bot = make_bot(token)
     try:
         me = await bot.get_me()
         return me.username

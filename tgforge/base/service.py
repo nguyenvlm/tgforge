@@ -179,28 +179,28 @@ launchctl kickstart -k "gui/$(id -u)/{service}"
 """
 
 
-def pop_restart_announce(home: Path) -> int | None:
-    """Read + delete the thread id a restart asked to be pinged in, if any."""
+def pop_restart_announce(home: Path) -> str | None:
+    """Read + delete the window key a restart asked to be pinged in, if any."""
     f = Path(home) / ".restart_announce"
     try:
-        tid = int(f.read_text().strip())
-    except (OSError, ValueError):
+        window = f.read_text().strip()
+    except OSError:
         return None
     f.unlink(missing_ok=True)
-    return tid
+    return window or None
 
 
 def detached_restart(
-    service: str, home: Path | None = None, announce_thread: int | None = None
+    service: str, home: Path | None = None, announce_window: str | None = None
 ) -> None:
     """Restart the service from inside a bot-driven turn without self-waiting.
     Single-instance: on Linux a second restart replaces the waiting one (the
     transient unit is stopped, then started anew); on macOS a lock dir drops it.
     `home` is required on macOS (the lock lives under it) and to carry
-    `announce_thread` — the topic the fresh process pings when it comes back."""
-    if announce_thread is not None and home is not None:
+    `announce_window` — the window the fresh process pings when it comes back."""
+    if announce_window is not None and home is not None:
         try:
-            (Path(home) / ".restart_announce").write_text(str(announce_thread))
+            (Path(home) / ".restart_announce").write_text(announce_window)
         except OSError:
             pass
     if IS_MACOS:

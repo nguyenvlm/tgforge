@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from claude_fakes import THREAD, FakeProc, client, drain, screen, window
 
+from tgforge.base.telegram import TelegramAdapter
+
 
 async def _settling(c, t):
     """A turn whose settle is stuck after its first answer piece; returns the release."""
@@ -33,7 +35,11 @@ async def _settling(c, t):
 def _below_every_answer(c, text):
     """Whether the message first sent as `text` sits below all three answer pieces."""
     answers = [mid for mid, body in screen(c) if body.startswith("ANSWER")]
-    target = next(mid for mid, tid, body in c.bot.created if tid == THREAD and body == text)
+    target = next(
+        mid
+        for mid, tid, body in c.bot.created
+        if TelegramAdapter.window_of(tid) == THREAD and body == text
+    )
     return len(answers) == 3 and target > max(answers)
 
 
@@ -57,7 +63,7 @@ def test_a_command_reply_through_the_router_waits_for_the_settle(tmp_path):
         c = client(tmp_path)
         t = window(c, tmp_path)
         release = await _settling(c, t)
-        await c.send("/status", thread_id=THREAD)  # an inline command: the kernel replies
+        await c.send("/status", window=THREAD)  # an inline command: the kernel replies
         await asyncio.sleep(0.05)
         release.set()
         await asyncio.wait_for(c.settle(), 5)
@@ -138,7 +144,7 @@ def test_the_help_reply_in_a_claude_window_waits_for_the_settle(tmp_path):
         c = client(tmp_path)
         t = window(c, tmp_path)
         release = await _settling(c, t)
-        task = asyncio.create_task(c.core._unhandled(c.core.chat_id, THREAD))
+        task = asyncio.create_task(c.core._unhandled(THREAD))
         await asyncio.sleep(0.05)
         release.set()
         await asyncio.wait_for(task, 5)

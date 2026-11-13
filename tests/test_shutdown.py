@@ -9,7 +9,7 @@ from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.testing import TestClient
 
 
-def _topic(client, tid=555):
+def _topic(client, tid="555"):
     t = client.core._instantiate(ClaudeTopic, tid, "Claude")
     client.core.owners[tid] = "claude"
     t.turn_open = True  # a turn is in flight
@@ -60,8 +60,8 @@ def test_broadcast_shutdown_flags_settles_and_flushes(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
         t = _topic(c)
-        c.core.instances[t.thread_id] = t
-        pending = c.core.land_frame(c.core.chat_id, 77, "a final view")
+        c.core.instances[t.window] = t
+        pending = c.core.transports[0].land_frame("0", 77, "a final view")
         await c.core.broadcast_shutdown()
         assert c.core.shutting_down is True
         assert t.turn_open is False  # on_shutdown ran
@@ -74,11 +74,11 @@ def test_restart_announce_roundtrip(tmp_path):
     from tgforge.base.service import pop_restart_announce
 
     (tmp_path / ".restart_announce").write_text("268")
-    assert pop_restart_announce(tmp_path) == 268
+    assert pop_restart_announce(tmp_path) == "268"
     assert not (tmp_path / ".restart_announce").exists()  # popped (deleted)
     assert pop_restart_announce(tmp_path) is None  # nothing pending
-    (tmp_path / ".restart_announce").write_text("not-an-int")
-    assert pop_restart_announce(tmp_path) is None  # garbage ignored
+    (tmp_path / ".restart_announce").write_text("")
+    assert pop_restart_announce(tmp_path) is None  # an empty record is none
 
 
 def test_detached_restart_records_the_thread(tmp_path, monkeypatch):
@@ -86,5 +86,24 @@ def test_detached_restart_records_the_thread(tmp_path, monkeypatch):
 
     monkeypatch.setattr(svc.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(svc, "IS_MACOS", False)
-    svc.detached_restart("svc", tmp_path, announce_thread=99)
+    svc.detached_restart("svc", tmp_path, announce_window="99")
     assert (tmp_path / ".restart_announce").read_text() == "99"
+
+
+def test_the_interrupted_card_keeps_the_note_after_the_collapsed_block(tmp_path):
+    """The base layout: page 1 (summary over its collapsed timeline), a blank line, the
+    note — the expected strings are the base render of the same turn."""
+
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        t = _topic(c)  # card 42
+        t.turn.timeline = [("tool", "💻 Bash: ls -la (v1.2)")]
+        t._summary = lambda *a, **k: "🔧 1 · 3s"
+        await t.on_shutdown()
+        assert c.bot.edits[-1] == (
+            42,
+            "🔧 1 · 3s\n**>💻 Bash: ls \\-la \\(v1\\.2\\)||"
+            "\n\n⏸ interrupted by a restart — resuming shortly",
+        )
+
+    asyncio.run(scenario())

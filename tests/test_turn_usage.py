@@ -62,7 +62,7 @@ def test_a_status_other_than_allowed_leads_with_a_warning():
     )
 
 
-def _usage_window(c, tmp_path, thread=555, model=None):
+def _usage_window(c, tmp_path, thread="555", model=None):
     t = window(c, tmp_path, thread)
     t.model = model
     return t
@@ -139,7 +139,7 @@ def test_the_live_status_line_carries_context_and_quota(tmp_path):
 def test_quota_is_shared_by_the_windows_on_one_account(tmp_path):
     async def scenario():
         c = client(tmp_path)
-        first = _usage_window(c, tmp_path, thread=555)
+        first = _usage_window(c, tmp_path, thread="555")
         second = _usage_window(c, tmp_path, thread=556)
         other = _usage_window(c, tmp_path, thread=557)
         other.config_dir = str(tmp_path / ".claude-other")

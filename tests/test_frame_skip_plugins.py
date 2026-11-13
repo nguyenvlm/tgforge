@@ -48,7 +48,7 @@ def test_the_one_shot_pump_keeps_reading_through_a_flood(tmp_path, monkeypatch):
         window(c, tmp_path)
         _flood_once(c.bot, "edit_message_text", 2.5)
         script = "for i in $(seq 1 40); do echo line$i; sleep 0.01; done"
-        await c.send(f"!{script}", thread_id=THREAD)
+        await c.send(f"!{script}", window=THREAD)
         await asyncio.wait_for(c.settle(), 10)
         final = c.edits[-1]
         assert "exit 0" in final and "line40" in final  # finished on time, not timed out
@@ -61,7 +61,7 @@ def test_a_one_shot_window_close_reaps_the_command(tmp_path):
     async def scenario():
         c = client(tmp_path)
         t = window(c, tmp_path)
-        await c.send("!sleep 30", thread_id=THREAD)
+        await c.send("!sleep 30", window=THREAD)
         for _ in range(100):
             if any(p.returncode is None for p in t._procs):
                 break
@@ -83,7 +83,7 @@ def _nested(tmp_path, depth=5):
 
 
 async def _files_window(c, root):
-    inst = await c.core.open_window(c.core.chat_id, LocalfsTopic, "browse")
+    inst = await c.core.open_window(LocalfsTopic, "browse", origin="0")
     inst.saved["cwd"] = str(root)
     inst._redraw()
     await c.core.flush_frames()
@@ -146,7 +146,7 @@ def test_a_chatty_one_shot_command_finishes_well_inside_the_timeout(tmp_path, mo
         c = client(tmp_path)
         window(c, tmp_path)
         started = time.monotonic()
-        await c.send("!seq 1 200000", thread_id=THREAD)
+        await c.send("!seq 1 200000", window=THREAD)
         await asyncio.wait_for(c.settle(), 30)
         final = c.edits[-1]
         assert "exit 0" in final and "200000" in final
@@ -176,7 +176,7 @@ def test_the_one_shot_pump_records_at_most_one_frame_per_interval(tmp_path, monk
         t = window(c, tmp_path)
         views = _record_views(t)
         script = "for i in $(seq 1 20); do echo line$i; sleep 0.06; done"
-        await c.send(f"!{script}", thread_id=THREAD)
+        await c.send(f"!{script}", window=THREAD)
         await asyncio.wait_for(c.settle(), 10)
         times = [at for at, _view in views]
         assert 2 <= len(times) <= 5  # ~1.2 s of output: not one frame per chunk (20)
@@ -195,7 +195,7 @@ def test_output_before_a_quiet_stretch_shows_within_one_interval(tmp_path, monke
         t = window(c, tmp_path)
         views = _record_views(t)
         started = time.monotonic()
-        await c.send("!printf a; sleep 0.3; printf b; sleep 2", thread_id=THREAD)
+        await c.send("!printf a; sleep 0.3; printf b; sleep 2", window=THREAD)
         await asyncio.wait_for(c.settle(), 10)
         shown = [at - started for at, view in views if "b" in view.split("\n", 1)[1]]
         assert shown and shown[0] < 1.6  # at the interval's end, not at the 2.3 s exit
@@ -207,7 +207,7 @@ def test_a_cut_off_utf8_character_at_the_end_is_kept(tmp_path):
     async def scenario():
         c = client(tmp_path)
         window(c, tmp_path)
-        await c.send("!printf 'ok\\342\\202'", thread_id=THREAD)  # 2 of €'s 3 bytes
+        await c.send("!printf 'ok\\342\\202'", window=THREAD)  # 2 of €'s 3 bytes
         await asyncio.wait_for(c.settle(), 10)
         assert "ok�" in c.edits[-1]  # flushed as a replacement, not dropped
 
@@ -230,7 +230,7 @@ def test_a_typed_path_jumps_to_that_folder(tmp_path, monkeypatch):
         ]
         for typed, expected in cases:
             sent_before = len(c.bot.sent)
-            await c.send(typed, thread_id=inst.thread_id)
+            await c.send(typed, window=inst.window)
             await c.settle()
             await c.core.flush_frames()
             typed_id = next(mid for mid, _t, text in reversed(c.bot.created) if text == typed)
@@ -251,7 +251,7 @@ def test_a_bad_typed_path_gets_a_brief_notice_deleted_later(tmp_path, monkeypatc
         (root / "a.txt").write_text("x")
         inst = await _files_window(c, root)
         for typed, reason in [("nope", "no such folder"), ("a.txt", "not a folder")]:
-            await c.send(typed, thread_id=inst.thread_id)
+            await c.send(typed, window=inst.window)
             await c.settle()
             typed_id = next(mid for mid, _t, text in c.bot.created if text == typed)
             note_id, note = next(
@@ -272,7 +272,7 @@ def test_a_typed_path_that_cannot_be_checked_gets_a_notice(tmp_path):
         c = TestClient(Localfs(), home=str(tmp_path))
         root = _nested(tmp_path)
         inst = await _files_window(c, root)
-        await c.send("x" * 5000, thread_id=inst.thread_id)  # longer than any path
+        await c.send("x" * 5000, window=inst.window)  # longer than any path
         await c.settle()
         assert any(text.startswith("⚠️ ") for _t, text in c.bot.sent)
         assert inst.saved["cwd"] == str(root)
@@ -290,7 +290,7 @@ def test_folder_clicks_and_typed_paths_make_no_rename(tmp_path, monkeypatch):
         renames = _flood_once(c.bot, "edit_forum_topic", 0, times=0)
         for _ in range(3):
             await _click(c, inst, "cd:0")
-        await c.send(str(root), thread_id=inst.thread_id)
+        await c.send(str(root), window=inst.window)
         await c.settle()
         await c.core.flush_frames()
         assert renames["calls"] == []
@@ -319,7 +319,7 @@ def test_the_files_view_stays_the_bottom_message(tmp_path, monkeypatch):
         assert c.bot.last_markup is not None  # with its buttons
 
         views_before = sum(text.startswith("📂") for _m, _t, text in c.bot.created)
-        await c.send("nope", thread_id=inst.thread_id)  # a bad path: typed message + notice
+        await c.send("nope", window=inst.window)  # a bad path: typed message + notice
         await c.settle()
         await c.core.flush_frames()
         views_after = sum(text.startswith("📂") for _m, _t, text in c.bot.created)
@@ -331,7 +331,8 @@ def test_the_files_view_stays_the_bottom_message(tmp_path, monkeypatch):
 def test_the_files_view_moves_as_one_copy_below_a_burst_of_messages(tmp_path):
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
-        c.core._pacer = kernel._Pacer(1200, kernel.PACE_BURST)  # fast, live burst size
+        # fast, live burst size
+        c.core.transports[0]._pacer = kernel._Pacer(1200, kernel.PACE_BURST)
         inst = await _files_window(c, _nested(tmp_path))
         for n in range(3):
             await inst.send(f"note {n}")  # each buries the view
