@@ -5,6 +5,9 @@ revival — all driven through a mock aiogram bot."""
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
 from tgforge.base.kernel import (
@@ -459,3 +462,16 @@ def test_telegram_polling_leaves_the_session_open_for_the_drain_then_close_ends_
     assert polled["close_bot_session"] is False and closed == []  # the drain still sends
     asyncio.run(adapter.close())
     assert closed == [True]
+
+
+def test_telegram_logs_each_inbound_with_its_delivery_delay(caplog):
+    sent = datetime.now(UTC) - timedelta(seconds=90)
+    photo = [SimpleNamespace(file_id="f1", file_size=10)]
+    with caplog.at_level(logging.INFO, logger="tgforge"):
+        inbound = telegram_inbound("look", "7", message_id=42, date=sent, photo=photo)
+    assert inbound is not None
+    lines = [r.getMessage() for r in caplog.records if "inbound msg 42" in r.getMessage()]
+    assert len(lines) == 1
+    assert "in 7: 1 attachment(s)" in lines[0]
+    age = float(lines[0].rsplit("received ", 1)[1].split("s after")[0])
+    assert 89 <= age < 120

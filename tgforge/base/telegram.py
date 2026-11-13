@@ -11,7 +11,9 @@ calls made here.
 from __future__ import annotations
 
 import copy
+import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aiogram import Bot as AioBot
@@ -51,6 +53,8 @@ from tgforge.base.kernel import (
     Transient,
 )
 from tgforge.base.ui import MAX_MSG
+
+LOGGER = logging.getLogger("tgforge")
 
 SAFE_RAW_CHUNK = 1800  # raw size whose MarkdownV2 conversion always fits MAX_MSG
 
@@ -593,6 +597,16 @@ class TelegramAdapter:
             inbound.replied_attachments = _attachments(reply)
             quote = getattr(message, "quote", None)
             inbound.quote = getattr(quote, "text", None) if quote is not None else None
+        sent = getattr(message, "date", None)
+        if sent is not None:  # a late delivery reads off this line
+            age = (datetime.now(UTC) - sent).total_seconds()
+            LOGGER.info(
+                "inbound msg %s in %s: %d attachment(s), received %.1fs after sent",
+                inbound.message_id,
+                inbound.window,
+                len(inbound.attachments),
+                age,
+            )
         return inbound
 
     def to_tap(self, callback) -> Tap:
