@@ -1,6 +1,6 @@
-"""Authorization: the default OwnerOnly middleware serves only the owner; the
-example allowlist (a custom middleware + an admin /allow command managing state in
-its own plugin store) extends that to added users with no restart."""
+"""Authorization: the default OwnerOnly hook serves only the owner; the example
+allowlist (a custom auth hook + an admin /allow command managing state in its own
+plugin store) extends that to added users with no restart."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from example.allowlist import Allowlist, AllowlistAuth
 from tgforge.base.app import OwnerOnly
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
+from tgforge.base.kernel import Inbound
+from tgforge.testing import kernel_bot, telegram_inbound, telegram_kernel
 
 
 class MockBot:
@@ -51,61 +52,43 @@ class MockBot:
 
 def _kernel(tmp_path, plugins=None, **cfg):
     conf = BotConfig(token="x", home=str(tmp_path), chat_id=100, bot_username="bot", **cfg)
-    return Kernel(MockBot(), conf, plugins or [])
+    return telegram_kernel(MockBot(), conf, plugins or [])
 
 
-def _msg(text, thread_id, uid=1, reply_from=None):
+def _msg(text, window, uid=1, reply_from=None):
     reply = SimpleNamespace(from_user=SimpleNamespace(id=reply_from)) if reply_from else None
-    return SimpleNamespace(
-        text=text,
-        caption=None,
-        photo=None,
-        document=None,
-        message_id=9,
-        from_user=SimpleNamespace(id=uid),
-        chat=SimpleNamespace(id=100),
-        message_thread_id=thread_id,
-        reply_to_message=reply,
-        entities=[],
+    return telegram_inbound(
+        text, window, user_id=uid, message_id=9, reply_to_message=reply, entities=[]
     )
 
 
-async def _drops(mw, uid):
-    passed = []
-
-    async def handler(event, data):
-        passed.append(uid)
-
-    await mw(handler, object(), {"event_from_user": SimpleNamespace(id=uid)})
-    return passed == []
+def _drops(auth, core, uid, window="0"):
+    return not auth(core, Inbound(window=window, message_id=None, user_id=uid, text="x"))
 
 
 def test_owner_only_default(tmp_path):
-    async def scenario():
-        core = _kernel(tmp_path, owner_id=1)
-        mw = OwnerOnly(core)
-        assert await _drops(mw, 2)  # stranger dropped
-        assert not await _drops(mw, 1)  # owner passes
-        core.owner_id = None
-        assert not await _drops(mw, 999)  # before /init, anyone passes
-
-    asyncio.run(scenario())
+    core = _kernel(tmp_path, owner_id=1)
+    auth = OwnerOnly()
+    assert _drops(auth, core, 2)  # stranger dropped
+    assert not _drops(auth, core, 1)  # owner passes
+    core.config.owner_id = None
+    assert not _drops(auth, core, 999)  # before /init, anyone passes
 
 
 def test_example_allowlist(tmp_path):
     async def scenario():
         allow = Allowlist()
         core = _kernel(tmp_path, [allow], owner_id=1)
-        mw = AllowlistAuth(core, allow)
-        assert await _drops(mw, 2)  # not yet allowed
+        auth = AllowlistAuth(allow)
+        assert _drops(auth, core, 2)  # not yet allowed
 
         # admin opens a window and allows user 2 by replying to their message
         await core.handle_message(_msg("@bot /new", None))
         tid = next(t for t in core.owners)
         await core.handle_message(_msg("/allow", tid, uid=1, reply_from=2))
         assert 2 in allow.allowed()
-        assert not await _drops(mw, 2)  # now passes, no restart
-        assert await _drops(mw, 3)  # still-unknown user dropped
+        assert not _drops(auth, core, 2)  # now passes, no restart
+        assert _drops(auth, core, 3)  # still-unknown user dropped
 
     asyncio.run(scenario())
 
@@ -116,9 +99,9 @@ def test_allow_is_admin_only(tmp_path):
         core = _kernel(tmp_path, [allow], owner_id=1)
         await core.handle_message(_msg("@bot /new", None))
         tid = next(t for t in core.owners)
-        core.bot.sent.clear()
+        kernel_bot(core).sent.clear()
         await core.handle_message(_msg("/allow", tid, uid=7, reply_from=2))
-        assert any("only the admin" in t for _t, t in core.bot.sent)
+        assert any("only the admin" in t for _t, t in kernel_bot(core).sent)
         assert 2 not in allow.allowed()
 
     asyncio.run(scenario())
@@ -131,3 +114,28 @@ def test_allowlist_persists(tmp_path):
     allow2 = Allowlist()
     _kernel(tmp_path, [allow2], owner_id=1)
     assert 42 in allow2.allowed()
+
+
+def test_allow_by_telegram_tap_mention(tmp_path):
+    async def scenario():
+        allow = Allowlist()
+        core = _kernel(tmp_path, [allow], owner_id=1)
+        core.transports[0].adapter.bot_id = 999
+        await core.handle_message(_msg("@bot /new", None))
+        tid = next(t for t in core.owners)
+        entities = [
+            SimpleNamespace(type="text_mention", user=SimpleNamespace(id=999)),  # the bot
+            SimpleNamespace(type="text_mention", user=SimpleNamespace(id=5)),
+        ]
+        message = SimpleNamespace(
+            message_id=9,
+            text="/allow Alice",
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=100),
+            message_thread_id=int(tid),
+            entities=entities,
+        )
+        await core.handle_message(core.transports[0].adapter.to_inbound(message))
+        assert allow.allowed() == {5}
+
+    asyncio.run(scenario())

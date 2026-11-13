@@ -92,10 +92,8 @@ def _restart(app: str | None, home: str | None) -> None:
     if not cfg.service:
         print("no service configured (set `service` in bot.json)")
         return
-    tid = os.environ.get("TELEGRAM_THREAD_ID")
-    detached_restart(
-        cfg.service, home_path, announce_thread=int(tid) if tid and tid.isdigit() else None
-    )
+    window = os.environ.get("TGFORGE_WINDOW") or None
+    detached_restart(cfg.service, home_path, announce_window=window)
     print(f"restart scheduled for {cfg.service}")
 
 

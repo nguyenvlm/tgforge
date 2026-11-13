@@ -23,8 +23,8 @@ def test_announce_online_resumes_the_requester(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
         (tmp_path / ".restart_announce").write_text("777")
-        inst = _Recorder(c.core, 777, "rec", None)
-        c.core.instances[777] = inst
+        inst = _Recorder(c.core, "777", "rec", None)
+        c.core.instances["777"] = inst
         await c.core._announce_online()
         assert any("back online" in text for _tid, text in c.bot.sent)
         assert inst.resumed  # the requester's hook fired
@@ -44,7 +44,7 @@ def test_announce_online_noop_without_pending(tmp_path):
 def test_base_on_restarted_is_a_noop(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        await Topic(c.core, 1, "t", None).on_restarted()  # must not raise
+        await Topic(c.core, "1", "t", None).on_restarted()  # must not raise
 
     asyncio.run(scenario())
 
@@ -52,7 +52,7 @@ def test_base_on_restarted_is_a_noop(tmp_path):
 def test_claude_on_restarted_resubmits(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         prompts = []
 
         async def _capture(prompt, **kw):

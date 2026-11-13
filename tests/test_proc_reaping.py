@@ -24,10 +24,10 @@ class _Spawner(Topic):
 def test_close_reaps_a_child_the_window_ignores(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        inst = await c.core.open_window(100, _Spawner, "s")
+        inst = await c.core.open_window(_Spawner, "s", origin="0")
         proc = inst.proc
         assert proc.returncode is None  # still running before close
-        await c.core.close_window(inst.thread_id)
+        await c.core.close_window(inst.window)
         assert proc.returncode is not None  # kernel reaped it on close
 
     asyncio.run(scenario())
@@ -36,9 +36,9 @@ def test_close_reaps_a_child_the_window_ignores(tmp_path):
 def test_release_also_reaps(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        inst = await c.core.open_window(100, _Spawner, "s")
+        inst = await c.core.open_window(_Spawner, "s", origin="0")
         proc = inst.proc
-        await c.core.release_window(inst.thread_id)  # window → core, same teardown
+        await c.core.release_window(inst.window)  # window → core, same teardown
         assert proc.returncode is not None
 
     asyncio.run(scenario())

@@ -5,7 +5,14 @@ from __future__ import annotations
 
 import pytest
 
-from tgforge.base.ui import MAX_MSG, fmt_duration, md_chunks, to_md
+from tgforge.base import ui
+from tgforge.base.telegram import SAFE_RAW_CHUNK, TelegramAdapter, to_md
+from tgforge.base.ui import MAX_MSG, fmt_duration
+
+
+def md_chunks(text):
+    """The Telegram split: pieces measured as their MarkdownV2 render."""
+    return ui.md_chunks(text, TelegramAdapter.measure, SAFE_RAW_CHUNK)
 
 
 def test_md_chunks_keep_converted_pieces_under_limit():

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from tgforge.base.kernel import file_held_open
-from tgforge.base.ui import MAX_MSG, fmt_duration
+from tgforge.base.ui import MAX_MSG, code_block, fmt_duration
 from tgforge.plugins.claude.render import SPINNER
 
 LOGGER = logging.getLogger("tgforge")
@@ -67,11 +67,11 @@ def prune_finished(session, now: float) -> None:
 
 
 def panel(session, spin: int = 0) -> tuple[str, str] | None:
-    """A monospace, never-collapsed panel of background tasks (md, plain), or None when
+    """A monospace, never-collapsed panel of background tasks (Markdown, plain), or None when
     there are none to show. A running row: the spinner, label, elapsed, and the last
     output line (`spin` animates the spinner). A finished row keeps its outcome mark
     (✓ / ✗ / ◼) for FINISHED_LINGER seconds, then drops. The panel is its own message,
-    so if many jobs make it exceed a Telegram message the OLDEST rows are dropped
+    so if many jobs make it exceed a message the OLDEST rows are dropped
     first — the panel never costs the main text."""
     now = time.monotonic()
     shown = visible_tasks(session, now)
@@ -96,12 +96,11 @@ def panel(session, spin: int = 0) -> tuple[str, str] | None:
             el = fmt_duration(int(t["done_at"] - t["start"]))
             task_rows.append(f"{t['done']} {label:<24} {el:>5}  {_OUTCOME[t['done']]}")
     body = _fit_panel(header, task_rows)
-    esc = body.replace("\\", "\\\\").replace("`", "\\`")
-    return f"```\n{esc}\n```", body
+    return code_block(body), body
 
 
 def _fit_panel(header: str, task_rows: list[str]) -> str:
-    """Join header + rows; if the escaped code block would exceed a Telegram message,
+    """Join header + rows; if the code block would exceed a message,
     drop the oldest rows (front of the list) until it fits, marking the elision."""
     limit = MAX_MSG - 10  # leave room for the ``` fences and a backtick-escape or two
     rows = list(task_rows)

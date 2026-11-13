@@ -7,10 +7,11 @@ import asyncio
 from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
+from tgforge.base.kernel import Tap
 from tgforge.plugins.gcloud import Gcloud
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.plugins.shell import Shell
+from tgforge.testing import kernel_bot, telegram_inbound, telegram_kernel
 
 
 class MockBot:
@@ -44,6 +45,9 @@ class MockBot:
     async def edit_message_reply_markup(self, **kw):
         return SimpleNamespace(message_id=kw.get("message_id"))
 
+    async def answer_callback_query(self, callback_query_id, **kw):
+        return True
+
     async def send_chat_action(self, **kw):
         return True
 
@@ -53,7 +57,7 @@ class MockBot:
 
 def _kernel(tmp_path):
     cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
-    return Kernel(MockBot(), cfg, [Shell(), Localfs(), Gcloud()])
+    return telegram_kernel(MockBot(), cfg, [Shell(), Localfs(), Gcloud()])
 
 
 def test_registration(tmp_path):
@@ -69,21 +73,13 @@ def test_localfs_opens_and_navigates(tmp_path):
         base = tmp_path / "base"
         (base / "sub").mkdir(parents=True)
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, LocalfsTopic, "browse")
+        inst = await core.open_window(LocalfsTopic, "browse", origin="0")
         assert inst.saved["cwd"] == str(tmp_path.resolve())
         # point at a clean dir so "sub" is the only entry, then tap into it
         inst.saved["cwd"] = str(base)
         inst._redraw()
-        cb = SimpleNamespace(
-            data="act:fs:cd:0",
-            message=SimpleNamespace(message_thread_id=inst.thread_id, chat=SimpleNamespace(id=100)),
-        )
-
-        async def _answer():
-            return None
-
-        cb.answer = _answer
-        await core.handle_callback(cb)
+        tap = Tap(window=inst.window, message_id=None, data="act:fs:cd:0", user_id=1)
+        await core.handle_tap(tap)
         assert inst.saved["cwd"].endswith("/sub")
 
     asyncio.run(scenario())
@@ -92,20 +88,26 @@ def test_localfs_opens_and_navigates(tmp_path):
 def test_restart_without_service_is_guarded(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)  # no `service` configured
-        inst = await core.open_window(100, LocalfsTopic, "browse")
-        core.bot.sent.clear()
-        await core.handle_message(
-            SimpleNamespace(
-                text="/restart",
-                caption=None,
-                photo=None,
-                document=None,
-                message_id=5,
-                from_user=SimpleNamespace(id=1),
-                chat=SimpleNamespace(id=100),
-                message_thread_id=inst.thread_id,
-            )
-        )
-        assert any("no service configured" in t for _tid, t in core.bot.sent)
+        inst = await core.open_window(LocalfsTopic, "browse", origin="0")
+        kernel_bot(core).sent.clear()
+        await core.handle_message(telegram_inbound("/restart", inst.window, message_id=5))
+        assert any("no service configured" in t for _tid, t in kernel_bot(core).sent)
+
+    asyncio.run(scenario())
+
+
+def test_a_backtick_heavy_file_view_fits_once_rendered(tmp_path):
+    from tgforge.base.telegram import TelegramAdapter
+    from tgforge.base.ui import MAX_MSG
+    from tgforge.testing import TestClient
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        inst = await c.core.open_window(LocalfsTopic, "browse", origin="0")
+        path = tmp_path / "ticks.md"
+        path.write_text("`a" * 1500)  # 3000 raw chars, about 4500 once escaped
+        inst.saved["view"] = str(path)
+        md, _plain, _keys = inst._file_view()
+        assert TelegramAdapter.measure(md) <= MAX_MSG  # rich, not the plain fallback
 
     asyncio.run(scenario())

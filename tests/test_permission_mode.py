@@ -10,9 +10,8 @@ import stat
 from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
 from tgforge.plugins.claude import Claude, ClaudeTopic
-from tgforge.testing import MockBot, TestClient
+from tgforge.testing import MockBot, TestClient, telegram_kernel
 
 _FAKE_CLI = """#!/usr/bin/env python3
 import sys, json
@@ -43,7 +42,7 @@ def test_set_persists_and_reloads(tmp_path):
 def test_status_shows_mode(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         assert "mode auto" in await t.status(None)
 
     asyncio.run(scenario())
@@ -52,8 +51,8 @@ def test_status_shows_mode(tmp_path):
 def test_mode_menu_changes_the_setting(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        c.core.owners[555] = "claude"
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
+        c.core.owners["555"] = "claude"
         task = asyncio.create_task(t.mode(None))
         await c.pump()
         assert "acceptEdits" in c.buttons
@@ -68,8 +67,8 @@ def test_mode_menu_changes_the_setting(tmp_path):
 def test_mode_change_kills_an_idle_proc(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        c.core.owners[555] = "claude"
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
+        c.core.owners["555"] = "claude"
         killed = []
         t.proc = SimpleNamespace(returncode=None, kill=lambda: killed.append(True))
         t.busy = False
@@ -85,8 +84,8 @@ def test_mode_change_kills_an_idle_proc(tmp_path):
 def test_mode_unchanged_leaves_proc_alone(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        c.core.owners[555] = "claude"
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
+        c.core.owners["555"] = "claude"
         killed = []
         t.proc = SimpleNamespace(returncode=None, kill=lambda: killed.append(True))
         t.busy = False
@@ -117,11 +116,11 @@ def test_spawn_uses_permission_mode_not_allowed_tools(tmp_path, monkeypatch):
 
     async def scenario():
         cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
-        core = Kernel(MockBot(), cfg, [Claude()])
+        core = telegram_kernel(MockBot(), cfg, [Claude()])
         claude = core.plugin_by_id["claude"]
         claude.claude_bin = str(fake)
         claude.claude_dir = tmp_path / ".claude"
-        t = core._instantiate(ClaudeTopic, 555, "work")
+        t = core._instantiate(ClaudeTopic, "555", "work")
         t.workspace = str(tmp_path)
         await t.submit("hi")
         for _ in range(60):

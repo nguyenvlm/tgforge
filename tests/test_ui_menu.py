@@ -4,14 +4,14 @@ assembly (built from the registry, not per-plugin knowledge)."""
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 from test_core_routing import MockBot
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Plugin, Topic, command, launch, universal
+from tgforge.base.kernel import Plugin, Tap, Topic, command, launch, universal
 from tgforge.base.ui import BTN_MAX, blabel
 from tgforge.plugins.claude.config import DEFAULT_MODELS
+from tgforge.testing import kernel_bot, telegram_kernel
 
 
 async def _tap(core, label):
@@ -19,18 +19,14 @@ async def _tap(core, label):
     matches `label` — a simulated Telegram tap."""
     for _ in range(200):
         await asyncio.sleep(0)
-        kb = core.bot.last_markup
+        kb = kernel_bot(core).last_markup
         if kb is not None:
             for row in kb.inline_keyboard:
                 for btn in row:
                     if btn.text == blabel(label):
-                        core.bot.last_markup = None
-                        cb = SimpleNamespace(
-                            data=btn.callback_data,
-                            message=None,
-                            answer=lambda *a, **k: _noop(),
-                        )
-                        await core.handle_callback(cb)
+                        kernel_bot(core).last_markup = None
+                        tap = Tap(window="0", message_id=None, data=btn.callback_data, user_id=1)
+                        await core.handle_tap(tap)
                         return
     raise AssertionError(f"button {label!r} never rendered")
 
@@ -93,18 +89,17 @@ class _Shell(Plugin):
 
 
 def _kernel_with_shell():
-    from tgforge.base.kernel import Kernel
 
     cfg = BotConfig(token="x", home="/tmp", owner_id=1, chat_id=100, bot_username="bot")
-    return Kernel(MockBot(), cfg, [_Shell()])
+    return telegram_kernel(MockBot(), cfg, [_Shell()])
 
 
 def test_settle_prompt_announces_choice_in_place():
     async def scenario():
         core = _kernel_with_shell()
         opts = [("🤖 Claude", "open:/claude"), ("🖥 Shell", "open:/shell")]
-        await core._settle_prompt(100, 555, opts, idx=1, announce=lambda label: f"🚀 {label}")
-        return core.bot
+        await core._settle_prompt("0", 555, opts, idx=1, announce=lambda label: f"🚀 {label}")
+        return kernel_bot(core)
 
     bot = asyncio.run(scenario())
     assert (555, "🚀 🖥 Shell") in bot.edits  # message rewritten to the outcome
@@ -114,8 +109,8 @@ def test_settle_prompt_announces_choice_in_place():
 def test_settle_prompt_timeout_collapses_to_note():
     async def scenario():
         core = _kernel_with_shell()
-        await core._settle_prompt(100, 7, [("a", "a")], idx=None, announce=lambda label: label)
-        return core.bot
+        await core._settle_prompt("0", 7, [("a", "a")], idx=None, announce=lambda label: label)
+        return kernel_bot(core)
 
     bot = asyncio.run(scenario())
     assert (7, "⏱ timed out") in bot.edits
@@ -124,8 +119,8 @@ def test_settle_prompt_timeout_collapses_to_note():
 def test_settle_prompt_without_announce_just_strips_buttons():
     async def scenario():
         core = _kernel_with_shell()
-        await core._settle_prompt(100, 9, [("a", "a")], idx=0, announce=None)
-        return core.bot
+        await core._settle_prompt("0", 9, [("a", "a")], idx=0, announce=None)
+        return kernel_bot(core)
 
     bot = asyncio.run(scenario())
     assert 9 in bot.markup_cleared
@@ -134,7 +129,7 @@ def test_settle_prompt_without_announce_just_strips_buttons():
 
 def test_desktop_menu_shows_launchers_and_allowed_universals():
     core = _kernel_with_shell()
-    opts = core._menu_options(thread_id=None)  # the desktop (General / core)
+    opts = core._menu_options("0")  # the desktop (General / core)
     values = [v for _label, v in opts]
     label_of = {v: label for label, v in opts}
     assert "open:/shell" in values  # launchers appear on the desktop
@@ -151,11 +146,11 @@ def test_desktop_menu_shows_launchers_and_allowed_universals():
 def test_window_menu_shows_class_commands_and_window_universals():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, "work")
-        return core, inst.thread_id
+        inst = await core.open_window(_ShellTopic, "work", origin="0")
+        return core, inst.window
 
     core, tid = asyncio.run(scenario())
-    opts = core._menu_options(thread_id=tid)
+    opts = core._menu_options(tid)
     values = [v for _label, v in opts]
     label_of = {v: label for label, v in opts}
     assert "ccmd:/kill" in values and label_of["ccmd:/kill"] == "🔪 Kill"  # its own command
@@ -169,8 +164,8 @@ def test_window_menu_shows_class_commands_and_window_universals():
 def test_menu_header_names_the_context():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, "work")
-        return core, inst.thread_id
+        inst = await core.open_window(_ShellTopic, "work", origin="0")
+        return core, inst.window
 
     core, tid = asyncio.run(scenario())
     assert core._menu_header(None) == "🧭 Menu"  # the desktop title, never a lone emoji
@@ -186,11 +181,11 @@ def test_window_title_carries_icon_and_capitalized_name():
 def test_open_window_and_rename_keep_the_icon():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, None)
-        opened = core._names()[inst.thread_id]
-        core.rename_topic(inst.thread_id, "deploy logs")
+        inst = await core.open_window(_ShellTopic, None, origin="0")
+        opened = core._names()[inst.window]
+        core.rename_topic(inst.window, "deploy logs")
         await core.flush_frames()
-        return opened, core._names()[inst.thread_id]
+        return opened, core._names()[inst.window]
 
     opened, renamed = asyncio.run(scenario())
     assert opened == "🖥 Shell"  # created with the icon + capitalized label
@@ -208,8 +203,8 @@ def test_menu_entry_falls_back_to_id_without_icon():
 def test_is_inline_reads_each_declaration():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, "work")
-        return core, inst.thread_id
+        inst = await core.open_window(_ShellTopic, "work", origin="0")
+        return core, inst.window
 
     core, tid = asyncio.run(scenario())
     assert core._is_inline("cmd:/stat", tid) is True  # inline universal
@@ -230,14 +225,14 @@ def test_aliases_resolve_to_primary():
 def test_inline_renders_in_place_with_back_then_reopens_menu():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, "work")
-        tid = inst.thread_id
-        task = asyncio.create_task(core.show_menu(100, tid))
+        inst = await core.open_window(_ShellTopic, "work", origin="0")
+        tid = inst.window
+        task = asyncio.create_task(core.show_menu(tid))
         await _tap(core, "👀 Peek")  # inline → renders in place + Back
         await _tap(core, "⬅ Back")  # Back re-renders the menu on the same message
         await _tap(core, "🔪 Kill")  # a one-off → marks triggered, ends the menu
         await task
-        return core.bot
+        return kernel_bot(core)
 
     bot = asyncio.run(scenario())
     # the inline body rendered on the menu message (an edit), never a separate send
@@ -251,12 +246,12 @@ def test_inline_renders_in_place_with_back_then_reopens_menu():
 def test_one_off_marks_triggered_no_back():
     async def scenario():
         core = _kernel_with_shell()
-        inst = await core.open_window(100, _ShellTopic, "work")
-        tid = inst.thread_id
-        task = asyncio.create_task(core.show_menu(100, tid))
+        inst = await core.open_window(_ShellTopic, "work", origin="0")
+        tid = inst.window
+        task = asyncio.create_task(core.show_menu(tid))
         await _tap(core, "🔪 Kill")  # one-off → menu ends immediately, no Back offered
         await asyncio.wait_for(task, timeout=1)  # would hang if a Back prompt were waiting
-        return core.bot
+        return kernel_bot(core)
 
     bot = asyncio.run(scenario())
     assert any(text == "▸ 🔪 Kill" for _mid, text in bot.edits)  # triggered marker

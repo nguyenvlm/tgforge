@@ -53,48 +53,6 @@
   },
   {
     "group": "render",
-    "name": "mdv2_escape",
-    "args": [
-      "a_b*c[d](e)"
-    ],
-    "expected": "a\\_b\\*c\\[d\\]\\(e\\)"
-  },
-  {
-    "group": "render",
-    "name": "mdv2_escape",
-    "args": [
-      "version 1.2.3!"
-    ],
-    "expected": "version 1\\.2\\.3\\!"
-  },
-  {
-    "group": "render",
-    "name": "mdv2_escape",
-    "args": [
-      "back\\slash and #hash"
-    ],
-    "expected": "back\\\\slash and \\#hash"
-  },
-  {
-    "group": "render",
-    "name": "expandable",
-    "args": [
-      "Header only",
-      ""
-    ],
-    "expected": "**>Header only||"
-  },
-  {
-    "group": "render",
-    "name": "expandable",
-    "args": [
-      "Header",
-      "line1\nline2\nline3"
-    ],
-    "expected": "**>Header\n>\n>line1\n>line2\n>line3||"
-  },
-  {
-    "group": "render",
     "name": "tool_line",
     "args": [
       "Bash",
@@ -246,64 +204,6 @@
       ""
     ],
     "expected": "$ cmd"
-  },
-  {
-    "group": "render",
-    "name": "shell_md",
-    "args": [
-      "ls",
-      [
-        "hi there\n"
-      ],
-      "done"
-    ],
-    "expected": "```\n$ ls\nhi there\n[done]\n```"
-  },
-  {
-    "group": "render",
-    "name": "shell_md",
-    "args": [
-      "tall",
-      [
-        "x\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\n"
-      ],
-      "…"
-    ],
-    "expected": "**>$ tall · …\n>\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x\n>x||"
-  },
-  {
-    "group": "render",
-    "name": "shell_md",
-    "args": [
-      "long",
-      [
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      ],
-      "…"
-    ],
-    "expected": "**>$ long · …\n>\n>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa||"
-  },
-  {
-    "group": "render",
-    "name": "shell_md",
-    "args": [
-      "bt",
-      [
-        "has `tick` and \\ slash\n"
-      ],
-      "done"
-    ],
-    "expected": "```\n$ bt\nhas \\`tick\\` and \\\\ slash\n[done]\n```"
-  },
-  {
-    "group": "render",
-    "name": "shell_md",
-    "args": [
-      "cmd",
-      [],
-      ""
-    ],
-    "expected": "```\n$ cmd\n```"
   },
   {
     "group": "render",

@@ -1,5 +1,5 @@
 """`tgforge restart` loads the bot home's config and schedules a detached restart,
-passing the requester thread from TELEGRAM_THREAD_ID; a home with no `service` is
+passing the requester window from TGFORGE_WINDOW; a home with no `service` is
 refused instead of restarting."""
 
 from __future__ import annotations
@@ -26,11 +26,11 @@ def test_restart_schedules_with_thread_from_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service,
         "detached_restart",
-        lambda svc, h, announce_thread=None: calls.append((svc, str(h), announce_thread)),
+        lambda svc, h, announce_window=None: calls.append((svc, str(h), announce_window)),
     )
-    monkeypatch.setenv("TELEGRAM_THREAD_ID", "42")
+    monkeypatch.setenv("TGFORGE_WINDOW", "42")
     cli.main(["restart", "--home", str(home)])
-    assert calls == [("mybot", str(home), 42)]
+    assert calls == [("mybot", str(home), "42")]
 
 
 def test_restart_without_thread_env_passes_none(tmp_path, monkeypatch):
@@ -39,9 +39,9 @@ def test_restart_without_thread_env_passes_none(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service,
         "detached_restart",
-        lambda svc, h, announce_thread=None: calls.append(announce_thread),
+        lambda svc, h, announce_window=None: calls.append(announce_window),
     )
-    monkeypatch.delenv("TELEGRAM_THREAD_ID", raising=False)
+    monkeypatch.delenv("TGFORGE_WINDOW", raising=False)
     cli.main(["restart", "--home", str(home)])
     assert calls == [None]
 

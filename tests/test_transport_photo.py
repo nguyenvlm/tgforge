@@ -9,6 +9,7 @@ import base64
 
 from tgforge.base import ui
 from tgforge.base.kernel import Topic
+from tgforge.base.telegram import _markup
 from tgforge.testing import TestClient
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 32).decode()
@@ -19,9 +20,9 @@ _KB = ui.keyboard([[ui.act("Ctrl-C", "term", "int")]])
 def test_send_photo_returns_id_and_passes_markup(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        mid = await c.core.send_photo_b64(100, "image/png", _PNG, reply_markup=_KB)
+        mid = await c.core.transports[0].send_photo_b64("0", "image/png", _PNG, reply_markup=_KB)
         assert isinstance(mid, int)
-        assert c.bot.last_markup is _KB  # keyboard forwarded
+        assert c.bot.last_markup == _markup(_KB)  # keyboard forwarded
 
     asyncio.run(scenario())
 
@@ -29,7 +30,7 @@ def test_send_photo_returns_id_and_passes_markup(tmp_path):
 def test_send_photo_oversized_returns_none(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        assert await c.core.send_photo_b64(100, "image/png", _OVERSIZED) is None
+        assert await c.core.transports[0].send_photo_b64("0", "image/png", _OVERSIZED) is None
 
     asyncio.run(scenario())
 
@@ -37,7 +38,8 @@ def test_send_photo_oversized_returns_none(tmp_path):
 def test_edit_photo_replaces_in_place(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        assert await c.core.edit_photo_b64(100, 7, "image/png", _PNG, reply_markup=_KB) is True
+        tx = c.core.transports[0]
+        assert await tx.edit_photo_b64("0", 7, "image/png", _PNG, reply_markup=_KB) is True
         assert (7, "<photo>") in c.bot.edits  # edited the existing message
 
     asyncio.run(scenario())
@@ -46,7 +48,7 @@ def test_edit_photo_replaces_in_place(tmp_path):
 def test_edit_photo_oversized_returns_false(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        assert await c.core.edit_photo_b64(100, 7, "image/png", _OVERSIZED) is False
+        assert await c.core.transports[0].edit_photo_b64("0", 7, "image/png", _OVERSIZED) is False
 
     asyncio.run(scenario())
 
@@ -54,9 +56,9 @@ def test_edit_photo_oversized_returns_false(tmp_path):
 def test_topic_send_and_edit_photo_forward_markup(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        t = Topic(c.core, 555, "t", None)
+        t = Topic(c.core, "555", "t", None)
         mid = await t.send_photo("image/png", _PNG, reply_markup=_KB)
-        assert isinstance(mid, int) and c.bot.last_markup is _KB
+        assert isinstance(mid, int) and c.bot.last_markup == _markup(_KB)
         assert await t.edit_photo(mid, "image/png", _PNG, reply_markup=_KB) is True
 
     asyncio.run(scenario())

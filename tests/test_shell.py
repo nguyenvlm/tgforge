@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import Kernel
 from tgforge.plugins.shell import Shell, ShellTopic
+from tgforge.testing import kernel_bot, telegram_inbound, telegram_kernel
 
 
 class MockBot:
@@ -56,20 +56,11 @@ class MockBot:
 
 def _kernel(tmp_path):
     cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
-    return Kernel(MockBot(), cfg, [Shell()])
+    return telegram_kernel(MockBot(), cfg, [Shell()])
 
 
-def _msg(text, thread_id):
-    return SimpleNamespace(
-        text=text,
-        caption=None,
-        photo=None,
-        document=None,
-        message_id=999,
-        from_user=SimpleNamespace(id=1),
-        chat=SimpleNamespace(id=100),
-        message_thread_id=thread_id,
-    )
+def _msg(text, window):
+    return telegram_inbound(text, window, message_id=999)
 
 
 async def _until(predicate, timeout=4.0):
@@ -85,8 +76,8 @@ async def _until(predicate, timeout=4.0):
 def test_shell_streams_output(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
-        await core.handle_message(_msg("echo hello123", inst.thread_id))
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        await core.handle_message(_msg("echo hello123", inst.window))
         assert await _until(lambda: "hello123" in inst.acc)
         await inst._kill()
 
@@ -96,8 +87,8 @@ def test_shell_streams_output(tmp_path):
 def test_cwd_tracked_and_persisted(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
-        await core.handle_message(_msg("cd /usr", inst.thread_id))
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        await core.handle_message(_msg("cd /usr", inst.window))
         assert await _until(lambda: inst._pid_cwd() == "/usr")
         # the flush loop snapshots the live cwd into the window store
         assert await _until(lambda: inst.saved.get("cwd") == "/usr", timeout=3.0)
@@ -109,8 +100,8 @@ def test_cwd_tracked_and_persisted(tmp_path):
 def test_revive_lands_in_saved_cwd(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
-        tid = inst.thread_id
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        tid = inst.window
         inst.saved["cwd"] = "/usr"
         await inst._kill()
         # a fresh kernel over the same home revives the window; the next message
@@ -129,7 +120,7 @@ def test_revive_lands_in_saved_cwd(tmp_path):
 def test_panel_skips_no_op_render(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
+        inst = await core.open_window(ShellTopic, "work", origin="0")
         try:
             inst._flush_task.cancel()  # only the renders below paint
             # detach the PTY reader: the live bash would append its prompt to `acc`
@@ -137,12 +128,12 @@ def test_panel_skips_no_op_render(tmp_path):
             asyncio.get_event_loop().remove_reader(inst.master_fd)
             await core.flush_frames()
             inst.acc = "hello output"
-            core.bot.edits = 0
+            kernel_bot(core).edits = 0
             inst._render()
             await core.flush_frames()
             inst._render()  # identical content → the kernel skips it, no plain-fallback flip
             await core.flush_frames()
-            assert core.bot.edits == 1
+            assert kernel_bot(core).edits == 1
         finally:
             await inst._kill()
 
@@ -152,11 +143,11 @@ def test_panel_skips_no_op_render(tmp_path):
 def test_feed_preserves_leading_whitespace(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
+        inst = await core.open_window(ShellTopic, "work", origin="0")
         out = tmp_path / "ws.txt"
-        await core.handle_message(_msg(f"cat > {out}", inst.thread_id))
+        await core.handle_message(_msg(f"cat > {out}", inst.window))
         assert await _until(out.exists)  # cat opened the redirect before we feed the line
-        await core.handle_message(_msg("   spaced", inst.thread_id))  # leading spaces kept raw
+        await core.handle_message(_msg("   spaced", inst.window))  # leading spaces kept raw
         inst._write(b"\x04")  # Ctrl-D closes cat's stdin
         assert await _until(lambda: out.read_text() == "   spaced\n")
         await inst._kill()
@@ -185,10 +176,10 @@ def test_real_tui_is_detected_and_shell_handed_back(tmp_path, prog, template):
 
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
+        inst = await core.open_window(ShellTopic, "work", origin="0")
         buf = tmp_path / "buf.txt"
         buf.write_text("hello\nworld\n")
-        await core.handle_message(_msg(template.format(f=buf), inst.thread_id))
+        await core.handle_message(_msg(template.format(f=buf), inst.window))
         shell_pg = os.getpgid(inst.proc.pid)
         # would stay on the TUI's own group forever if it were never intercepted
         assert await _until(lambda: os.tcgetpgrp(inst.master_fd) == shell_pg, timeout=12.0)
@@ -205,8 +196,8 @@ def test_clear_command_is_not_intercepted(tmp_path):
 
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
-        await core.handle_message(_msg("clear", inst.thread_id))
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        await core.handle_message(_msg("clear", inst.window))
         await asyncio.sleep(1.0)  # let the clear stream through
         assert inst.tui is False
         assert inst.allow_universal is True
@@ -222,16 +213,16 @@ def test_tui_intercept_posts_notice(tmp_path):
 
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
-        core.bot.sent.clear()
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        kernel_bot(core).sent.clear()
         cmd = (
             "python3 -c 'import signal,sys,time; signal.signal(signal.SIGTERM, "
             'lambda *a: sys.exit(0)); sys.stdout.write("\\033[?1049h"); '
             "sys.stdout.flush(); time.sleep(30)'"
         )
-        await core.handle_message(_msg(cmd, inst.thread_id))
+        await core.handle_message(_msg(cmd, inst.window))
         # MarkdownV2 escaping mangles "full-screen"; "terminal UI" survives clean
-        assert await _until(lambda: any("terminal UI" in t for t in core.bot.sent))
+        assert await _until(lambda: any("terminal UI" in t for t in kernel_bot(core).sent))
         await inst._kill()
 
     asyncio.run(scenario())
@@ -240,7 +231,7 @@ def test_tui_intercept_posts_notice(tmp_path):
 def test_tui_process_is_stopped_and_shell_is_handed_back(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
-        inst = await core.open_window(100, ShellTopic, "work")
+        inst = await core.open_window(ShellTopic, "work", origin="0")
         # a program that enters the alt-screen and would otherwise block forever, and
         # (like nano) never emits the alt-screen-off sequence when signalled
         cmd = (
@@ -248,7 +239,7 @@ def test_tui_process_is_stopped_and_shell_is_handed_back(tmp_path):
             'lambda *a: sys.exit(0)); sys.stdout.write("\\033[?1049h"); '
             "sys.stdout.flush(); time.sleep(30)'"
         )
-        await core.handle_message(_msg(cmd, inst.thread_id))
+        await core.handle_message(_msg(cmd, inst.window))
         assert await _until(lambda: inst.tui)  # detected the alt-screen
         shell_pg = os.getpgid(inst.proc.pid)
         # the process is stopped and the shell's own group holds the terminal again

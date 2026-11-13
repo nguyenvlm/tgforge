@@ -7,10 +7,11 @@ import asyncio
 import json
 from pathlib import Path
 
+from tgforge.base.telegram import TelegramAdapter
 from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.testing import TestClient
 
-THREAD = 555
+THREAD = "555"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cli_usage_events.jsonl"
 
 
@@ -97,7 +98,7 @@ def client(tmp_path) -> TestClient:
     return TestClient(Claude(), home=str(tmp_path))
 
 
-def window(c: TestClient, tmp_path, thread: int = THREAD) -> ClaudeTopic:
+def window(c: TestClient, tmp_path, thread: str = THREAD) -> ClaudeTopic:
     """A Claude window without the interactive on_open pickers, on an empty session."""
     t = c.core._instantiate(ClaudeTopic, thread, "work")
     c.core.owners[thread] = "claude"
@@ -113,17 +114,17 @@ async def drain(c: TestClient, t: ClaudeTopic) -> None:
         await c.core.flush_frames()
 
 
-def screen(c: TestClient, thread: int = THREAD) -> list[tuple[int, str]]:
+def screen(c: TestClient, thread: str = THREAD) -> list[tuple[int, str]]:
     """The thread as it reads now: (message id, current text) in chat order."""
     edits = dict(c.bot.edits)  # the last edit per message wins
     return [
         (mid, edits.get(mid, text))
         for mid, tid, text in c.bot.created
-        if tid == thread and mid not in c.bot.deleted
+        if TelegramAdapter.window_of(tid) == thread and mid not in c.bot.deleted
     ]
 
 
-def texts(c: TestClient, thread: int = THREAD) -> list[str]:
+def texts(c: TestClient, thread: str = THREAD) -> list[str]:
     return [text for _mid, text in screen(c, thread)]
 
 

@@ -1,5 +1,11 @@
 {
   "token": "<bot-token-from-@BotFather>",
   "home": "~/.tgforge/mybot",
-  "service": "mybot"
+  "service": "mybot",
+  "slack": {
+    "bot_token": "xoxb-<slack-bot-token>",
+    "app_token": "xapp-<slack-app-level-token>",
+    "owner_id": null,
+    "control_channel": null
+  }
 }

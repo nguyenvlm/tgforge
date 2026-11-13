@@ -1,6 +1,6 @@
 """Local-filesystem browser: `/localfs` opens a tap-to-navigate window over the
 whole filesystem. The view is the window's bottom frame: each tap records its newest
-content (edited in place when a slot is free), so taps never wait on Telegram, and a
+content (edited in place when a slot is free), so taps never wait on the platform, and a
 newer message in the topic re-sends it below. A typed path jumps to that folder. The
 current dir / file view persists in the window store, so a restart re-renders where it
 left off; the title stays the window's name.
@@ -31,13 +31,13 @@ def _human_size(n: int) -> str:
     return f"{size:.1f}P"
 
 
-def _code(content: str) -> str:
+def _code(content: str, measure) -> str:
+    """`content` as a code block; over the budget once rendered (`measure`, the window's
+    adapter), its first half instead."""
     budget = MAX_MSG - 10
-    esc = content.replace("\\", "\\\\").replace("`", "\\`")
-    if len(esc) > budget:
+    if measure(ui.code_block(content)) > budget:
         content = content[: budget // 2]
-        esc = content.replace("\\", "\\\\").replace("`", "\\`")
-    return f"```\n{esc}\n```"
+    return ui.code_block(content)
 
 
 @launch("/localfs", "browse the local filesystem")
@@ -130,7 +130,7 @@ class LocalfsTopic(Topic):
             size = os.path.getsize(path)
         except OSError as e:
             content = f"⚠ {e}"
-            return _code(content), content, ui.keyboard([[back, close]])
+            return _code(content, self.adapter.measure), content, ui.keyboard([[back, close]])
         head = f"📄 {path}\n{_human_size(size)}"
         try:
             with open(path, "rb") as f:
@@ -146,11 +146,11 @@ class LocalfsTopic(Topic):
             preview = f"\n\n⚠ {e}"
         content = head + preview
         dl = ui.act("⬇ download", "fs", "dl")
-        return _code(content), content, ui.keyboard([[dl], [back, close]])
+        return _code(content, self.adapter.measure), content, ui.keyboard([[dl], [back, close]])
 
     def _redraw(self):
         """Record the view's newest frame and return at once: a burst of taps shows the
-        last view, never waiting on Telegram."""
+        last view, never waiting on the platform."""
         if self.saved.get("view"):
             md, plain, markup = self._file_view()
             self.show_bottom_frame(VIEW_FRAME, plain, md, reply_markup=markup)

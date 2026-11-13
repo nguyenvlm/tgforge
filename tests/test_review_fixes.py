@@ -11,10 +11,11 @@ from types import SimpleNamespace
 
 from aiogram.exceptions import TelegramAPIError
 
+from tgforge.base.telegram import _markup
 from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.plugins.claude.driver import _project_dir
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
-from tgforge.testing import TestClient
+from tgforge.testing import TestClient, telegram_inbound
 
 
 class _ApiErr(TelegramAPIError):
@@ -33,7 +34,7 @@ def test_ask_buttons_bails_on_failed_send(tmp_path):
             raise _ApiErr()
 
         c.bot.send_message = boom
-        value, mid = await asyncio.wait_for(c.core.ask_buttons(100, None, "Pick?", [("A", "a")]), 2)
+        value, mid = await asyncio.wait_for(c.core.ask_buttons("0", "Pick?", [("A", "a")]), 2)
         assert value is None and mid is None  # returned at once, not after the timeout
 
     asyncio.run(scenario())
@@ -47,7 +48,7 @@ def test_ask_text_bails_on_failed_prompt_send(tmp_path):
             raise _ApiErr()
 
         c.bot.send_message = boom
-        assert await asyncio.wait_for(c.core.ask_text(100, None, "Path?"), 2) is None
+        assert await asyncio.wait_for(c.core.ask_text("0", "Path?"), 2) is None
         assert c.core._await_input.get(0) is None  # the feeder was cleaned up
 
     asyncio.run(scenario())
@@ -59,18 +60,9 @@ def test_ask_text_bails_on_failed_prompt_send(tmp_path):
 def test_media_only_does_not_cancel_ask_text(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        task = asyncio.create_task(c.core.ask_text(100, None, "Path?"))
+        task = asyncio.create_task(c.core.ask_text("0", "Path?"))
         await c.pump()
-        photo = SimpleNamespace(
-            message_id=1,
-            text=None,
-            caption=None,
-            photo=["file"],
-            document=None,
-            from_user=SimpleNamespace(id=1),
-            chat=SimpleNamespace(id=100),
-            message_thread_id=None,
-        )
+        photo = telegram_inbound("", photo=[SimpleNamespace(file_id="file")])
         await c.core.handle_message(photo)
         assert not task.done()  # the prompt is still waiting, not cancelled
         await c.send("typed/path")
@@ -85,13 +77,13 @@ def test_media_only_does_not_cancel_ask_text(tmp_path):
 def test_dedup_base_survives_title_refresh(tmp_path):
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
-        w = await c.core.open_window(100, LocalfsTopic, None)
+        w = await c.core.open_window(LocalfsTopic, None, origin="0")
         w.saved["base_name"] = "Files #2"  # a deduped window
         w.title_suffix = lambda: "proj"
         await w.refresh_title()
         await c.core.flush_frames()
         # refresh recomposes from the stored base, not the class label → "#2" survives
-        assert c.core._names()[w.thread_id] == "📁 Files #2 · proj"
+        assert c.core._names()[w.window] == "📁 Files #2 · proj"
 
     asyncio.run(scenario())
 
@@ -102,9 +94,9 @@ def test_dedup_base_survives_title_refresh(tmp_path):
 def test_second_menu_supersedes_the_first(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        t1 = asyncio.create_task(c.core.menu(100, None, "M1", [("A", "a"), ("B", "b")]))
+        t1 = asyncio.create_task(c.core.menu("0", "M1", [("A", "a"), ("B", "b")]))
         await c.pump()
-        t2 = asyncio.create_task(c.core.menu(100, None, "M2", [("X", "x"), ("Y", "y")]))
+        t2 = asyncio.create_task(c.core.menu("0", "M2", [("X", "x"), ("Y", "y")]))
         await c.pump()
         assert await asyncio.wait_for(t1, 2) is None  # the first was dismissed
         await c.tap("X")
@@ -119,8 +111,8 @@ def test_second_menu_supersedes_the_first(tmp_path):
 def test_close_keeps_window_when_delete_fails(tmp_path):
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))
-        inst = await c.core.open_window(100, LocalfsTopic, None)
-        tid = inst.thread_id
+        inst = await c.core.open_window(LocalfsTopic, None, origin="0")
+        tid = inst.window
 
         async def boom(**k):
             raise _ApiErr()
@@ -138,7 +130,7 @@ def test_close_keeps_window_when_delete_fails(tmp_path):
 def test_account_switch_carries_transcript(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.plugin.claude_dir = tmp_path / ".claude"
         t.workspace = str(tmp_path)
         old = _project_dir(t._session_config_dir(), Path(t.workspace)) / f"{t.session_id}.jsonl"
@@ -158,10 +150,10 @@ def test_account_switch_carries_transcript(tmp_path):
 def test_set_markup_attaches_keyboard(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         kb = t._suggestion_markup(["yes", "no"])
         await t.send_rich("the answer", reply_markup=kb)
-        assert c.bot.last_markup is kb  # the buttons ride the answer's own send
+        assert c.bot.last_markup == _markup(kb)  # the buttons ride the answer's own send
         assert c.bot.markup_cleared == []  # no separate markup edit
 
     asyncio.run(scenario())
@@ -173,8 +165,8 @@ def test_set_markup_attaches_keyboard(tmp_path):
 def test_plain_suggestion_routes_to_agent(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        c.core.owners[555] = "claude"  # register ownership so routing resolves the class
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
+        c.core.owners["555"] = "claude"  # register ownership so routing resolves the class
         submitted: list[str] = []
 
         async def rec(prompt, reply_to=None):
@@ -193,8 +185,8 @@ def test_plain_suggestion_routes_to_agent(tmp_path):
 def test_bang_suggestion_runs_shell_not_prompt(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
-        c.core.owners[555] = "claude"
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
+        c.core.owners["555"] = "claude"
         submitted: list[str] = []
 
         async def rec(prompt, reply_to=None):
@@ -222,7 +214,7 @@ def test_bang_suggestion_runs_shell_not_prompt(tmp_path):
 def test_account_switch_refused_while_busy(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.busy = True  # a turn is still writing the old account's jsonl
         await t._pick_account()
         assert t.config_dir is None  # the switch never happened

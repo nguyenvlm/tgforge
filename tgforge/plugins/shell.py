@@ -40,8 +40,8 @@ class PtyWindow(Topic):
     pty_rows: int = 40
     pty_cols: int = 120
 
-    def __init__(self, core, thread_id, name, saved):
-        super().__init__(core, thread_id, name, saved)
+    def __init__(self, core, window, name, saved):
+        super().__init__(core, window, name, saved)
         self.master_fd = -1
         self.proc: asyncio.subprocess.Process | None = None
         self.closed = False
@@ -142,8 +142,8 @@ class ShellTopic(PtyWindow):
     menu_label = "Shell"
     slash_commands = False  # slashes are shell input; controls are the panel buttons
 
-    def __init__(self, core, thread_id, name, saved):
-        super().__init__(core, thread_id, name, saved)
+    def __init__(self, core, window, name, saved):
+        super().__init__(core, window, name, saved)
         self.acc = ""  # accumulated cleaned output
         self.dirty = False
         self.tui = False  # a full-screen app holds the alt-screen; panel can't render it
@@ -194,7 +194,7 @@ class ShellTopic(PtyWindow):
         }
         await self._spawn_pty(cwd or str(self._core.config.home_path), env)
         # the panel is sent here, from the handler, so the flush loop (which reads the
-        # PTY) only ever records frames and never waits on Telegram
+        # PTY) only ever records frames and never waits on the platform
         self.msg_id = await self.send("(no output yet)")
         self._flush_task = asyncio.create_task(self._flush_loop())
 
@@ -298,8 +298,7 @@ class ShellTopic(PtyWindow):
         if self.tui or self.msg_id is None:
             return  # a full-screen app briefly holds the screen; _end_tui posts the notice
         body = self.acc[-TAIL_CHARS:].strip() or "(no output yet)"
-        esc = body.replace("\\", "\\\\").replace("`", "\\`")
-        self.show_frame(self.msg_id, body, f"```\n{esc}\n```", reply_markup=self._keys())
+        self.show_frame(self.msg_id, body, ui.code_block(body), reply_markup=self._keys())
 
     def _keys(self):
         return ui.keyboard(

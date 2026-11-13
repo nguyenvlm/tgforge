@@ -9,7 +9,7 @@ import asyncio
 
 from aiogram.exceptions import TelegramBadRequest
 
-from tgforge.base.kernel import Transport
+from tgforge.testing import telegram_transport
 
 
 class _NotModified(TelegramBadRequest):
@@ -43,7 +43,7 @@ class _Bot:
 def test_not_modified_is_success_no_plain_fallback():
     async def scenario():
         bot = _Bot(_NotModified())
-        tx = Transport(bot)
+        tx = telegram_transport(bot)
         ok = await tx.edit_md(100, 7, "```\nshell\n```", "shell")
         assert ok is True  # treated as success
         assert bot.plain_edits == []  # never fell back to plain → format stays shell
@@ -54,7 +54,7 @@ def test_not_modified_is_success_no_plain_fallback():
 def test_other_bad_request_still_falls_back_to_plain():
     async def scenario():
         bot = _Bot(_OtherBadRequest())
-        tx = Transport(bot)
+        tx = telegram_transport(bot)
         await tx.edit_md(100, 7, "```\nshell\n```", "shell")
         assert bot.plain_edits == ["shell"]  # a real markdown failure still degrades
 

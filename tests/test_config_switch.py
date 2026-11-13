@@ -16,8 +16,8 @@ from tgforge.testing import TestClient
 
 def _topic(tmp_path, models=None):
     c = TestClient(Claude(models=models), home=str(tmp_path))
-    t = c.core._instantiate(ClaudeTopic, 555, "work")
-    c.core.owners[555] = "claude"
+    t = c.core._instantiate(ClaudeTopic, "555", "work")
+    c.core.owners["555"] = "claude"
     return c, t
 
 

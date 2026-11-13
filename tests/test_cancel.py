@@ -40,7 +40,7 @@ _CTX = SimpleNamespace(args="")
 def test_cancel_idle_with_running_background_job_still_responds(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.busy = False
         t.proc = _FakeProc()  # process kept alive for the background job
         t.background_tasks = {"bid1": {"label": "job", "start": 0.0, "done": None}}
@@ -55,7 +55,7 @@ def test_cancel_idle_with_running_background_job_still_responds(tmp_path):
 def test_cancel_idle_nothing_running(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.busy = False
         t.proc = None
         await t.cancel(_CTX)
@@ -67,7 +67,7 @@ def test_cancel_idle_nothing_running(tmp_path):
 def test_cancel_dedupes_while_busy(tmp_path):
     async def scenario():
         c = TestClient(home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.busy = True
         t.proc = _FakeProc()
 

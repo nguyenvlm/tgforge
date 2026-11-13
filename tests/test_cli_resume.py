@@ -13,7 +13,7 @@ from tgforge.testing import TestClient
 def test_cli_emits_a_clear_resume_command(tmp_path):
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
-        t = c.core._instantiate(ClaudeTopic, 555, "work")
+        t = c.core._instantiate(ClaudeTopic, "555", "work")
         t.workspace = str(tmp_path)
 
         await t.cli(None)

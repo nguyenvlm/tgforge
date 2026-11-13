@@ -1,7 +1,7 @@
 """The turn engine: a pure reducer over the Claude CLI stream-json events, plus
 the finalize answer-selection. Transport-agnostic — the async process lifecycle
 (spawn, stdin folding, holder reordering) is the driver's job and calls in here,
-so the turn-shaping logic is unit-testable without a process or Telegram.
+so the turn-shaping logic is unit-testable without a process or a platform.
 """
 
 from __future__ import annotations

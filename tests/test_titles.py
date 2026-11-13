@@ -9,23 +9,23 @@ import asyncio
 from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.plugins.shell import Shell, ShellTopic
-from tgforge.testing import TestClient
+from tgforge.testing import TestClient, kernel_bot
 
 
 def _spy_renames(core):
     """Record the names passed to edit_forum_topic; returns the list."""
     calls: list[str] = []
-    orig = core.bot.edit_forum_topic
+    orig = kernel_bot(core).edit_forum_topic
 
     async def spy(**kw):
         calls.append(kw.get("name"))
         return await orig(**kw)
 
-    core.bot.edit_forum_topic = spy
+    kernel_bot(core).edit_forum_topic = spy
     return calls
 
 
-def _instantiate(client, cls, cls_id, tid=555):
+def _instantiate(client, cls, cls_id, tid="555"):
     t = client.core._instantiate(cls, tid, cls.menu_label)
     client.core.owners[tid] = cls_id
     return t
@@ -46,7 +46,7 @@ def test_localfs_title_is_the_window_name(tmp_path):
         t.saved["cwd"] = "/srv/data/myproj"
         await t.refresh_title()
         await c.core.flush_frames()
-        assert c.core._names()[555] == "📁 Files"  # no folder suffix
+        assert c.core._names()["555"] == "📁 Files"  # no folder suffix
 
     asyncio.run(scenario())
 
@@ -69,7 +69,7 @@ def test_claude_session_title_becomes_the_topic_name(tmp_path):
         t.saved["base_name"] = t.title
         await t.refresh_title()
         await c.core.flush_frames()
-        assert c.core._names()[555] == "🤖 Fix the login bug"
+        assert c.core._names()["555"] == "🤖 Fix the login bug"
 
     asyncio.run(scenario())
 
@@ -94,7 +94,7 @@ def test_sync_title_renames_topic_to_the_ai_title(tmp_path):
         _write_jsonl(t, tmp_path, [{"type": "ai-title", "aiTitle": "Retry bug hunt"}])
         await t._sync_title()
         await c.core.flush_frames()
-        assert c.core._names()[555] == "🤖 Retry bug hunt"
+        assert c.core._names()["555"] == "🤖 Retry bug hunt"
 
     asyncio.run(scenario())
 
@@ -116,7 +116,7 @@ def test_sync_title_custom_outranks_ai(tmp_path):
         )
         await t._sync_title()
         await c.core.flush_frames()
-        assert c.core._names()[555] == "🤖 My name"
+        assert c.core._names()["555"] == "🤖 My name"
 
     asyncio.run(scenario())
 
