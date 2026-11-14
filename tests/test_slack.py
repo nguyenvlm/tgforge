@@ -36,10 +36,11 @@ from tgforge.base.kernel import (
     Transport,
     command,
     launch,
+    on_message,
     on_unknown,
     universal,
 )
-from tgforge.base.slack import NAME_MAX, SlackMarkdown, channel_slug
+from tgforge.base.slack import NAME_MAX, PREFIX, SlackMarkdown, channel_slug
 from tgforge.testing import kernel_bot
 
 TG_WINDOW = "1001"
@@ -69,6 +70,24 @@ class Work(Plugin):
     @universal("/usage2", "a universal the escape skips")
     async def usage2(self, ctx):
         SEEN.append(("universal", ctx.text))
+
+
+class RawTopic(Topic):
+    id = "raw"
+    slash_commands = False
+
+    @command("/model", "switch the model")
+    async def model(self, ctx):
+        SEEN.append(("model", ctx.args))
+
+    @on_message
+    async def text(self, ctx):
+        SEEN.append(("text", ctx.text))
+
+
+class Raw(Plugin):
+    id = "raw"
+    topics = [RawTopic]
 
 
 def setup_function():
@@ -482,14 +501,27 @@ def test_a_mention_before_a_command_routes_it_like_the_telegram_slash(tmp_path):
     asyncio.run(scenario())
 
 
-def test_a_space_before_a_command_routes_it_like_the_telegram_slash(tmp_path):
+@pytest.mark.parametrize(
+    "cls, channel, seen",
+    [
+        (WorkTopic, "C9", [("model", "opus")]),  # a window runs it as a command
+        (None, "C0", []),  # General acts only on a mention
+        (RawTopic, "C9", [("text", "/model opus")]),  # a raw-input window takes it as input
+    ],
+    ids=["window", "general", "raw-input-window"],
+)
+def test_a_space_before_a_command_routes_it_like_an_unmentioned_slash(tmp_path, cls, channel, seen):
     async def scenario():
-        core = _kernel(tmp_path)
-        _own(core, SLACK_WINDOW)
+        core = _kernel(tmp_path, [Work(), Raw()])
+        if cls is not None:
+            _own(core, PREFIX + channel, cls)
         adapter = core.transports[1].adapter
         # a leading space keeps Slack from taking the message as its own slash command
-        await core.handle_message(await adapter.to_inbound(_slack_message(" /model opus")))
-        assert SEEN == [("model", "opus")]
+        message = _slack_message(" /model opus", channel=channel)
+        await core.handle_message(await adapter.to_inbound(message))
+        assert SEEN == seen
+        if cls is None:
+            assert slack_client(core).of("chat_postMessage") == []  # no reply either
 
     asyncio.run(scenario())
 
