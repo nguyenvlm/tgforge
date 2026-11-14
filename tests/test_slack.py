@@ -482,6 +482,18 @@ def test_a_mention_before_a_command_routes_it_like_the_telegram_slash(tmp_path):
     asyncio.run(scenario())
 
 
+def test_a_space_before_a_command_routes_it_like_the_telegram_slash(tmp_path):
+    async def scenario():
+        core = _kernel(tmp_path)
+        _own(core, SLACK_WINDOW)
+        adapter = core.transports[1].adapter
+        # a leading space keeps Slack from taking the message as its own slash command
+        await core.handle_message(await adapter.to_inbound(_slack_message(" /model opus")))
+        assert SEEN == [("model", "opus")]
+
+    asyncio.run(scenario())
+
+
 def test_a_bare_tgf_opens_the_menu(tmp_path):
     async def scenario():
         core = _kernel(tmp_path)
