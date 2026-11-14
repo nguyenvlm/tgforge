@@ -80,7 +80,7 @@ from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answ
 LOGGER = logging.getLogger("tgforge")
 
 EDIT_INTERVAL = 2.5  # seconds between live-card frames (the kernel skips what it can't show)
-ALBUM_DEBOUNCE = 2.0
+MESSAGE_DEBOUNCE = 1.0  # quiet seconds before buffered messages go out as one prompt
 RELEASE_IDLE_SEC = 1800
 CONTROL_TIMEOUT = 10.0  # seconds to wait for the CLI's answer to a control request
 UPDATER_INTERVAL = 5.0
@@ -210,7 +210,9 @@ class ClaudeTopic(Topic):
         self.mirror_start = 0.0
         self.mirror_tick = 0
         self._suggested: dict[str, dict] = {}
-        self._albums: dict[str, dict] = {}
+        self.message_buffer: list[tuple] = []  # (Inbound, text, download task)
+        self.message_last_arrival = 0.0
+        self.message_flush_task: asyncio.Task | None = None
 
     # ── Convenience ────────────────────────────────────────────────
     def _env_tag(self) -> str:
@@ -301,6 +303,7 @@ class ClaudeTopic(Topic):
             self.mirror_task,
             self.background_updater_task,
             self.release_task,
+            self.message_flush_task,
             *self.send_steps,
         ):
             if t is not None:
@@ -1162,32 +1165,37 @@ class ClaudeTopic(Topic):
     def _attach_dir(self) -> Path:
         return Path(self.workspace) / "tmp" / "attachments"
 
-    async def _route_media(self, message, text):
-        gid = message.album
-        if not gid:
-            built = await self._build_prompt([message], text)
-            if built:
-                await self.submit(built, reply_to=message.message_id)
-            return
-        buf = self._albums.setdefault(gid, {"msgs": [], "text": ""})
-        buf["msgs"].append(message)
-        if text and not buf["text"]:
-            buf["text"] = text
-        old = buf.get("task")
-        if old is not None:
-            old.cancel()
-        buf["task"] = asyncio.create_task(self._flush_album(gid))
+    async def _buffer_message(self, message, text):
+        """Buffer a message; the window's buffered messages go out as one prompt once
+        `MESSAGE_DEBOUNCE` passes with no new message and every download has finished
+        (an album, or a forward and its comment, arrive as separate messages)."""
+        attachments = message.attachments + message.replied_attachments
+        download = asyncio.create_task(self._download_attachments(attachments))
+        self.message_buffer.append((message, text, download))
+        self.message_last_arrival = asyncio.get_running_loop().time()
+        if self.message_flush_task is None:
+            self.message_flush_task = asyncio.create_task(self._flush_messages())
 
-    async def _flush_album(self, gid):
+    async def _flush_messages(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            quiet_left = self.message_last_arrival + MESSAGE_DEBOUNCE - loop.time()
+            if quiet_left > 0:
+                await asyncio.sleep(quiet_left)
+                continue
+            downloading = [d for _, _, d in self.message_buffer if not d.done()]
+            if not downloading:
+                break
+            await asyncio.wait(downloading)
+        buffered, self.message_buffer = self.message_buffer, []
+        self.message_flush_task = None
         try:
-            await asyncio.sleep(ALBUM_DEBOUNCE)
-        except asyncio.CancelledError:
-            return
-        buf = self._albums.pop(gid, None)
-        if not buf or not buf["msgs"]:
-            return
-        prompt = await self._build_prompt(buf["msgs"], buf["text"])
-        await self.submit(prompt, reply_to=buf["msgs"][0].message_id)
+            prompt = self._build_prompt(buffered)
+        except Exception:  # nothing awaits this task: log before the messages are lost
+            LOGGER.exception("message flush (%s): prompt build failed", self.name)
+            raise
+        if prompt:
+            await self.submit(prompt, reply_to=buffered[0][0].message_id)
 
     def _context_prefix(self, message) -> str:
         notes: list[str] = []
@@ -1207,15 +1215,18 @@ class ClaudeTopic(Topic):
                 notes.append(f"[{label} {who}: {quoted}{tail}]")
         return "\n".join(notes)
 
-    async def _build_prompt(self, msgs, text) -> str:
+    def _build_prompt(self, buffered) -> str:
+        """One prompt from buffered (Inbound, text, finished download) entries: each
+        message's context note and text in arrival order, then every saved file."""
         parts: list[str] = []
-        ctx = self._context_prefix(msgs[0])
-        if ctx:
-            parts.append(ctx)
-        if text:
-            parts.append(text)
-        attachments = [a for m in msgs for a in m.attachments] + msgs[0].replied_attachments
-        paths = await self._download_attachments(attachments)
+        paths: list[Path] = []
+        for message, text, download in buffered:
+            ctx = self._context_prefix(message)
+            if ctx:
+                parts.append(ctx)
+            if text:
+                parts.append(text)
+            paths += download.result()
         if paths:
             listing = "\n".join(str(p) for p in paths)
             parts.append(f"[Attached file(s), saved locally — Read to view:\n{listing}\n]")
@@ -1655,7 +1666,7 @@ class ClaudeTopic(Topic):
     # ── Text handlers ──────────────────────────────────────────────
     @on_message
     async def prompt_msg(self, ctx):
-        await self._route_media(ctx.message, ctx.text)
+        await self._buffer_message(ctx.message, ctx.text)
 
     @on_unknown
     async def skill(self, ctx):

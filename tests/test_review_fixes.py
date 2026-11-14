@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from aiogram.exceptions import TelegramAPIError
 
 from tgforge.base.telegram import _markup
-from tgforge.plugins.claude import Claude, ClaudeTopic
+from tgforge.plugins.claude import Claude, ClaudeTopic, driver
 from tgforge.plugins.claude.driver import _project_dir
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.testing import TestClient, telegram_inbound
@@ -162,7 +162,9 @@ def test_set_markup_attaches_keyboard(tmp_path):
 # ── a tapped suggestion goes through the router, not straight to submit ──
 
 
-def test_plain_suggestion_routes_to_agent(tmp_path):
+def test_plain_suggestion_routes_to_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(driver, "MESSAGE_DEBOUNCE", 0.01)
+
     async def scenario():
         c = TestClient(Claude(), home=str(tmp_path))
         t = c.core._instantiate(ClaudeTopic, "555", "work")
@@ -176,6 +178,7 @@ def test_plain_suggestion_routes_to_agent(tmp_path):
         t._suggestion_markup(["hi there", "!ls"])
         token = next(iter(t._suggested))
         await t._on_suggestion(SimpleNamespace(message=None), f"{token}:0")
+        await t.message_flush_task  # a tapped reply waits out the message debounce like typed text
         assert submitted == ["hi there"]  # a plain reply still reaches the agent
         assert any("☑️ hi there" in text for _tid, text in c.bot.sent)  # tap is visibly acked
 
