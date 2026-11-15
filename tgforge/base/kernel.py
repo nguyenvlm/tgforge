@@ -5,7 +5,7 @@ subprocess reaper, persistence (`AppDB`, one SQLite file; `SavedDict`, namespace
 dict-like views), the plugin declaration decorators, the `Topic` and `Plugin` bases,
 the neutral event types (`Inbound`, `Tap`) and call outcomes an adapter reports, the
 `Transport` (one platform adapter behind one pacer and flood-wait deadline, with the
-rich-then-plain retry, chunking, and the frame-skip output for live messages and
+body-by-body fallback, chunking, and the frame-skip output for live messages and
 titles), the command registry (built once at startup; aborts the launch on any name
 clash), the per-call `Context` a handler receives, and the `Kernel` itself. The kernel
 holds one `Transport` per configured platform and picks a window's by its key; it owns
@@ -924,10 +924,12 @@ class Plugin:
 # title); close_window(window); window_alive(window, title) -> bool; answer_tap(tap);
 # identity() -> bot name; bind_owner(user id); render(markdown) -> (rich or None,
 # plain); render_pages(pages) -> [(rich or None, plain)]; measure(markdown) ->
-# rendered size; page_size(head, body, first) -> rendered page size; classify(error);
+# rendered size; page_size(head, body, first) -> rendered page size; bodies(body) ->
+# the bodies to try in order for one message (a rich body then its fallbacks, plain
+# text first as the platform's own form); classify(error);
 # run(on message, on tap); close() (after the drain). Attributes: platform, bot_name,
 # key_prefix, general, owner_id, command_prefix, pages_in_thread, renders_tables,
-# max_message, safe_chunk, photo_max, upload_max, download_max.
+# max_message, photo_max, upload_max, download_max.
 
 
 @dataclass
@@ -1184,20 +1186,31 @@ class Transport:
         rejections, returning None (or `_NOT_MODIFIED`, see `_attempt`). `paced=False` (a
         button-tap answer, which posts no message) skips the pacer slot and the order
         queue but still waits out a flood-wait."""
+        return await self._call_chain([make_call], ok_not_modified, paced, sent_to)
+
+    async def _call_chain(self, make_calls, ok_not_modified=False, paced=True, sent_to=None):
+        """`_call` over alternatives for one message: each factory in turn until the
+        platform takes one, all under one hold of the issue order, so a refused body's
+        fallback goes out before any call issued after it."""
         self._pacer.waiting += 1
         try:
             async with self._send_order if paced else contextlib.nullcontext():
-                while True:
-                    await self._clear_to_call(paced=paced)
-                    result = await self._attempt(
-                        make_call,
-                        ok_not_modified,
-                        spare=False,
-                        paced=paced,
-                        sent_to=sent_to,
-                    )
-                    if result is not _FLOODED:
+                result = None
+                for make_call in make_calls:
+                    while True:
+                        await self._clear_to_call(paced=paced)
+                        result = await self._attempt(
+                            make_call,
+                            ok_not_modified,
+                            spare=False,
+                            paced=paced,
+                            sent_to=sent_to,
+                        )
+                        if result is not _FLOODED:
+                            break
+                    if result is not None:
                         return result
+                return result
         finally:
             self._pacer.waiting -= 1
 
@@ -1210,6 +1223,28 @@ class Transport:
         if isinstance(md, ui.Pages):
             return self.adapter.render_pages(_first_page(md))[0][0]
         return self.adapter.render(md)[0]
+
+    def _bodies(self, rich, plain) -> list:
+        """Every body to try for one message, in order: the rich render's (when it fits),
+        then the plain body's."""
+        rich_bodies = self.adapter.bodies(rich) if rich is not None else []
+        return rich_bodies + self.adapter.bodies(plain)
+
+    async def _attempt_bodies(self, bodies, make_call, **kw):
+        """Frame mode: one `_attempt` per body until the platform takes one; each retry
+        takes a fresh spare slot. The last attempt's result when none is taken."""
+        result = None
+        for i, body in enumerate(bodies):
+            if i:
+                await self._clear_to_call(spare=True)
+            result = await self._attempt(lambda body=body: make_call(body), **kw)
+            if result is not None:
+                return result
+        return result
+
+    async def _call_bodies(self, bodies, make_call, **kw):
+        """Essential mode: the bodies as one `_call_chain`."""
+        return await self._call_chain([lambda body=body: make_call(body) for body in bodies], **kw)
 
     def _plain(self, plain, md) -> str:
         """The caller's plain body, else the plain render of `md`."""
@@ -1491,20 +1526,12 @@ class Transport:
         content = (frame.plain, frame.md, frame.reply_markup)  # the newest, read at the send
         plain, md, markup = content
         window = frame.window
-        result = None
         rich = self._rich(md) if md is not None else None
-        if rich is not None:
-            result = await self._attempt(
-                lambda: self.adapter.send(window, rich, markup, None, silent=True),
-                sent_to=window,
-            )
-            if result is None:  # the rich body was rejected: a second, plain attempt
-                await self._clear_to_call(spare=True)
-        if result is None:
-            result = await self._attempt(
-                lambda: self.adapter.send(window, _cap(plain), markup, None, silent=True),
-                sent_to=window,
-            )
+        result = await self._attempt_bodies(
+            self._bodies(rich, _cap(plain)),
+            lambda body: self.adapter.send(window, body, markup, None, silent=True),
+            sent_to=window,
+        )
         if result is _FLOODED:
             LOGGER.info("bottom frame %s: re-send flood-waited, retrying", key[1])
             self._mark_dirty(key)
@@ -1553,8 +1580,9 @@ class Transport:
                 await self._recheck_flood()
             else:
                 await self._clear_to_call(spare=True)
-            stub = await self._attempt(
-                lambda: self.adapter.edit(window, old, STUB_TEXT, None),
+            stub = await self._attempt_bodies(
+                self.adapter.bodies(STUB_TEXT),
+                lambda body: self.adapter.edit(window, old, body, None),
                 ok_not_modified=True,
             )
             if stub is None or stub is _FLOODED:
@@ -1598,16 +1626,9 @@ class Transport:
         rejects it) the plain body. An over-limit render is never sent: a hard cut could
         land on valid markup and silently drop the final words."""
         rich = self._rich(md) if md is not None else None
-        if rich is not None:
-            result = await self._attempt(
-                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
-                ok_not_modified=True,
-            )
-            if result is not None:
-                return result
-            await self._clear_to_call(spare=True)
-        return await self._attempt(
-            lambda: self.adapter.edit(window, msg_id, _cap(plain), reply_markup),
+        return await self._attempt_bodies(
+            self._bodies(rich, _cap(plain)),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
             ok_not_modified=True,
         )
 
@@ -1621,9 +1642,10 @@ class Transport:
         for i, chunk in enumerate(pieces):
             buttons = reply_markup if i == len(pieces) - 1 else None
             reply = reply_to if i == 0 else None
-            result = await self._call(
-                lambda chunk=chunk, buttons=buttons, reply=reply: self.adapter.send(
-                    window, _cap(chunk), buttons, reply
+            result = await self._call_bodies(
+                self._bodies(None, _cap(chunk)),
+                lambda body, buttons=buttons, reply=reply: self.adapter.send(
+                    window, body, buttons, reply
                 ),
                 sent_to=sent_to,
             )
@@ -1632,8 +1654,9 @@ class Transport:
 
     async def edit(self, window, msg_id, text, reply_markup=None) -> bool:
         """Replace a message's text (plain); its buttons become `reply_markup`."""
-        result = await self._call(
-            lambda: self.adapter.edit(window, msg_id, _cap(text), reply_markup),
+        result = await self._call_bodies(
+            self._bodies(None, _cap(text)),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
             ok_not_modified=True,
         )
         return result is not None
@@ -1650,7 +1673,7 @@ class Transport:
         """Send standard Markdown, rendered by the adapter (plain fallback per piece),
         split to fit; the `reply_markup` goes on the last piece."""
         mid = None
-        pieces = md_chunks(text, self.adapter.measure, self.adapter.safe_chunk)
+        pieces = md_chunks(text, self.adapter.measure)
         for i, raw in enumerate(pieces):
             buttons = reply_markup if i == len(pieces) - 1 else None
             reply = reply_to if i == 0 else None
@@ -1663,18 +1686,11 @@ class Transport:
         rejects it) the plain body."""
         rendered_rich, rendered_plain = self.adapter.render(md)
         plain = rendered_plain if plain is None else plain
-        result = None
-        if rendered_rich is not None:
-            result = await self._call(
-                lambda: self.adapter.send(window, rendered_rich, buttons, reply_to, silent=silent),
-                sent_to=window,
-            )
-        if result is None:
-            result = await self._call(
-                lambda: self.adapter.send(window, _cap(plain), buttons, reply_to, silent=silent),
-                sent_to=window,
-            )
-        return result
+        return await self._call_bodies(
+            self._bodies(rendered_rich, _cap(plain)),
+            lambda body: self.adapter.send(window, body, buttons, reply_to, silent=silent),
+            sent_to=window,
+        )
 
     async def send_md(
         self,
@@ -1709,22 +1725,13 @@ class Transport:
         """One page of `Pages`; a page posted in a thread is not a new message of the
         window's timeline, so it moves no bottom frame."""
         sent_to = None if thread is not None else window
-        result = None
-        if rich is not None:
-            result = await self._call(
-                lambda: self.adapter.send(
-                    window, rich, None, reply_to, silent=silent, thread=thread
-                ),
-                sent_to=sent_to,
-            )
-        if result is None:
-            result = await self._call(
-                lambda: self.adapter.send(
-                    window, _cap(plain), None, reply_to, silent=silent, thread=thread
-                ),
-                sent_to=sent_to,
-            )
-        return result
+        return await self._call_bodies(
+            self._bodies(rich, _cap(plain)),
+            lambda body: self.adapter.send(
+                window, body, None, reply_to, silent=silent, thread=thread
+            ),
+            sent_to=sent_to,
+        )
 
     async def edit_rich(self, window, msg_id, text) -> bool:
         """Edit a message to standard Markdown (plain fallback)."""
@@ -1733,16 +1740,12 @@ class Transport:
     async def edit_md(self, window, msg_id, md, plain, reply_markup=None) -> bool:
         """Edit a message to standard Markdown with a caller-bounded plain fallback. An
         over-limit render goes straight to the plain body, never cut."""
-        rich = self._rich(md)
-        result = None
-        if rich is not None:
-            result = await self._call(
-                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
-                ok_not_modified=True,
-            )
-        if result is not None:
-            return True
-        return await self.edit(window, msg_id, self._plain(plain, md), reply_markup=reply_markup)
+        result = await self._call_bodies(
+            self._bodies(self._rich(md), _cap(self._plain(plain, md))),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
+            ok_not_modified=True,
+        )
+        return result is not None
 
     async def delete_msg(self, window, msg_id) -> None:
         """Delete a message (its pending frame is dropped); a rejection (the message is

@@ -6,13 +6,13 @@ from __future__ import annotations
 import pytest
 
 from tgforge.base import ui
-from tgforge.base.telegram import SAFE_RAW_CHUNK, TelegramAdapter, to_md
+from tgforge.base.telegram import TelegramAdapter, to_md
 from tgforge.base.ui import MAX_MSG, fmt_duration
 
 
 def md_chunks(text):
-    """The Telegram split: pieces measured as their MarkdownV2 render."""
-    return ui.md_chunks(text, TelegramAdapter.measure, SAFE_RAW_CHUNK)
+    """The Telegram split: pieces measured as their render."""
+    return ui.md_chunks(text, TelegramAdapter.measure)
 
 
 def test_md_chunks_keep_converted_pieces_under_limit():
@@ -184,7 +184,7 @@ def test_to_md_output_is_valid_mdv2(raw):
 
 def test_md_chunks_fit_with_unindented_list_continuation():
     # lazy continuation lines inside a nested item: a hanging indent the source
-    # lacks would grow every line past the SAFE_RAW_CHUNK bound
+    # lacks would grow every line past MAX_MSG
     raw = "- - - a\n" + ".\n" * 3000
     for p in md_chunks(raw):
         assert len(to_md(p)) <= MAX_MSG

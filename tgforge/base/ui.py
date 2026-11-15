@@ -9,10 +9,13 @@ function another app registered — the bot core routes it.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
 MAX_MSG = 4096
+FULL_ENOUGH = MAX_MSG * 15 // 16  # a fitting piece at least this size ends the search
+HALF_FULL = MAX_MSG // 2  # a preferred cut (whitespace, an unindented line) fills at least this
 CTA_PREFIX = "cta"
 ACT_PREFIX = "act"
 
@@ -45,10 +48,19 @@ def chunks(text: str) -> list[str]:
     return out
 
 
-def md_chunks(text: str, measure: Callable[[str], int], floor: int) -> list[str]:
-    """Split Markdown so each piece's rendered size (`measure`, the adapter's) also fits
+def md_chunks(text: str, measure: Callable[[str], int]) -> list[str]:
+    """Split Markdown so each piece's rendered size (`measure`, the adapter's) fits
     MAX_MSG — a raw-length-only split can render past the limit and fall back to plain.
-    Shrinks newline-first down to `floor`, a raw size whose render always fits."""
+    Each piece is a prefix that fits, the longest or one filling FULL_ENOUGH, found by
+    bisection, every piece measured as sent. It ends at a newline when one fits (before
+    a line indented under 4 spaces when that piece fills HALF_FULL); else inside the
+    line at whitespace outside inline formatting, else at whitespace (each only when
+    the piece fills HALF_FULL, so never one holding only a block marker), else at the
+    longest-fitting character. A code
+    block open at the cut is closed at the end of the piece (never right after its
+    opening line) and reopened (same fence line) at the start of the next; a list
+    continuation opening the next piece loses its indent; a line cut midway continues
+    with its block marker escaped, so it reads as text."""
     if not text:
         return ["(empty)"]
     out = []
@@ -56,15 +68,264 @@ def md_chunks(text: str, measure: Callable[[str], int], floor: int) -> list[str]
         if len(text) <= MAX_MSG and measure(text) <= MAX_MSG:
             out.append(text)
             break
-        cut = text.rfind("\n", 1, min(len(text), MAX_MSG))
-        if cut == -1:
-            cut = min(len(text), MAX_MSG)
-        while cut > floor and measure(text[:cut]) > MAX_MSG:
-            newline = text.rfind("\n", 1, cut)
-            cut = newline if newline > floor else floor
-        out.append(text[:cut])
-        text = text[cut:].lstrip("\n")
+        cut = _best_cut(text, measure)
+        assert cut is not None, "one character renders past MAX_MSG"
+        rest = _rest(text, cut)
+        assert len(rest) < len(text), "a cut that does not shorten the text"
+        out.append(_piece(text, cut))
+        text = rest
     return out
+
+
+def _best_cut(text: str, measure: Callable[[str], int]) -> int | None:
+    """The cut for the next piece of `text` (see `md_chunks`); each cut list is built
+    only when the ones before it give no cut."""
+    limit = min(len(text), MAX_MSG)
+
+    sizes: dict[int, int] = {}  # a cut's piece size, measured once
+
+    def size_of(cut: int) -> int:
+        if cut not in sizes:
+            sizes[cut] = measure(_piece(text, cut))
+        return sizes[cut]
+
+    openers = _opening_fence_ends(text, limit)
+    newlines = [i for i in range(1, limit) if text[i] == "\n" and i not in openers]
+    flush = [i for i in newlines if len(_NEXT_INDENT.match(text, i).group(1)) < CODE_INDENT]
+    cut = _longest_fit(flush, size_of)
+    if cut is not None and size_of(cut) >= HALF_FULL:
+        return cut
+    cut = _longest_fit(newlines, size_of)
+    if cut is not None:
+        return cut
+    # inside the line after the last cut that may not be taken (an opening fence line)
+    first = newlines[0] if newlines else limit
+    start = max((i + 1 for i in openers if i < first), default=0)
+    line_end = text.find("\n", start)
+    line = text[start : len(text) if line_end == -1 else line_end]  # whole, for closing marks
+    room = limit - start  # cuts stay within the message
+    for cuts in (
+        lambda: [start + i for i in _plain_spaces(line) if 0 < i < room],
+        lambda: [start + i for i in range(1, min(len(line), room)) if line[i] in " \t"],
+    ):
+        cut = _longest_fit(cuts(), size_of)
+        if cut is not None and size_of(cut) >= HALF_FULL:
+            return cut
+    return _longest_fit(range(max(start, 1), limit + 1), size_of)
+
+
+CODE_INDENT = 4  # a line indented this far after a blank line is an indented code block
+_NEXT_INDENT = re.compile(r"\n*( *)")  # from a newline: the next nonblank line's indent
+_FENCE = re.compile(r"((?: *> ?)* *)(`{3,}|~{3,})([^\n]*)")  # prefix (indent, quotes), run, info
+_BLOCK_MARKER = re.compile(r"#{1,6}(?=\s|$)|>|[-+*](?=\s|$)|`{3,}|~{3,}|(?:[-*_] *){3,}$")
+_ORDERED_MARKER = re.compile(r"\d{1,9}(?=[.)](?:\s|$))")
+_LIST_ITEM = re.compile(r" *(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _open_fence(text: str, cut: int) -> str | None:
+    """The opening line (with its indent and quote marks) of the fenced code block open
+    at `cut` (None outside one); a line `cut` falls inside counts from its start."""
+    opener = None
+    lines = text[:cut].split("\n")
+    if cut < len(text) and text[cut] != "\n":
+        lines.pop()  # the line the cut falls inside
+    for line in lines:
+        match = _FENCE.fullmatch(line)
+        if match is None:
+            continue
+        _, run, info = match.groups()
+        if opener is None:
+            if not (run[0] == "`" and "`" in info):
+                opener = line
+        elif run[0] == _fence_run(opener)[0] and len(run) >= len(_fence_run(opener)):
+            if not info.strip():
+                opener = None
+    return opener
+
+
+def _opening_fence_ends(text: str, limit: int) -> set[int]:
+    """The newlines before `limit` that end a line opening a code block (a piece may not
+    end there: it would hold only the fence line)."""
+    ends = set()
+    opener = None
+    at = 0
+    while at < limit:
+        newline = text.find("\n", at)
+        if newline == -1:
+            break
+        match = _FENCE.fullmatch(text[at:newline])
+        if match is not None:
+            _, run, info = match.groups()
+            if opener is None and not (run[0] == "`" and "`" in info):
+                opener = run
+                if newline < limit:
+                    ends.add(newline)
+            elif opener is not None and run[0] == opener[0] and len(run) >= len(opener):
+                if not info.strip():
+                    opener = None
+        at = newline + 1
+    return ends
+
+
+def _fence_run(opener: str) -> str:
+    return _FENCE.fullmatch(opener).group(2)
+
+
+def _fence_prefix(opener: str) -> str:
+    return _FENCE.fullmatch(opener).group(1)
+
+
+def _piece(text: str, cut: int) -> str:
+    """The piece ending at `cut`, a code block open there closed."""
+    opener = _open_fence(text, cut)
+    if opener is None:
+        return text[:cut]
+    return f"{text[:cut]}\n{_fence_prefix(opener)}{_fence_run(opener)}"
+
+
+def _rest(text: str, cut: int) -> str:
+    """The text after the piece ending at `cut`: a code block open there reopened, a
+    list continuation unindented, a line cut midway continued with its block marker
+    escaped."""
+    opener = _open_fence(text, cut)
+    at_newline = text[cut] == "\n"
+    if opener is not None:
+        continued = text[cut + 1 :] if at_newline else _fence_prefix(opener) + text[cut:]
+        rest = f"{opener}\n{continued}"
+        return _unindent_continuation(text[:cut], rest)
+    if at_newline:
+        return _unindent_continuation(text[:cut], text[cut:].lstrip("\n"))
+    rest = text[cut:].lstrip(" \t")
+    if _BLOCK_MARKER.match(rest):
+        return "\\" + rest
+    ordered = _ORDERED_MARKER.match(rest)
+    return f"{rest[: ordered.end()]}\\{rest[ordered.end() :]}" if ordered else rest
+
+
+def _unindent_continuation(before: str, rest: str) -> str:
+    """`rest` with the indent of its leading lines removed when they continue a list
+    item in `before` (indented CODE_INDENT or more they would open a code block); the
+    lines from the first one indented less on are kept as written."""
+    depth = _indent(rest)
+    if depth < CODE_INDENT:
+        return rest
+    parent = next(
+        (line for line in reversed(before.split("\n")) if line.strip() and _indent(line) < depth),
+        "",
+    )
+    if not _LIST_ITEM.match(parent):
+        return rest  # an indented code block stays one
+    lines = rest.split("\n")
+    for index, line in enumerate(lines):
+        if line.strip() and _indent(line) < depth:
+            break
+        lines[index] = line[depth:]
+    return "\n".join(lines)
+
+
+def _closes_later(line: str, mark: str, start: int) -> bool:
+    """Whether an unescaped `mark` appears in `line` from `start` on."""
+    at = line.find(mark, start)
+    while at != -1:
+        escapes = len(line[:at]) - len(line[:at].rstrip("\\"))
+        if escapes % 2 == 0:
+            return True
+        at = line.find(mark, at + 1)
+    return False
+
+
+def _plain_spaces(line: str) -> list[int]:
+    """The positions of whitespace in one line of Markdown outside a code span, a `$`
+    math span, a `**` / `__` run and a link — each counted open only when its closing
+    mark follows later on the line."""
+    cuts = []
+    code = 0  # length of the open code span's backtick run
+    math = strong = ""  # the open run's mark ("" when none is open)
+    in_destination = False
+    brackets = 0
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if char == "\\" and not code:
+            i += 2
+            continue
+        if char == "`":
+            run = len(line[i:]) - len(line[i:].lstrip("`"))
+            if code == run:
+                code = 0
+            elif not code and _closes_later(line, "`" * run, i + run):
+                code = run
+            i += run
+            continue
+        if code:
+            i += 1
+            continue
+        if char == "$":
+            math = "" if math else ("$" if _closes_later(line, "$", i + 1) else "")
+        elif not math and line.startswith(("**", "__"), i):
+            mark = line[i : i + 2]
+            if strong == mark:
+                strong = ""
+            elif not strong and _closes_later(line, mark, i + 2):
+                strong = mark
+            i += 2
+            continue
+        elif not math and char == "[" and _closes_later(line, "]", i + 1):
+            brackets += 1
+        elif not math and char == "]" and brackets:
+            brackets -= 1
+            in_destination = line.startswith("(", i + 1) and _closes_later(line, ")", i + 2)
+        elif in_destination and char == ")":
+            in_destination = False
+        elif char in " \t" and not (math or strong or brackets or in_destination):
+            cuts.append(i)
+        i += 1
+    return cuts
+
+
+def _longest_fit(cuts, size_of: Callable[[int], int]) -> int | None:
+    """The largest of the ascending `cuts` whose piece (`size_of`) measures within
+    MAX_MSG, or a fitting one measuring at least FULL_ENOUGH, or None when none fits.
+    The longest is tried first, then the bracket is narrowed by bisection, each probe
+    placed where the sizes measured so far put the limit (sizes grow about linearly
+    with the prefix) and kept off the bracket's ends."""
+    if not cuts:
+        return None
+    top = size_of(cuts[-1])
+    if top <= MAX_MSG:
+        return cuts[-1]
+    # cuts[low] fits (-1: none known, size 0), cuts[high] does not
+    low, high, low_size, high_size = -1, len(cuts) - 1, 0, top
+    while high - low > 1:
+        low_at = cuts[low] if low >= 0 else 0
+        share = ((MAX_MSG + FULL_ENOUGH) / 2 - low_size) / max(high_size - low_size, 1)
+        target = low_at + share * (cuts[high] - low_at)
+        middle = _bisect_left(cuts, target, low + 1, high)
+        quarter = max((high - low) // 4, 1)
+        middle = min(max(middle, low + quarter), high - quarter)
+        size = size_of(cuts[middle])
+        if size <= MAX_MSG:
+            if size >= FULL_ENOUGH:
+                return cuts[middle]
+            low, low_size = middle, size
+        else:
+            high, high_size = middle, size
+    return cuts[low] if low >= 0 else None
+
+
+def _bisect_left(cuts, value: float, low: int, high: int) -> int:
+    """The first index in `cuts[low:high]` at or past `value` (`high` when none)."""
+    while low < high:
+        middle = (low + high) // 2
+        if cuts[middle] < value:
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 @dataclass

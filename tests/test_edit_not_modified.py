@@ -29,14 +29,21 @@ class _OtherBadRequest(TelegramBadRequest):
 
 
 class _Bot:
+    """Raises `exc` on every edit but a plain one (no rich body, no parse mode)."""
+
     def __init__(self, exc):
         self.exc = exc
+        self.tried: list[str] = []  # the form of each edit tried, in order
         self.plain_edits: list[str] = []
 
-    async def edit_message_text(self, text, **kw):
+    async def edit_message_text(self, text=None, **kw):
+        if kw.get("rich_message") is not None:
+            self.tried.append("rich")
+            raise self.exc
+        self.tried.append(kw.get("parse_mode") or "plain")
         if kw.get("parse_mode") == "MarkdownV2":
             raise self.exc
-        self.plain_edits.append(text)  # the fallback path (no parse_mode)
+        self.plain_edits.append(text)  # the last fallback (no parse_mode)
         return None
 
 
@@ -46,7 +53,7 @@ def test_not_modified_is_success_no_plain_fallback():
         tx = telegram_transport(bot)
         ok = await tx.edit_md(100, 7, "```\nshell\n```", "shell")
         assert ok is True  # treated as success
-        assert bot.plain_edits == []  # never fell back to plain → format stays shell
+        assert bot.tried == ["rich"]  # no fallback edit → format stays shell
 
     asyncio.run(scenario())
 
@@ -56,6 +63,8 @@ def test_other_bad_request_still_falls_back_to_plain():
         bot = _Bot(_OtherBadRequest())
         tx = telegram_transport(bot)
         await tx.edit_md(100, 7, "```\nshell\n```", "shell")
+        # rich, its MarkdownV2 fallback, the plain body as rich, then plain
+        assert bot.tried == ["rich", "MarkdownV2", "rich", "plain"]
         assert bot.plain_edits == ["shell"]  # a real markdown failure still degrades
 
     asyncio.run(scenario())

@@ -128,6 +128,11 @@ def texts(c: TestClient, thread: str = THREAD) -> list[str]:
     return [text for _mid, text in screen(c, thread)]
 
 
+def markups(c: TestClient, thread: str = THREAD) -> list[str]:
+    """`texts`, with a Rich Message's HTML in place of its text."""
+    return [c.bot.rich.get(mid, text) for mid, text in screen(c, thread)]
+
+
 async def cancel_task(task) -> None:
     """Stop a background task (the updater, a painter) and let it unwind."""
     if task is not None:

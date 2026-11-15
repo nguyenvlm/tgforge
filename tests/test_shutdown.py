@@ -100,10 +100,9 @@ def test_the_interrupted_card_keeps_the_note_after_the_collapsed_block(tmp_path)
         t.turn.timeline = [("tool", "💻 Bash: ls -la (v1.2)")]
         t._summary = lambda *a, **k: "🔧 1 · 3s"
         await t.on_shutdown()
-        assert c.bot.edits[-1] == (
-            42,
-            "🔧 1 · 3s\n**>💻 Bash: ls \\-la \\(v1\\.2\\)||"
-            "\n\n⏸ interrupted by a restart — resuming shortly",
+        assert c.bot.rich[42] == (
+            "<p>🔧 1 · 3s</p><blockquote expandable>💻 Bash: ls -la (v1.2)</blockquote>"
+            "<p>⏸ interrupted by a restart — resuming shortly</p>"
         )
 
     asyncio.run(scenario())

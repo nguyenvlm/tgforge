@@ -16,6 +16,7 @@ from claude_fakes import (
     cancel_task,
     client,
     drain,
+    markups,
     replay,
     result,
     screen,
@@ -24,6 +25,7 @@ from claude_fakes import (
     window,
 )
 
+from tgforge.base.telegram import RichMessage, rich_fits
 from tgforge.base.ui import MAX_MSG
 from tgforge.plugins.claude import background
 from tgforge.plugins.claude.render import tool_line
@@ -52,30 +54,54 @@ async def _turn(c, t, timeline=(), answer="the answer"):
     await drain(c, t)
 
 
-def _is_fold(text: str) -> bool:
-    return "**>" in text and text.endswith("||")
+def _is_fold(markup: str) -> bool:
+    return "<blockquote expandable>" in markup and markup.endswith("</blockquote>")
+
+
+def _record_bodies(c) -> list:
+    """Every body the window's adapter sends or edits a message to, from now on."""
+    bodies = []
+    send, edit = c.adapter.send, c.adapter.edit
+
+    async def record_send(window, text, *args, **kw):
+        bodies.append(text)
+        return await send(window, text, *args, **kw)
+
+    async def record_edit(window, message_id, text, *args, **kw):
+        bodies.append(text)
+        return await edit(window, message_id, text, *args, **kw)
+
+    c.adapter.send, c.adapter.edit = record_send, record_edit
+    return bodies
 
 
 def test_a_long_timeline_folds_into_several_messages_with_every_entry(tmp_path):
     async def scenario():
         c = client(tmp_path)
         t = window(c, tmp_path)
+        bodies = _record_bodies(c)
         entries = [("tool", f"💻 Bash: step {i:03d} " + "x" * 300) for i in range(40)]
         await _turn(c, t, entries)
 
         shown = texts(c)
-        folds = [text for text in shown if _is_fold(text)]
+        folds = [markup for markup in markups(c) if _is_fold(markup)]
         assert len(folds) >= 3  # 40 × ~320 chars cannot fit one message
-        assert all(len(text) <= MAX_MSG for text in folds)
+        assert all(rich_fits(markup) for markup in folds)
+        # each fold's MarkdownV2 fallback fits a message too
+        fold_bodies = [b for b in bodies if isinstance(b, RichMessage) and _is_fold(b.html)]
+        assert len(fold_bodies) >= len(folds)
+        assert all(b.fallback is not None and len(b.fallback) <= MAX_MSG for b in fold_bodies)
         joined = "".join(folds)
         for i in range(40):
             assert f"step {i:03d}" in joined  # every entry present
         assert "…" not in joined.replace("↳", "")  # nothing cut
         assert shown[-1] == "the answer"  # the answer is the bottom-most message
-        summary, quote = folds[0].split("\n", 1)
-        assert summary.startswith("🔧 40")  # message 1 opens with the summary line, plain
-        assert quote.startswith("**>💻 Bash: step 000")  # the block holds only the timeline
-        assert all(f.startswith("**>↳ ") for f in folds[1:])  # later pages: `↳ i/n` in the block
+        summary, quote = folds[0].split("</p>", 1)
+        assert summary.startswith("<p>🔧 40")  # message 1 opens with the summary line, plain
+        # the block holds only the timeline
+        assert quote.startswith("<blockquote expandable>💻 Bash: step 000")
+        # later pages: `↳ i/n` in the block
+        assert all(f.startswith("<blockquote expandable>↳ ") for f in folds[1:])
 
     asyncio.run(scenario())
 
@@ -90,7 +116,7 @@ def test_an_entry_longer_than_a_message_is_split_across_messages(tmp_path):
         c = client(tmp_path)
         t = window(c, tmp_path)
         await _turn(c, t, [("thinking", "word " * 2000), ("tool", "🔧 last")])
-        folds = [text for text in texts(c) if _is_fold(text)]
+        folds = [markup for markup in markups(c) if _is_fold(markup)]
         assert len(folds) >= 2
         assert sum(text.count("word") for text in folds) == 2000
 
@@ -105,7 +131,7 @@ def test_no_tools_gives_a_summary_only_message_and_the_answer(tmp_path):
         shown = texts(c)
         assert len(shown) == 2
         assert "↓" in shown[0] and "🔧" not in shown[0]
-        assert "**>" not in shown[0] and not shown[0].endswith("||")  # no block
+        assert "<blockquote" not in markups(c)[0]  # no block
         assert shown[1] == "just text"
 
     asyncio.run(scenario())
@@ -131,7 +157,7 @@ def test_the_live_card_becomes_message_1(tmp_path):
         t.turn.timeline.append(("tool", "🔧 one"))
         await t._finalize_turn("done")
         await drain(c, t)
-        assert screen(c)[0][0] == card and _is_fold(screen(c)[0][1])
+        assert screen(c)[0][0] == card and _is_fold(markups(c)[0])
 
     asyncio.run(scenario())
 
@@ -145,7 +171,7 @@ def test_a_failed_card_edit_deletes_the_card_and_sends_message_1_fresh(tmp_path)
         card = t.turn.card_id
         t.turn.timeline.append(("tool", "🔧 one"))
 
-        async def gone(text, **kw):
+        async def gone(text=None, **kw):
             raise _Gone()
 
         c.bot.edit_message_text = gone
@@ -153,7 +179,7 @@ def test_a_failed_card_edit_deletes_the_card_and_sends_message_1_fresh(tmp_path)
         await drain(c, t)
         assert card in c.bot.deleted  # the live frame never stays as the finalized card
         shown = texts(c)
-        assert _is_fold(shown[0]) and "🔧 one" in shown[0].replace("\\", "")
+        assert _is_fold(markups(c)[0]) and "🔧 one" in shown[0]
         assert shown[1] == "done"
 
     asyncio.run(scenario())
@@ -235,7 +261,7 @@ def test_order_is_folds_then_answer_then_attachments_then_panel(tmp_path):
         await _turn(c, t, entries, answer=f"the answer\n[[attach]] {attachment}")
         await drain(c, t)
 
-        shown = texts(c)
+        shown = markups(c)
         kinds = [
             "fold"
             if _is_fold(text)
@@ -383,7 +409,7 @@ def test_the_heartbeat_never_paints_a_closed_turns_card(tmp_path, monkeypatch):
         await drain(c, t)
         await asyncio.sleep(0.05)
         await drain(c, t)
-        assert _is_fold(dict(c.bot.edits)[card])  # still message 1, not a live frame
+        assert _is_fold(c.bot.rich[card])  # still message 1, not a live frame
         await t._stop_heartbeat()
 
     asyncio.run(scenario())

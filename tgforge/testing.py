@@ -19,6 +19,8 @@ bound by default so `/init` isn't needed; pass `owner_id=None` to test bootstrap
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 import tempfile
 from types import SimpleNamespace
 
@@ -68,6 +70,16 @@ def telegram_inbound(
     return adapter.to_inbound(message)
 
 
+_BLOCK_END = re.compile(r"<br/>|</(?:p|h[1-6]|li|blockquote|pre|tr|details|tg-math-block)>")
+
+
+def rich_text(rich_html: str) -> str:
+    """The text a reader sees in a Rich HTML body: tags dropped, line and block ends as
+    newlines (plain text sent as Rich HTML reads back unchanged)."""
+    text = re.sub(r"<[^>]+>", "", _BLOCK_END.sub("\n", rich_html))
+    return html.unescape(text).rstrip("\n")
+
+
 def kernel_bot(kernel: Kernel):
     """The mock bot behind a `telegram_kernel`."""
     return kernel.transports[0].adapter.bot
@@ -78,7 +90,7 @@ class MockBot:
 
     def __init__(self):
         self._next = 1000
-        self.sent: list[tuple[int | None, str]] = []  # (thread_id, text)
+        self.sent: list[tuple[int | None, str]] = []  # (thread_id, text; a rich one's `rich_text`)
         # every new message in chat order, the owner's included: (message_id, thread_id, text)
         self.created: list[tuple[int, int | None, str]] = []
         self.silent: set[int] = set()  # ids of messages sent with disable_notification
@@ -89,6 +101,9 @@ class MockBot:
         self.last_markup = None
         # ("create" | "edit" | "delete", message id, text) in call order
         self.screen_log: list[tuple[str, int, str | None]] = []
+        # the form each message's newest text landed in: "rich", "MarkdownV2" or "plain"
+        self.forms: dict[int, str] = {}
+        self.rich: dict[int, str] = {}  # message id → its newest Rich HTML
 
     def _id(self) -> int:
         self._next += 1
@@ -119,7 +134,17 @@ class MockBot:
         self.sent.append((kw.get("message_thread_id"), text))
         if kw.get("reply_markup") is not None:
             self.last_markup = kw["reply_markup"]
-        return self._created(kw.get("message_thread_id"), text, kw)
+        message = self._created(kw.get("message_thread_id"), text, kw)
+        self.forms[message.message_id] = kw.get("parse_mode") or "plain"
+        return message
+
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        """`sendRichMessage`: recorded through `send_message` (so a test's hook on it
+        sees every send) with its `rich_text`; the HTML goes to `rich`."""
+        message = await self.send_message(chat_id, rich_text(rich_message.html), **kw)
+        self.forms[message.message_id] = "rich"
+        self.rich[message.message_id] = rich_message.html
+        return message
 
     async def send_photo(self, chat_id, photo, **kw):
         self.sent.append((kw.get("message_thread_id"), "<photo>"))
@@ -137,7 +162,15 @@ class MockBot:
             self.last_markup = kw["reply_markup"]
         return SimpleNamespace(message_id=kw.get("message_id"))
 
-    async def edit_message_text(self, text, **kw):
+    async def edit_message_text(self, text=None, **kw):
+        """`editMessageText`; a rich edit (`rich_message`) recorded as `send_rich_message`."""
+        rich = kw.pop("rich_message", None)
+        if rich is not None:
+            text = rich_text(rich.html)
+            self.rich[kw.get("message_id")] = rich.html
+        self.forms[kw.get("message_id")] = (
+            "rich" if rich is not None else kw.get("parse_mode") or "plain"
+        )
         self.edits.append((kw.get("message_id"), text))
         self.screen_log.append(("edit", kw.get("message_id"), text))
         if kw.get("reply_markup") is not None:

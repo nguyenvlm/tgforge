@@ -5,10 +5,25 @@ cleanly. Its frames go through the kernel's frame-skip output."""
 from __future__ import annotations
 
 import asyncio
+import time
 
 from claude_fakes import client, drain, window
 
 from tgforge.plugins.claude import driver as drv
+
+CARD_EDIT_DEADLINE = 2.0  # seconds a test waits for the heartbeat's first card edit
+
+
+async def _card_edited(c, t) -> bool:
+    """Whether the open turn's card gets an edit before CARD_EDIT_DEADLINE (drained each
+    tick, so a slow event loop only delays the answer)."""
+    deadline = time.monotonic() + CARD_EDIT_DEADLINE
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        await drain(c, t)
+        if t.turn.card_id is not None and any(mid == t.turn.card_id for mid, _ in c.bot.edits):
+            return True
+    return False
 
 
 def test_stop_heartbeat_halts_repaint(tmp_path, monkeypatch):
@@ -17,10 +32,7 @@ def test_stop_heartbeat_halts_repaint(tmp_path, monkeypatch):
         c = client(tmp_path)
         t = window(c, tmp_path)
         t._open_holder()
-        await asyncio.sleep(0.05)  # let it tick a few times
-        await drain(c, t)
-        card = t.turn.card_id
-        assert any(mid == card for mid, _ in c.bot.edits)  # the heartbeat is repainting
+        assert await _card_edited(c, t)  # the heartbeat is repainting
 
         await t._stop_heartbeat()
         assert t.heartbeat_task is None
@@ -44,9 +56,7 @@ def test_open_holder_revives_a_dead_heartbeat_on_a_reused_proc(tmp_path, monkeyp
         t.heartbeat_task = None
         t._open_holder()
         assert t.heartbeat_task is not None and not t.heartbeat_task.done()
-        await asyncio.sleep(0.05)
-        await drain(c, t)
-        assert any(mid == t.turn.card_id for mid, _ in c.bot.edits)
+        assert await _card_edited(c, t)
         await t._stop_heartbeat()
 
     asyncio.run(scenario())

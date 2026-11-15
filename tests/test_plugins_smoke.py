@@ -11,7 +11,7 @@ from tgforge.base.kernel import Tap
 from tgforge.plugins.gcloud import Gcloud
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.plugins.shell import Shell
-from tgforge.testing import kernel_bot, telegram_inbound, telegram_kernel
+from tgforge.testing import kernel_bot, rich_text, telegram_inbound, telegram_kernel
 
 
 class MockBot:
@@ -38,7 +38,12 @@ class MockBot:
         self.sent.append((kw.get("message_thread_id"), text))
         return SimpleNamespace(message_id=self._n)
 
-    async def edit_message_text(self, text, **kw):
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        return await self.send_message(chat_id, rich_text(rich_message.html), **kw)
+
+    async def edit_message_text(self, text=None, **kw):
+        rich = kw.pop("rich_message", None)
+        text = rich_text(rich.html) if rich is not None else text
         self.edited.append(text)
         return SimpleNamespace(message_id=kw.get("message_id"))
 

@@ -13,7 +13,7 @@ import pytest
 
 from tgforge.base.config import BotConfig
 from tgforge.plugins.shell import Shell, ShellTopic
-from tgforge.testing import kernel_bot, telegram_inbound, telegram_kernel
+from tgforge.testing import kernel_bot, rich_text, telegram_inbound, telegram_kernel
 
 
 class MockBot:
@@ -40,7 +40,10 @@ class MockBot:
         self.sent.append(text)
         return SimpleNamespace(message_id=self._n)
 
-    async def edit_message_text(self, text, **kw):
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        return await self.send_message(chat_id, rich_text(rich_message.html), **kw)
+
+    async def edit_message_text(self, text=None, **kw):
         self.edits += 1
         return SimpleNamespace(message_id=kw.get("message_id"))
 

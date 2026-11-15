@@ -20,7 +20,8 @@ def test_cli_emits_a_clear_resume_command(tmp_path):
 
         msg = "\n".join(c.replies)
         assert "paste this into a terminal" in msg  # says what to do, not a bare line
-        assert "```" in msg  # the command sits in a tap-to-copy code block
+        rich = "\n".join(c.bot.rich.values())
+        assert "<pre>" in rich  # the command sits in a tap-to-copy code block
         assert f"claude --resume {t.session_id}" in msg  # this exact session
         assert f"cd {t.workspace}" in msg  # in its workspace
         assert "CLAUDE_CONFIG_DIR=" in msg  # under its account

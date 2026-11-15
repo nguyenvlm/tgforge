@@ -123,7 +123,6 @@ class SlackAdapter:
     pages_in_thread = True
     renders_tables = False
     max_message = ui.MAX_MSG
-    safe_chunk = ui.MAX_MSG  # a render is as long as its source
     photo_max = 1024 * 1024 * 1024  # an image is a file like any other
     upload_max = 1024 * 1024 * 1024
     download_max = 1024 * 1024 * 1024
@@ -176,6 +175,11 @@ class SlackAdapter:
     def page_size(head: str, body: str, first: bool) -> int:
         """A thread reply carries the page head and body as written."""
         return len(f"{head}\n\n{body}")
+
+    @staticmethod
+    def bodies(body) -> list:
+        """One body per message: no fallback of its own."""
+        return [body]
 
     def classify(self, error: Exception):
         if isinstance(error, SlackApiError):
