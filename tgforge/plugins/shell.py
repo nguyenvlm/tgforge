@@ -298,7 +298,12 @@ class ShellTopic(PtyWindow):
         if self.tui or self.msg_id is None:
             return  # a full-screen app briefly holds the screen; _end_tui posts the notice
         body = self.acc[-TAIL_CHARS:].strip() or "(no output yet)"
-        self.show_frame(self.msg_id, body, ui.code_block(body), reply_markup=self._keys())
+
+        def tail(kept: int) -> str:
+            return ui.code_block(body[len(body) - kept :])
+
+        md = tail(ui.most_that_fits(tail, len(body), self.fits_one_message))
+        self.show_frame(self.msg_id, body, md, reply_markup=self._keys())
 
     def _keys(self):
         return ui.keyboard(

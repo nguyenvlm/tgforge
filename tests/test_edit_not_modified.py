@@ -68,3 +68,19 @@ def test_other_bad_request_still_falls_back_to_plain():
         assert bot.plain_edits == ["shell"]  # a real markdown failure still degrades
 
     asyncio.run(scenario())
+
+
+def test_a_live_message_edit_not_modified_tries_no_other_form():
+    """A frame edit Telegram answers "message is not modified" (content that renders the
+    same Rich HTML) has landed: no MarkdownV2, escaped Rich or plain retry flips its form."""
+
+    async def scenario():
+        bot = _Bot(_NotModified())
+        tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
+        assert await tx.land_frame("0", 7, "shell", "```\nshell\n```") is True
+        assert bot.tried == ["rich"]
+        tx.show_frame("0", 8, "shell 2", "```\nshell 2\n```")
+        await tx.flush_frames()
+        assert bot.tried == ["rich", "rich"] and bot.plain_edits == []
+
+    asyncio.run(scenario())

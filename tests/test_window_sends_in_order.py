@@ -8,7 +8,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from claude_fakes import THREAD, FakeProc, client, drain, screen, window
+from claude_fakes import PIECE_LINE, THREAD, FakeProc, client, drain, screen, window
 
 from tgforge.base.telegram import TelegramAdapter
 
@@ -27,7 +27,7 @@ async def _settling(c, t):
     t.proc = FakeProc()
     t._open_holder()
     await drain(c, t)
-    await t._finalize_turn("\n".join(f"ANSWER {i} " + "q" * 3000 for i in range(3)))
+    await t._finalize_turn("\n".join(f"ANSWER {i} " + "q" * PIECE_LINE for i in range(3)))
     await asyncio.sleep(0.05)  # piece 0 out, piece 1 stuck
     return release
 

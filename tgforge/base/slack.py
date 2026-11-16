@@ -178,7 +178,7 @@ class SlackAdapter:
 
     @staticmethod
     def bodies(body) -> list:
-        """One body per message: no fallback of its own."""
+        """One form of one message: no fallback of its own."""
         return [body]
 
     def classify(self, error: Exception):

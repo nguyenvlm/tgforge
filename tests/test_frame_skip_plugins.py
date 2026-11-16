@@ -57,6 +57,24 @@ def test_the_one_shot_pump_keeps_reading_through_a_flood(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_one_shot_output_of_backslashes_lands_within_one_message(tmp_path, monkeypatch):
+    """Output that MarkdownV2 escapes to twice its length still shows as one message,
+    while the command runs and when it ends."""
+    monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.1)
+
+    async def scenario():
+        c = client(tmp_path)
+        window(c, tmp_path)
+        lines = "for i in $(seq 1 600); do printf '%s line%d\\n' '\\\\\\\\\\' $i; done"
+        await c.send(f"!{lines}; sleep 1; echo fin$((1 + 1))", window=THREAD)
+        await asyncio.wait_for(c.settle(), 10)
+        *running, final = c.edits
+        assert any("line600" in text and "fin2" not in text for text in running)
+        assert "exit 0" in final and "line600" in final and "fin2" in final
+
+    asyncio.run(scenario())
+
+
 def test_a_one_shot_window_close_reaps_the_command(tmp_path):
     async def scenario():
         c = client(tmp_path)
@@ -348,5 +366,23 @@ def test_the_files_view_moves_as_one_copy_below_a_burst_of_messages(tmp_path):
         for at in moves:  # each old copy's delete is the call right before its re-send
             kind, _new, text = log[at + 1]
             assert kind == "create" and is_view(text)
+
+    asyncio.run(scenario())
+
+
+def test_a_file_of_regex_text_opens_in_the_files_view(tmp_path):
+    """Its backslashes escape to twice their length in MarkdownV2: the view's code block
+    is cut to one message in every form."""
+
+    async def scenario():
+        c = TestClient(Localfs(), home=str(tmp_path))
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "a_regex.txt").write_text(("\\d+\\s*\\w " * 400)[:3000])
+        inst = await _files_window(c, root)
+        await _click(c, inst, "file:0")
+        await c.core.flush_frames()
+        shown = _view_text(c, inst)
+        assert shown.startswith(f"📄 {root}/a_regex.txt") and "\\d+\\s*\\w" in shown
 
     asyncio.run(scenario())

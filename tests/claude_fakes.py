@@ -12,6 +12,8 @@ from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.testing import TestClient
 
 THREAD = "555"
+# a line over half of one Telegram message's Rich text, so each goes out as its own message
+PIECE_LINE = TelegramAdapter.max_message // 2 + 1000
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cli_usage_events.jsonl"
 
 

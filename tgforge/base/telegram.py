@@ -14,6 +14,7 @@ then `↳ i/n` blocks); a `ui.Keyboard` renders as an inline keyboard. The kerne
 from __future__ import annotations
 
 import copy
+import functools
 import html
 import logging
 import math
@@ -300,35 +301,79 @@ def pages_md(pages: ui.Pages) -> list[tuple[str, str]]:
 
 # ── Rich Messages ──────────────────────────────────────────────────
 
-_SUB_SUP_CLOSERS = ("</sub>", "</sup>")
+# closers of the inline elements raw HTML opens (sub/superscripts, a spoiler)
+_RAW_CLOSERS = ("</sub>", "</sup>", "</tg-spoiler>")
 # a Rich HTML tag that opens a block (the 500-block limit counts nested ones too)
 _BLOCK_TAG = re.compile(
     r"<(?:p|h[1-6]|pre|hr|ul|ol|li|blockquote|table|tr|details|tg-math-block|footer|aside)\b"
 )
-_TAG = re.compile(r"<(/?)([a-zA-Z][\w-]*)[^>]*?(/?)>")
+# the name run never gives back; a tag's attributes stop at the next `<`
+_TAG = re.compile(r"<(/?)([a-zA-Z][\w-]*+)[^<>]*?(/?)>")
 _VOID_TAGS = ("br", "hr", "input", "img")
-_TABLE_ROW = re.compile(r"<tr>(.*?)</tr>")
-_TABLE_CELL = re.compile(r"<t[hd][\s>]")
+_ROW_TOKEN = re.compile(r"</?tr>|<t[hd][\s>]")  # a row's start or end, or a cell's start
 RICH_DEPTH_LIMIT = 16  # levels of nested formatting and blocks
 RICH_COLUMN_LIMIT = 20  # columns in a table
 FLAT_ITEM_INDENT = "\u00a0\u00a0"  # per flattened list level, before the item marker
 
 
+class _DroppedCloser(str):
+    """The closer of an inline element written without its tags (past the depth
+    limit): empty, so closing it writes nothing; `tag` is the closer it stands for."""
+
+    tag: str = ""
+
+
+def _closer_tag(closer: str) -> str:
+    return closer.tag if isinstance(closer, _DroppedCloser) else closer
+
+
 class RichMessageWalker(_RichHtmlWalker):
     """telegramify-markdown's Rich HTML walker, changed for Telegram's Rich Messages:
-    inline `<sub>`/`<sup>` stay sub/superscripts (any other raw HTML stays literal text;
-    a stray closing tag stays literal, an unclosed one is closed before whatever ends
-    around it); lists and quotes past `nested_block_limit` levels are flattened (each
-    deeper item a paragraph with an indented marker); a table wider than
+    inline `<sub>`/`<sup>` stay sub/superscripts and `<tg-spoiler>` a spoiler (any
+    other raw HTML stays literal text; a stray closing tag stays literal, an unclosed
+    one is closed before whatever ends around it); a list or quote nests only while the
+    deepest block inside it still fits RICH_DEPTH_LIMIT levels (`_container_needs`),
+    else it is flattened (each item a paragraph with an indented marker); an inline
+    element (bold, italic, strike, sub/sup, a link, a spoiler, inline code or math, a
+    footnote reference), or display math met inside inline formatting, that would nest
+    past the limit is written as its text alone, so
+    one walk always fits the limit and keeps every word; a table wider than
     RICH_COLUMN_LIMIT goes out as several tables of those columns; text after display
     math in the same paragraph opens a new paragraph."""
 
-    def __init__(self, nested_block_limit: int) -> None:
+    def __init__(self, needs: list[int]) -> None:
         super().__init__()
-        self._nested_block_limit = nested_block_limit
+        self._needs = iter(needs)  # per list or quote, in order: its deepest block's levels
         self._nested_depth = 0  # open ul / ol, li and blockquote elements
         self._flat_lists: list[int | None] = []  # flattened lists: next number, None bullets
         self._quotes: list[bool] = []  # per open quote: whether its element was written
+        self._headings = 0  # open heading elements
+        self._footnotes = 0  # open footnote definitions
+
+    def _depth_outside_paragraph(self) -> int:
+        """How deep the elements open at the write position nest, a paragraph left out
+        (a block closes it): lists, items and quotes, a heading or a footnote, the
+        table, row and cell around a cell, and the inline elements."""
+        return (
+            self._nested_depth
+            + self._headings
+            + self._footnotes
+            + (3 if self._in_table_cell else 0)
+            + sum(1 for closer in self._inline_closers if closer)
+        )
+
+    def _element_depth(self) -> int:
+        """`_depth_outside_paragraph` plus the paragraph (open, or opened next)."""
+        paragraph = self._paragraph_open or (self._pending_paragraph and not self._in_table_cell)
+        return self._depth_outside_paragraph() + (1 if paragraph else 0)
+
+    def _open_inline(self, open_tag: str, close_tag: str) -> None:
+        if self._element_depth() < RICH_DEPTH_LIMIT:
+            super()._open_inline(open_tag, close_tag)
+            return
+        dropped = _DroppedCloser()
+        dropped.tag = close_tag
+        self._inline_closers.append(dropped)  # its text is written, its tags are not
 
     def _handle_event(self, event) -> None:
         payload = event[0] if isinstance(event, tuple) and len(event) == 2 else event
@@ -336,24 +381,42 @@ class RichMessageWalker(_RichHtmlWalker):
             if "TaskListMarker" in payload and self._flat_lists:
                 self._write_inline("☑ " if payload["TaskListMarker"] else "☐ ")
                 return
+            if "DisplayMath" in payload and self._depth_outside_paragraph() >= RICH_DEPTH_LIMIT:
+                math = payload["DisplayMath"]
+                self._write_inline(self._escape_text("$$" + math + "$$"))
+                return  # its text, without the tag
             if "DisplayMath" in payload:
                 in_paragraph = self._paragraph_open
                 super()._handle_event(event)
                 self._pending_paragraph = in_paragraph
                 return
+            at_limit = self._element_depth() >= RICH_DEPTH_LIMIT
+            if at_limit and "InlineMath" in payload:  # its text, without the tag
+                self._write_inline(self._escape_text(f"${payload['InlineMath']}$"))
+                return
+            if at_limit and "FootnoteReference" in payload:
+                self._write_inline(self._escape_text(f"[{payload['FootnoteReference']}]"))
+                return
         super()._handle_event(event)
+
+    def _on_inline_code(self, code: str) -> None:
+        if self._image is None and self._element_depth() >= RICH_DEPTH_LIMIT:
+            self._write_inline(self._escape_text(code))  # its text, without the tag
+            return
+        super()._on_inline_code(code)
 
     def _on_inline_html(self, value: str) -> None:
         tag = value.strip().lower()
-        if tag in ("<sub>", "<sup>"):
+        if tag in ("<sub>", "<sup>", "<tg-spoiler>"):
             self._open_inline(tag, "</" + tag[1:])
-        elif tag in _SUB_SUP_CLOSERS and self._inline_closers[-1:] == [tag]:
+        elif tag in _RAW_CLOSERS and [_closer_tag(c) for c in self._inline_closers[-1:]] == [tag]:
             self._close_inline()
         else:
             super()._on_inline_html(value)
 
-    def _close_open_sub_sup(self) -> None:
-        while self._inline_closers and self._inline_closers[-1] in _SUB_SUP_CLOSERS:
+    def _close_open_raw(self) -> None:
+        """Close the raw-HTML inline elements still open (never closed in the source)."""
+        while self._inline_closers and _closer_tag(self._inline_closers[-1]) in _RAW_CLOSERS:
             self._close_inline()
 
     def _on_start(self, tag) -> None:
@@ -366,8 +429,16 @@ class RichMessageWalker(_RichHtmlWalker):
             self._pending_paragraph = True
             self._write_inline(f"{FLAT_ITEM_INDENT * (len(self._flat_lists) - 1)}{marker} ")
             return
+        if isinstance(tag, dict) and ("Heading" in tag or "FootnoteDefinition" in tag):
+            super()._on_start(tag)
+            if "Heading" in tag:
+                self._headings += 1
+            else:
+                self._footnotes += 1
+            return
         if isinstance(tag, dict) and "BlockQuote" in tag:
-            nested = self._nested_depth + 1 <= self._nested_block_limit
+            need = next(self._needs)
+            nested = self._nested_depth + self._footnotes + 1 + need <= RICH_DEPTH_LIMIT
             self._quotes.append(nested)
             if not nested:
                 self._enter_block()
@@ -378,7 +449,14 @@ class RichMessageWalker(_RichHtmlWalker):
             self._nested_depth += 1
 
     def _on_end(self, tag) -> None:
-        self._close_open_sub_sup()
+        self._close_open_raw()
+        if tag == "FootnoteDefinition" or (isinstance(tag, dict) and "Heading" in tag):
+            super()._on_end(tag)
+            if tag == "FootnoteDefinition":
+                self._footnotes -= 1
+            else:
+                self._headings -= 1
+            return
         if tag == "Item" and self._flat_lists:
             self._close_paragraph()
             return
@@ -391,7 +469,9 @@ class RichMessageWalker(_RichHtmlWalker):
             self._nested_depth -= 1
 
     def _on_start_list(self, start_number: int | None) -> None:
-        if self._flat_lists or self._nested_depth + 2 > self._nested_block_limit:
+        need = next(self._needs)
+        depth = self._nested_depth + self._footnotes  # the open containers around it
+        if self._flat_lists or depth + 2 + need > RICH_DEPTH_LIMIT:
             self._close_paragraph()
             self._flat_lists.append(start_number)
             return
@@ -419,7 +499,7 @@ class RichMessageWalker(_RichHtmlWalker):
             super()._on_end_table()
 
     def _close_paragraph(self) -> None:
-        self._close_open_sub_sup()
+        self._close_open_raw()
         super()._close_paragraph()
 
 
@@ -442,19 +522,70 @@ def _price_openers(text: str, events: tuple) -> list[int]:
     return offsets
 
 
+@functools.lru_cache(maxsize=8)  # a piece's measure and its send render the same text
 def rich_html(text: str) -> str:
     """GFM → Telegram Rich HTML: `$…$` / `$$…$$` as `<tg-math>` / `<tg-math-block>`
     (a price's `$` before a symbol stays text), `<sub>`/`<sup>` as sub/superscripts,
-    other raw HTML as literal text; lists and quotes kept nested as deep as the payload
-    still nests within RICH_DEPTH_LIMIT, the deeper ones flattened."""
+    other raw HTML as literal text; within RICH_DEPTH_LIMIT levels in one walk (see
+    `RichMessageWalker`)."""
     parsed, events = _parse(text, RICH_OPTIONS, latex_escape=False)
     while offsets := _price_openers(parsed, events):
         parsed, events = _parse(_escape_at(parsed, offsets), RICH_OPTIONS, latex_escape=False)
-    for nested_block_limit in range(RICH_DEPTH_LIMIT, -1, -1):
-        rich = RichMessageWalker(nested_block_limit).walk(events)
-        if rich_depth(rich) <= RICH_DEPTH_LIMIT:
-            break
-    return rich
+    return RichMessageWalker(_container_needs(events)).walk(events)
+
+
+# the levels a block written inside a list or quote takes: a table, row and cell; a
+# code block's pre and code; any other block (an item written as a paragraph included)
+_BLOCK_LEVELS = {"Table": 3, "CodeBlock": 2, "Paragraph": 1, "Heading": 1, "HtmlBlock": 1}
+_BLOCK_LEVELS |= {"Item": 1, "FootnoteDefinition": 2}
+
+
+def _event_name(tag) -> str:
+    return tag if isinstance(tag, str) else next(iter(tag))
+
+
+def _container_needs(events) -> list[int]:
+    """Per list and blockquote, in the order they start: the most levels a block inside
+    it takes (its inner lists and quotes left out: each nests only where its own
+    blocks still fit, else is flattened)."""
+    needs: list[int] = []
+    open_containers: list[int] = []
+    for event in events:
+        payload = event[0] if isinstance(event, tuple) and len(event) == 2 else event
+        if payload == "Rule" or (isinstance(payload, dict) and "DisplayMath" in payload):
+            levels = 1
+        elif isinstance(payload, dict) and "Start" in payload:
+            name = _event_name(payload["Start"])
+            if name in ("List", "BlockQuote"):
+                open_containers.append(len(needs))
+                needs.append(0)
+                continue
+            levels = _BLOCK_LEVELS.get(name, 0)
+        elif isinstance(payload, dict) and "End" in payload:
+            if _event_name(payload["End"]) in ("List", "BlockQuote"):
+                open_containers.pop()
+            continue
+        else:
+            continue
+        for container in open_containers:
+            needs[container] = max(needs[container], levels)
+    return needs
+
+
+@functools.lru_cache(maxsize=16)  # the piece a split chose is rendered for its send next
+def _measure(markdown: str) -> int:
+    """`TelegramAdapter.measure`; a size past MAX_MSG once a form is known to be over (the
+    plain length, then the Rich size, depth and columns), so the MarkdownV2 render runs
+    only for a piece the other forms let fit."""
+    if len(markdown) > MAX_MSG:
+        return len(markdown)
+    rich = rich_html(markdown)
+    size = rich_size(rich)
+    if size > MAX_MSG:
+        return size
+    if rich_depth(rich) > RICH_DEPTH_LIMIT or rich_columns(rich) > RICH_COLUMN_LIMIT:
+        return MAX_MSG + 1
+    return max(len(markdown), size, len(to_md(markdown)))
 
 
 def _html_lines(text: str) -> str:
@@ -500,8 +631,17 @@ def rich_depth(rich: str) -> int:
 
 
 def rich_columns(rich: str) -> int:
-    """The most cells in one table row of Rich HTML."""
-    return max((len(_TABLE_CELL.findall(row)) for row in _TABLE_ROW.findall(rich)), default=0)
+    """The most cells in one table row of Rich HTML (one pass over its row and cell tags)."""
+    widest = cells = 0
+    for token in _ROW_TOKEN.finditer(rich):
+        tag = token.group()
+        if tag == "<tr>":
+            cells = 0
+        elif tag == "</tr>":
+            widest = max(widest, cells)
+        else:
+            cells += 1
+    return widest
 
 
 def rich_fits(rich: str) -> bool:
@@ -536,18 +676,18 @@ class PlainText(str):
 
 @dataclass
 class RichMessage:
-    """A body rendered to Rich HTML (sent as a Rich Message); `fallback` is the body
-    tried when Telegram refuses it (MarkdownV2 that fits, or None)."""
+    """A body rendered to Rich HTML (sent as a Rich Message; None when over the Rich
+    limits), with what Telegram gets when it refuses that: `fallback`, one MarkdownV2
+    message, or `markdown`, the Markdown whose MarkdownV2 render goes instead when it
+    fits MAX_MSG."""
 
-    html: str
-    fallback: MarkdownV2 | None
+    html: str | None
+    fallback: MarkdownV2 | PlainText | None
+    markdown: str | None
 
 
-def _rich_or_markdown(rich: str, md: str) -> RichMessage | MarkdownV2 | None:
-    """The rich body when it fits (MarkdownV2 as its fallback when that fits), else
-    the MarkdownV2 one, else None."""
-    fallback = MarkdownV2(md) if len(md) <= MAX_MSG else None
-    return RichMessage(rich, fallback) if rich_fits(rich) else fallback
+def _fitting(rich: str) -> str | None:
+    return rich if rich_fits(rich) else None
 
 
 def make_bot(token: str) -> AioBot:
@@ -616,7 +756,7 @@ class TelegramAdapter:
     general = GENERAL
     pages_in_thread = False
     renders_tables = True  # a Markdown table renders as a Rich table
-    max_message = MAX_MSG
+    max_message = MAX_MSG  # the most characters one message's Markdown may span
     photo_max = 10 * 1024 * 1024
     upload_max = 50 * 1024 * 1024
     download_max = 20 * 1024 * 1024  # the bot API's getFile cap
@@ -654,23 +794,30 @@ class TelegramAdapter:
 
     # ── Rendering ──────────────────────────────────────────────────
 
-    def render(self, markdown: str) -> tuple[RichMessage | MarkdownV2 | None, str]:
-        return _rich_or_markdown(rich_html(markdown), to_md(markdown)), markdown
+    def render(self, markdown: str) -> tuple[RichMessage | None, str]:
+        """Markdown's rich body (its Rich HTML when that fits the Rich limits, then its
+        MarkdownV2), or None when it is over one message in one of its forms (`measure`):
+        the plain body goes instead, never a cut."""
+        if _measure(markdown) > MAX_MSG:  # the split's measure of this piece, reused
+            return None, markdown
+        return RichMessage(_fitting(rich_html(markdown)), None, markdown), markdown
 
-    def render_pages(self, pages: ui.Pages) -> list[tuple[RichMessage | MarkdownV2 | None, str]]:
+    def render_pages(self, pages: ui.Pages) -> list[tuple[RichMessage, str]]:
         return [
-            (_rich_or_markdown(rich, md), plain)
+            (
+                RichMessage(_fitting(rich), MarkdownV2(md) if len(md) <= MAX_MSG else None, None),
+                plain,
+            )
             for rich, (md, plain) in zip(pages_rich(pages), pages_md(pages), strict=True)
         ]
 
     @staticmethod
     def measure(markdown: str) -> int:
-        """The rendered size of standard Markdown (what `send_rich` splits against): the
-        Rich HTML's `rich_size`, or the MarkdownV2 fallback's length when larger, so a
-        piece fits both the Rich Message limits and its MarkdownV2 fallback. Past MAX_MSG
-        the Rich size alone is returned (a lower bound, still past the limit)."""
-        size = rich_size(rich_html(markdown))
-        return size if size > MAX_MSG else max(size, len(to_md(markdown)))
+        """The size of standard Markdown in its largest form, on the MAX_MSG scale (what
+        `send_rich` splits against): its plain length, its MarkdownV2 length and its Rich
+        HTML's `rich_size`, past MAX_MSG when the Rich HTML breaks the depth or column
+        limit — so a piece within MAX_MSG goes out as one message in every form."""
+        return _measure(markdown)
 
     @staticmethod
     def page_size(head: str, body: str, first: bool) -> int:
@@ -680,14 +827,24 @@ class TelegramAdapter:
         return len(_page(head, body, first)[0])
 
     @staticmethod
-    def bodies(body) -> list:
-        """The bodies to try in order for one message: a rich body, then its MarkdownV2
-        fallback; plain text as escaped Rich HTML, then as plain text."""
+    def bodies(body):
+        """The forms to try in order for one message, each one message (built when
+        reached): a rich body, then its MarkdownV2 fallback (`render` gives a rich body
+        only for Markdown that fits MAX_MSG in every form); plain text (within MAX_MSG,
+        the caller's bound) as escaped Rich HTML, then as plain text."""
         if isinstance(body, RichMessage):
-            return [body] if body.fallback is None else [body, body.fallback]
+            if body.html is not None:
+                yield body
+            if body.fallback is not None:
+                yield body.fallback
+            elif body.markdown is not None:
+                yield MarkdownV2(to_md(body.markdown))
+            return
         if isinstance(body, (MarkdownV2, PlainText)):
-            return [body]
-        return [RichMessage(plain_html(body), None), PlainText(body)]
+            yield body
+            return
+        yield RichMessage(plain_html(body), None, None)
+        yield PlainText(body)
 
     def classify(self, error: Exception):
         if isinstance(error, TelegramRetryAfter):
@@ -730,6 +887,20 @@ class TelegramAdapter:
                 )
             raise
 
+    async def _logged_refusal(self, text, call):
+        """Make a call with a MarkdownV2 body; a refusal is a rendering defect: logged
+        with its error and the payload size, then raised for the transport's next body."""
+        try:
+            return await call()
+        except TelegramAPIError as error:
+            if isinstance(text, MarkdownV2) and isinstance(self.classify(error), Refused):
+                LOGGER.warning(
+                    "MarkdownV2 message refused (%d characters): %s",
+                    len(text),
+                    getattr(error, "message", type(error).__name__),
+                )
+            raise
+
     async def send(self, window, text, buttons, reply_to, silent=False, thread=None):
         kw = self._where(window)
         markup = _markup(buttons)
@@ -746,7 +917,9 @@ class TelegramAdapter:
         else:
             if isinstance(text, MarkdownV2):
                 kw["parse_mode"] = "MarkdownV2"
-            message = await self.bot.send_message(self._chat, str(text), **kw)
+            message = await self._logged_refusal(
+                text, lambda: self.bot.send_message(self._chat, str(text), **kw)
+            )
         return message.message_id
 
     async def edit(self, window, message_id, text, buttons):
@@ -770,7 +943,12 @@ class TelegramAdapter:
             )
             return True
         body, kw = self._text_kw(text, buttons)
-        await self.bot.edit_message_text(body, chat_id=self._chat, message_id=message_id, **kw)
+        await self._logged_refusal(
+            text,
+            lambda: self.bot.edit_message_text(
+                body, chat_id=self._chat, message_id=message_id, **kw
+            ),
+        )
         return True
 
     async def delete(self, window, message_id):

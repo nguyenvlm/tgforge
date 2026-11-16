@@ -823,7 +823,7 @@ class ClaudeTopic(Topic):
         """Record the background-jobs panel: its own message, kept by the kernel as the
         window's bottom-most (re-sent below any newer message); nothing to show →
         deleted."""
-        panel = background.panel(self, spin)
+        panel = background.panel(self, spin, self.fits_one_message)
         if panel is None:
             self.show_bottom_frame(PANEL_FRAME, None)
         else:
@@ -2037,7 +2037,9 @@ class Claude(Plugin):
         def show_view():
             view["timer"] = None
             view["last"] = time.monotonic()
-            topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
+            topic.show_frame(
+                hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, "", topic.fits_one_message)
+            )
 
         status = ""
         proc = None
@@ -2096,7 +2098,7 @@ class Claude(Plugin):
             buf.append(tail)
         result = shell_view(cmd, buf, status)
         if hid is not None:
-            await topic.land_frame(hid, result, shell_md(cmd, buf, status))
+            await topic.land_frame(hid, result, shell_md(cmd, buf, status, topic.fits_one_message))
         payload = f"[shell result]\n{result}"
         if chain:
             await topic.submit(payload)

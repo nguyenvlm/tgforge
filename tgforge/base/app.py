@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import signal
+import time
 
 from tgforge.base.config import BotConfig
 from tgforge.base.kernel import LOGGER, Kernel, Transport, setup_logging
@@ -20,6 +22,7 @@ from tgforge.base.kernel import LOGGER, Kernel, Transport, setup_logging
 SLACK_INSTALL = 'uv pip install "tgforge[slack]"'
 SOURCE_BACKOFF = 5.0  # s before a stopped platform loop is restarted, doubling
 SOURCE_BACKOFF_MAX = 120.0  # s: the longest wait between restarts
+FULL_COLLECTION_WARN = 0.1  # s: a full collection this long pauses the event loop
 
 
 class OwnerOnly:
@@ -83,6 +86,7 @@ class App:
             if self._auth(kernel, tap):
                 await kernel.handle_tap(tap)
 
+        watch_full_collections = full_collection_watch()
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):  # before startup: a stop then still drains
@@ -94,6 +98,9 @@ class App:
                 raise SystemExit(1)
             for plugin in kernel.plugins:
                 await plugin.on_startup()
+            gc.collect()
+            gc.freeze()  # the long-lived startup heap leaves every later collection's scan
+            gc.callbacks.append(watch_full_collections)
             sources = [
                 loop.create_task(_serve(tx.adapter, on_message, on_tap)) for tx in kernel.transports
             ]
@@ -113,11 +120,39 @@ class App:
                         await task
                 await kernel.broadcast_shutdown()  # flag + let each window settle its UI
         finally:
+            if watch_full_collections in gc.callbacks:
+                gc.callbacks.remove(watch_full_collections)
             for tx in transports:
                 try:
                     await tx.adapter.close()
                 except Exception:
                     LOGGER.exception("closing %s failed", tx.adapter.platform)
+
+
+def full_collection_watch(clock=time.perf_counter):
+    """A `gc.callbacks` hook timing each full (generation 2) collection: one over
+    FULL_COLLECTION_WARN is logged at WARNING with its duration and the objects it
+    scanned, so a heap grown past the startup freeze shows in the log."""
+    started: list[float] = []
+
+    def on_collection(phase: str, info: dict) -> None:
+        if info["generation"] != 2:
+            return
+        if phase == "start":
+            started[:] = [clock()]
+            return
+        if not started:
+            return
+        took = clock() - started.pop()
+        if took > FULL_COLLECTION_WARN:
+            LOGGER.warning(
+                "full garbage collection took %.0f ms (%d objects scanned, %d frozen at startup)",
+                took * 1000,
+                len(gc.get_objects(generation=2)),
+                gc.get_freeze_count(),
+            )
+
+    return on_collection
 
 
 async def _serve(adapter, on_message, on_tap, join=None) -> None:

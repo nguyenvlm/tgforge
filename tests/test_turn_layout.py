@@ -11,6 +11,7 @@ import asyncio
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from claude_fakes import (
+    PIECE_LINE,
     FakeProc,
     assistant_text,
     cancel_task,
@@ -189,11 +190,14 @@ def test_a_ten_chunk_answer_sends_all_ten(tmp_path):
     async def scenario():
         c = client(tmp_path)
         t = window(c, tmp_path)
-        answer = "\n".join(f"chunk {i} " + "y" * 1500 for i in range(10))
+        answer = "\n".join(f"chunk {i} " + "y" * PIECE_LINE for i in range(10))
         await _turn(c, t, answer=answer)
         shown = texts(c)
         assert "(output truncated)" not in " ".join(shown)
+        answers = [text for text in shown if "chunk " in text]
+        assert len(answers) == 10  # one message per chunk: each over half a message
         assert sum(text.count("chunk ") for text in shown) == 10
+        assert [text.split()[1] for text in answers] == [str(i) for i in range(10)]
 
     asyncio.run(scenario())
 
@@ -212,7 +216,7 @@ def test_a_flood_waited_piece_is_retried_and_order_holds(tmp_path):
             return await real_send(chat_id, text, **kw)
 
         c.bot.send_message = send
-        answer = "\n".join(f"PIECE {i} " + "z" * 3000 for i in range(4))
+        answer = "\n".join(f"PIECE {i} " + "z" * PIECE_LINE for i in range(4))
         await _turn(c, t, answer=answer)
         pieces = [text for text in texts(c) if "PIECE" in text]
         order = [int(text.split("PIECE ")[1].split()[0]) for text in pieces]
@@ -235,7 +239,7 @@ def test_suggestion_buttons_ride_the_last_answer_message(tmp_path):
             return msg
 
         c.bot.send_message = send
-        answer = "\n".join(f"part {i} " + "w" * 3000 for i in range(3))
+        answer = "\n".join(f"part {i} " + "w" * PIECE_LINE for i in range(3))
         await _turn(c, t, answer=answer + "\n[[suggest]] yes | no")
         answer_ids = [mid for mid, text in screen(c) if "part " in text]
         assert markups[answer_ids[-1]] is not None
@@ -347,7 +351,7 @@ def test_a_message_queued_during_the_settle_gets_a_fresh_card_below_the_answer(t
 
         t._finalize_turn = boundary_then_message
         echo = asyncio.Event()
-        answer = "\n".join(f"ANSWER {i} " + "q" * 3000 for i in range(3))
+        answer = "\n".join(f"ANSWER {i} " + "q" * PIECE_LINE for i in range(3))
         t.proc = FakeProc([result(answer), echo, replay("next prompt"), asyncio.Event()])
         reader = asyncio.create_task(t._reader())
         await asyncio.sleep(0.05)

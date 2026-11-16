@@ -6,13 +6,13 @@ from __future__ import annotations
 import pytest
 
 from tgforge.base import ui
-from tgforge.base.telegram import TelegramAdapter, to_md
+from tgforge.base.telegram import to_md
 from tgforge.base.ui import MAX_MSG, fmt_duration
 
 
 def md_chunks(text):
-    """The Telegram split: pieces measured as their render."""
-    return ui.md_chunks(text, TelegramAdapter.measure)
+    """Pieces measured as their MarkdownV2 render."""
+    return ui.md_chunks(text, lambda piece: len(to_md(piece)))
 
 
 def test_md_chunks_keep_converted_pieces_under_limit():

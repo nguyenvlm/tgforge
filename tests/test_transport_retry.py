@@ -17,7 +17,7 @@ from aiogram.exceptions import (
 )
 
 from tgforge.base.kernel import TRANSIENT_BACKOFF, TRANSIENT_RETRIES
-from tgforge.base.telegram import RICH_BYTE_LIMIT
+from tgforge.base.ui import MAX_MSG
 from tgforge.testing import rich_text, telegram_transport
 
 
@@ -125,13 +125,13 @@ def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
     async def scenario():
         sent = []
 
-        async def rec(text=None, **kw):
-            sent.append(rich_text(kw["rich_message"].html) if "rich_message" in kw else text)
+        async def rec(text=None, **kw):  # the plain body goes as escaped Rich HTML first
+            rich = kw.get("rich_message")
+            sent.append(rich_text(rich.html) if rich is not None else text)
             return SimpleNamespace(message_id=kw.get("message_id"))
 
         t = telegram_transport(SimpleNamespace(edit_message_text=rec))
-        # over the Rich Message limit too: would be cut at MAX_MSG
-        md = "*" + "x" * (RICH_BYTE_LIMIT + 500) + " MD_TAIL"
+        md = "*" + "x" * (MAX_MSG + 500) + " MD_TAIL"  # would be cut at MAX_MSG
         plain = "the reply body ends with PLAIN_TAIL_KEPT"
         landed = await t.edit_md("0", 42, md, plain)
         assert landed is True

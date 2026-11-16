@@ -199,3 +199,29 @@ def test_a_registered_job_starts_the_updater_mid_turn(tmp_path):
         await cancel_task(t.background_updater_task)
 
     asyncio.run(scenario())
+
+
+def test_a_panel_of_backslash_heavy_jobs_lands_as_one_message(tmp_path):
+    """Their last lines escape to twice their length in MarkdownV2: the oldest rows drop
+    until the panel fits one message in every form."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        now = time.monotonic()
+        t.background_tasks = {}
+        for i in range(40):
+            out = tmp_path / f"job{i}.output"
+            out.write_text("C:\\Users\\x\\" * 20 + "\n")
+            t.background_tasks[f"b{i}"] = {
+                "path": str(out),
+                "label": f"job {i:02d}",
+                "start": now,
+                "done": None,
+            }
+        t._paint_panel(0)
+        await drain(c, t)
+        panel = next(text for mid, text in screen(c) if mid == _panel_id(t))
+        assert "job 39" in panel and "older job(s) hidden" in panel
+
+    asyncio.run(scenario())

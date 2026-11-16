@@ -134,6 +134,64 @@ def test_start_serves_every_platform_then_drains_and_closes_on_the_stop_signal(
     assert ("message", "from a stranger") not in events  # user 2 is not the owner
 
 
+class _Starting(Plugin):
+    id = "starting"
+
+    async def on_startup(self):
+        self.seen.append("plugin startup")
+
+
+def test_the_startup_heap_is_frozen_after_startup_before_the_first_update(
+    tmp_path, monkeypatch, events
+):
+    import gc
+
+    monkeypatch.setattr(gc, "freeze", lambda: events.append("freeze"))
+    plugin = _Starting()
+    plugin.seen = events
+    first = _Adapter("", Inbound("0", 1, 1, "the first update"), seen=events)
+    bot = _app(tmp_path, monkeypatch, [first], plugins=[plugin])
+    asyncio.run(_serve_until(bot, lambda: first.runs))
+    assert events.count("freeze") == 1
+    order = [e for e in events if e in ("startup", "plugin startup", "freeze")]
+    assert order == ["startup", "plugin startup", "freeze"]
+    assert events.index("freeze") < events.index(("message", "the first update"))
+
+
+def test_a_slow_full_collection_is_logged_and_a_fast_one_is_not(caplog):
+    now = [0.0]
+    watch = app_module.full_collection_watch(clock=lambda: now[0])
+    with caplog.at_level("WARNING", logger="tgforge"):
+        for generation, took in ((2, 0.15), (2, 0.05), (1, 0.5)):
+            watch("start", {"generation": generation})
+            now[0] += took
+            watch("stop", {"generation": generation})
+    logged = [r.getMessage() for r in caplog.records if "full garbage collection" in r.getMessage()]
+    assert len(logged) == 1 and logged[0].startswith("full garbage collection took 150 ms")
+    assert "objects scanned" in logged[0] and "frozen at startup" in logged[0]
+
+
+def test_the_collection_watch_runs_while_serving_and_is_removed_after(
+    tmp_path, monkeypatch, events
+):
+    import gc
+
+    watched = []
+    monkeypatch.setattr(gc, "freeze", lambda: None)
+    monkeypatch.setattr(app_module, "full_collection_watch", lambda: watched.append(1) or _marker)
+    first = _Adapter("", Inbound("0", 1, 1, "the first update"), seen=events)
+    bot = _app(tmp_path, monkeypatch, [first])
+    serving = []
+    asyncio.run(
+        _serve_until(bot, lambda: first.runs and not serving.append(_marker in gc.callbacks))
+    )
+    assert watched == [1] and serving[0] is True and _marker not in gc.callbacks
+
+
+def _marker(phase, info):
+    """A stand-in collection hook."""
+
+
 def test_no_platform_connecting_exits_non_zero(tmp_path, monkeypatch, events):
     down = _Adapter("", Inbound("0", 1, 1, "never"), identity_failures=1, seen=events)
     bot = _app(tmp_path, monkeypatch, [down])

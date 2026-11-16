@@ -40,7 +40,7 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.config import BotConfig
-from tgforge.base.ui import MAX_MSG, chunks, md_chunks
+from tgforge.base.ui import MAX_MSG, chunks, md_pieces
 
 LOGGER = logging.getLogger("tgforge")
 
@@ -783,6 +783,11 @@ class Topic:
             )
         )
 
+    def fits_one_message(self, md) -> bool:
+        """Whether Markdown goes out as one message in every form this window's platform
+        may send it in (`Transport.fits_one_message`): a live message's content must."""
+        return self._tx.fits_one_message(md)
+
     def show_frame(self, msg_id, plain, md=None, reply_markup=None) -> None:
         """Frame-skip update of a live message in this window (`Transport.show_frame`)."""
         self._tx.show_frame(self.window, msg_id, plain, md, reply_markup=reply_markup)
@@ -924,9 +929,9 @@ class Plugin:
 # title); close_window(window); window_alive(window, title) -> bool; answer_tap(tap);
 # identity() -> bot name; bind_owner(user id); render(markdown) -> (rich or None,
 # plain); render_pages(pages) -> [(rich or None, plain)]; measure(markdown) ->
-# rendered size; page_size(head, body, first) -> rendered page size; bodies(body) ->
-# the bodies to try in order for one message (a rich body then its fallbacks, plain
-# text first as the platform's own form); classify(error);
+# size of its largest form; page_size(head, body, first) -> rendered page size;
+# bodies(body) -> the forms to try in order for one message, each one message (a rich
+# body then its fallbacks, plain text first as the platform's own form); classify(error);
 # run(on message, on tap); close() (after the drain). Attributes: platform, bot_name,
 # key_prefix, general, owner_id, command_prefix, pages_in_thread, renders_tables,
 # max_message, photo_max, upload_max, download_max.
@@ -1186,33 +1191,29 @@ class Transport:
         rejections, returning None (or `_NOT_MODIFIED`, see `_attempt`). `paced=False` (a
         button-tap answer, which posts no message) skips the pacer slot and the order
         queue but still waits out a flood-wait."""
-        return await self._call_chain([make_call], ok_not_modified, paced, sent_to)
+        async with self._essential(paced):
+            return await self._land(make_call, ok_not_modified, paced, sent_to)
 
-    async def _call_chain(self, make_calls, ok_not_modified=False, paced=True, sent_to=None):
-        """`_call` over alternatives for one message: each factory in turn until the
-        platform takes one, all under one hold of the issue order, so a refused body's
-        fallback goes out before any call issued after it."""
+    @contextlib.asynccontextmanager
+    async def _essential(self, paced: bool = True):
+        """The hold of an essential call: counted as waiting for the pacer, and in issue
+        order (unless not `paced`)."""
         self._pacer.waiting += 1
         try:
             async with self._send_order if paced else contextlib.nullcontext():
-                result = None
-                for make_call in make_calls:
-                    while True:
-                        await self._clear_to_call(paced=paced)
-                        result = await self._attempt(
-                            make_call,
-                            ok_not_modified,
-                            spare=False,
-                            paced=paced,
-                            sent_to=sent_to,
-                        )
-                        if result is not _FLOODED:
-                            break
-                    if result is not None:
-                        return result
-                return result
+                yield
         finally:
             self._pacer.waiting -= 1
+
+    async def _land(self, make_call, ok_not_modified, paced, sent_to):
+        """One essential call, retried through flood-waits until it lands or is refused."""
+        while True:
+            await self._clear_to_call(paced=paced)
+            result = await self._attempt(
+                make_call, ok_not_modified, spare=False, paced=paced, sent_to=sent_to
+            )
+            if result is not _FLOODED:
+                return result
 
     # ── Rendering ──────────────────────────────────────────────────
 
@@ -1224,27 +1225,62 @@ class Transport:
             return self.adapter.render_pages(_first_page(md))[0][0]
         return self.adapter.render(md)[0]
 
-    def _bodies(self, rich, plain) -> list:
-        """Every body to try for one message, in order: the rich render's (when it fits),
-        then the plain body's."""
-        rich_bodies = self.adapter.bodies(rich) if rich is not None else []
-        return rich_bodies + self.adapter.bodies(plain)
+    def _bodies(self, rich, plain):
+        """Every form to try in order for one message, each one message (built when
+        reached): the rich render's, then the plain body's."""
+        if rich is not None:
+            yield from self.adapter.bodies(rich)
+        yield from self.adapter.bodies(plain)
 
-    async def _attempt_bodies(self, bodies, make_call, **kw):
-        """Frame mode: one `_attempt` per body until the platform takes one; each retry
-        takes a fresh spare slot. The last attempt's result when none is taken."""
+    async def _attempt_bodies(self, alternatives, make_call, **kw):
+        """Frame mode: one `_attempt` per form of a single message until the platform
+        takes one; each retry takes a fresh spare slot. The last attempt's result when
+        none is taken."""
         result = None
-        for i, body in enumerate(bodies):
-            if i:
+        tried = False
+        for body in alternatives:
+            if tried:
                 await self._clear_to_call(spare=True)
+            tried = True
             result = await self._attempt(lambda body=body: make_call(body), **kw)
             if result is not None:
                 return result
         return result
 
-    async def _call_bodies(self, bodies, make_call, **kw):
-        """Essential mode: the bodies as one `_call_chain`."""
-        return await self._call_chain([lambda body=body: make_call(body) for body in bodies], **kw)
+    async def _call_bodies(self, alternatives, make_call, sent_to=None, ok_not_modified=False):
+        """One message: each form (`make_call(body)` gives its call) until the platform
+        takes one, under one hold of the issue order; None when every form is refused."""
+        async with self._essential():
+            for body in alternatives:
+                result = await self._land(
+                    lambda body=body: make_call(body), ok_not_modified, True, sent_to
+                )
+                if result is not None:
+                    return result
+        return None
+
+    def fits_one_message(self, md) -> bool:
+        """Whether Markdown (or `Pages`) goes out as one message in every form it may
+        take: what a live message's content must be. Markdown is held to the adapter's
+        `measure`, the size of its largest form; `Pages` to its first page's plain body
+        (each page's other forms are packed to fit by `ui.expandable_pages`)."""
+        if isinstance(md, ui.Pages):
+            return len(self._plain(None, md)) <= MAX_MSG
+        return self.adapter.measure(md) <= MAX_MSG
+
+    def _check_frame(self, plain, md) -> None:
+        """Fail loud when a live message's content does not fit one message: its plain
+        body, and every form its Markdown may take (`fits_one_message`)."""
+        if len(plain) > MAX_MSG:
+            raise ValueError(
+                f"a live message over one message ({len(plain)} characters plain): "
+                "the caller cuts it to MAX_MSG before recording it"
+            )
+        if md is not None and not self.fits_one_message(md):
+            raise ValueError(
+                "a live message whose Markdown is over one message in one of its forms: "
+                "the caller cuts it (see Topic.fits_one_message) before recording it"
+            )
 
     def _plain(self, plain, md) -> str:
         """The caller's plain body, else the plain render of `md`."""
@@ -1274,6 +1310,7 @@ class Transport:
 
     def _record_frame(self, window, message_id, plain, md, reply_markup) -> _Frame:
         plain = self._plain(plain, md)
+        self._check_frame(plain, md)
         key = ("msg", window, message_id)
         frame = self._frames.get(key)
         if frame is None:
@@ -1289,6 +1326,8 @@ class Transport:
         (silently), later ones edit it, and a newer message in the window re-sends it
         below and deletes the old copy. `plain=None` deletes it. Returns at once."""
         frame_key = ("bottom", key)
+        if plain is not None:
+            self._check_frame(plain, md)
         frame = self._frames.get(frame_key)
         if frame is None:
             if plain is None:
@@ -1647,7 +1686,7 @@ class Transport:
                 lambda body, buttons=buttons, reply=reply: self.adapter.send(
                     window, body, buttons, reply
                 ),
-                sent_to=sent_to,
+                sent_to,
             )
             mid = result if result is not None else mid
         return mid
@@ -1671,25 +1710,31 @@ class Transport:
 
     async def send_rich(self, window, text, reply_to=None, reply_markup=None):
         """Send standard Markdown, rendered by the adapter (plain fallback per piece),
-        split to fit; the `reply_markup` goes on the last piece."""
+        split so each piece is one message in every form; the `reply_markup` goes on the
+        last piece. Each piece is cut only when the one before it is sent (one ahead, to
+        know the last), and the cut search lets the event loop run, so a long reply never
+        holds it."""
         mid = None
-        pieces = md_chunks(text, self.adapter.measure)
-        for i, raw in enumerate(pieces):
-            buttons = reply_markup if i == len(pieces) - 1 else None
-            reply = reply_to if i == 0 else None
-            result = await self._send_rendered(window, raw, None, buttons, reply)
+        pieces = md_pieces(text, self.adapter.measure, self.adapter.max_message)
+        piece = await anext(pieces)
+        reply = reply_to
+        while piece is not None:
+            following = await anext(pieces, None)
+            buttons = reply_markup if following is None else None
+            result = await self._send_rendered(window, piece, None, buttons, reply)
             mid = result if result is not None else mid
+            piece, reply = following, None
         return mid
 
     async def _send_rendered(self, window, md, plain, buttons, reply_to, silent=False):
         """One message: the rich render of `md` when it fits, else (or when the platform
-        rejects it) the plain body."""
+        rejects it) each next form, then the plain body."""
         rendered_rich, rendered_plain = self.adapter.render(md)
         plain = rendered_plain if plain is None else plain
         return await self._call_bodies(
             self._bodies(rendered_rich, _cap(plain)),
             lambda body: self.adapter.send(window, body, buttons, reply_to, silent=silent),
-            sent_to=window,
+            window,
         )
 
     async def send_md(
@@ -1724,13 +1769,12 @@ class Transport:
     async def _send_pages_message(self, window, rich, plain, reply_to, thread, silent):
         """One page of `Pages`; a page posted in a thread is not a new message of the
         window's timeline, so it moves no bottom frame."""
-        sent_to = None if thread is not None else window
         return await self._call_bodies(
             self._bodies(rich, _cap(plain)),
             lambda body: self.adapter.send(
                 window, body, None, reply_to, silent=silent, thread=thread
             ),
-            sent_to=sent_to,
+            None if thread is not None else window,
         )
 
     async def edit_rich(self, window, msg_id, text) -> bool:
@@ -1738,8 +1782,8 @@ class Transport:
         return await self.edit_md(window, msg_id, text, text)
 
     async def edit_md(self, window, msg_id, md, plain, reply_markup=None) -> bool:
-        """Edit a message to standard Markdown with a caller-bounded plain fallback. An
-        over-limit render goes straight to the plain body, never cut."""
+        """Edit a message to standard Markdown with a plain fallback: one message in every
+        form. An over-limit render goes straight to the next form, never cut."""
         result = await self._call_bodies(
             self._bodies(self._rich(md), _cap(self._plain(plain, md))),
             lambda body: self.adapter.edit(window, msg_id, body, reply_markup),

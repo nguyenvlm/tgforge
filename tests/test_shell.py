@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tgforge.base.config import BotConfig
-from tgforge.plugins.shell import Shell, ShellTopic
+from tgforge.plugins.shell import FLUSH_INTERVAL, Shell, ShellTopic
 from tgforge.testing import kernel_bot, rich_text, telegram_inbound, telegram_kernel
 
 
@@ -251,5 +251,30 @@ def test_tui_process_is_stopped_and_shell_is_handed_back(tmp_path):
         assert await _until(lambda: inst.tui is False, timeout=6.0)
         assert inst.allow_universal is True
         await inst._kill()
+
+    asyncio.run(scenario())
+
+
+def test_backslash_heavy_output_keeps_the_panel_updating(tmp_path):
+    """Windows paths escape to twice their length in MarkdownV2: the panel's code block is
+    cut to one message in every form, so later output still shows."""
+
+    async def scenario():
+        core = _kernel(tmp_path)
+        inst = await core.open_window(ShellTopic, "work", origin="0")
+        bot = core.transports[0].adapter.bot
+        paths = "for i in $(seq 1 400); do printf 'C:\\\\Users\\\\x\\\\'; done; echo"
+        try:
+            await core.handle_message(_msg(paths, inst.window))
+            assert await _until(lambda: inst.acc.count("\\") > 1200)  # 3 per path
+            await asyncio.sleep(2 * FLUSH_INTERVAL)  # the backslash frame is recorded
+            assert not inst._flush_task.done()
+            edits = bot.edits
+            await core.handle_message(_msg("echo MARK$((40 + 2))", inst.window))
+            assert await _until(lambda: "MARK42" in inst.acc)
+            assert await _until(lambda: bot.edits > edits, 3 * FLUSH_INTERVAL)
+            assert not inst._flush_task.done()
+        finally:
+            await inst._kill()
 
     asyncio.run(scenario())
