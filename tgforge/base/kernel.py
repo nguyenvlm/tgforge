@@ -1539,7 +1539,11 @@ class Transport:
         if content == frame.shown:
             _resolve(waiters, True)
             return
-        result = await self._edit_attempt(frame.window, frame.message_id, *content)
+        try:
+            result = await self._edit_attempt(frame.window, frame.message_id, *content)
+        except Exception:
+            _resolve(waiters, False)  # a waiting land_frame goes on to its fallback
+            raise
         if result is _FLOODED:
             frame.waiters = waiters + frame.waiters
             frame.must_land = frame.must_land or must_land  # stays first until it lands

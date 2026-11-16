@@ -79,6 +79,7 @@ from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answ
 
 LOGGER = logging.getLogger("tgforge")
 
+SEND_STEP_STALL = 60.0  # s a send step waits on the one before it before a WARNING
 EDIT_INTERVAL = 2.5  # seconds between live-card frames (the kernel skips what it can't show)
 MESSAGE_DEBOUNCE = 1.0  # quiet seconds before buffered messages go out as one prompt
 RELEASE_IDLE_SEC = 1800
@@ -445,7 +446,14 @@ class ClaudeTopic(Topic):
 
         async def run():
             if previous is not None:
-                await asyncio.wait([previous])
+                done, _pending = await asyncio.wait([previous], timeout=SEND_STEP_STALL)
+                if not done:  # a step that never ends holds every later message back
+                    LOGGER.warning(
+                        "send step (%s) waits over %ss on the step before it",
+                        self.name,
+                        SEND_STEP_STALL,
+                    )
+                    await asyncio.wait([previous])
             try:
                 await step()
             except Exception:
