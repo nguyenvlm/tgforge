@@ -12,6 +12,8 @@ from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.testing import TestClient
 
 THREAD = "555"
+# a line over half of one Telegram message's Rich text, so each goes out as its own message
+PIECE_LINE = TelegramAdapter.max_message // 2 + 1000
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cli_usage_events.jsonl"
 
 
@@ -104,6 +106,16 @@ def window(c: TestClient, tmp_path, thread: str = THREAD) -> ClaudeTopic:
     c.core.owners[thread] = "claude"
     t.workspace = str(tmp_path)
     t._jsonl = lambda: tmp_path / "none.jsonl"
+    t.notice_prompts = []  # notice prompts, recorded instead of launching the CLI
+
+    async def submit_notices():
+        t.notice_task = None
+        block = t._take_notice_block()
+        if block:
+            t.notice_prompt_open = True
+            t.notice_prompts.append(block)
+
+    t._submit_notices = submit_notices
     return t
 
 
@@ -126,6 +138,11 @@ def screen(c: TestClient, thread: str = THREAD) -> list[tuple[int, str]]:
 
 def texts(c: TestClient, thread: str = THREAD) -> list[str]:
     return [text for _mid, text in screen(c, thread)]
+
+
+def markups(c: TestClient, thread: str = THREAD) -> list[str]:
+    """`texts`, with a Rich Message's HTML in place of its text."""
+    return [c.bot.rich.get(mid, text) for mid, text in screen(c, thread)]
 
 
 async def cancel_task(task) -> None:

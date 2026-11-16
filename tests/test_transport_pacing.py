@@ -8,7 +8,7 @@ import asyncio
 from types import SimpleNamespace
 
 from tgforge.base.kernel import _Pacer
-from tgforge.testing import telegram_transport
+from tgforge.testing import rich_text, telegram_transport
 
 
 def _fake_clock(monkeypatch):
@@ -74,8 +74,8 @@ def test_call_essential_waits_for_a_slot_then_sends(monkeypatch):
         _, slept = _fake_clock(monkeypatch)
         sent = []
 
-        async def rec(text, **kw):
-            sent.append(text)
+        async def rec(text=None, **kw):
+            sent.append(rich_text(kw["rich_message"].html) if "rich_message" in kw else text)
             return SimpleNamespace(message_id=1)
 
         bot = SimpleNamespace(edit_message_text=rec)
@@ -107,3 +107,32 @@ def test_enable_pacing_flips_it_on():
     assert t._pacer.enabled is False  # off by default so tests never pace
     t.enable_pacing()
     assert t._pacer.enabled is True  # the live run turns it on
+
+
+def test_a_live_message_fallback_takes_its_own_pacer_slot(monkeypatch):
+    from aiogram.exceptions import TelegramBadRequest
+
+    class _Refused(TelegramBadRequest):
+        def __init__(self):
+            self.message = "Bad Request: can't parse rich message"
+
+    async def scenario():
+        clock, _ = _fake_clock(monkeypatch)
+        edits = []  # (form, clock) per edit attempt
+
+        async def edit_message_text(text=None, **kw):
+            rich = "rich_message" in kw
+            escaped = rich and kw["rich_message"].html == "<p>x</p>"
+            edits.append(("escaped Rich" if escaped else "rich" if rich else "plain", clock["t"]))
+            if rich and not escaped:
+                raise _Refused()
+            return SimpleNamespace(message_id=kw["message_id"])
+
+        bot = SimpleNamespace(edit_message_text=edit_message_text)
+        t = telegram_transport(bot, pace_per_min=60, pace_burst=1)  # 1 slot/s, 1 at once
+        assert await t.land_frame("0", 42, "x", "**x**")
+        assert [form for form, _ in edits] == ["rich", "escaped Rich"]
+        # the refused rich edit spent the one slot: the fallback waits a refill
+        assert edits[1][1] - edits[0][1] >= 1.0
+
+    asyncio.run(scenario())

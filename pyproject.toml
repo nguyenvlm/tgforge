@@ -8,7 +8,8 @@ version = "0.0.1"
 description = "Telegram and Slack windows with pluggable consumer apps (Claude Code, shell, file browser)."
 requires-python = ">=3.12"
 dependencies = [
-    "aiogram~=3.30.0",
+    "aiogram~=3.32.0",
+    "playwright~=1.64.0",
     "pydantic~=2.13.0",
     "telegramify-markdown==1.4.2",
 ]

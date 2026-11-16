@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from tgforge.base.kernel import file_held_open
-from tgforge.base.ui import MAX_MSG, code_block, fmt_duration
+from tgforge.base.ui import MAX_MSG, code_block, fmt_duration, most_that_fits
 from tgforge.plugins.claude.render import SPINNER
 
 LOGGER = logging.getLogger("tgforge")
@@ -66,13 +66,14 @@ def prune_finished(session, now: float) -> None:
         del session.background_tasks[bid]
 
 
-def panel(session, spin: int = 0) -> tuple[str, str] | None:
+def panel(session, spin: int = 0, fits=None) -> tuple[str, str] | None:
     """A monospace, never-collapsed panel of background tasks (Markdown, plain), or None when
     there are none to show. A running row: the spinner, label, elapsed, and the last
     output line (`spin` animates the spinner). A finished row keeps its outcome mark
     (✓ / ✗ / ◼) for FINISHED_LINGER seconds, then drops. The panel is its own message,
     so if many jobs make it exceed a message the OLDEST rows are dropped
-    first — the panel never costs the main text."""
+    first — the panel never costs the main text; given `fits` (`Topic.fits_one_message`),
+    until its code block fits one message in every form."""
     now = time.monotonic()
     shown = visible_tasks(session, now)
     if not shown:
@@ -95,24 +96,28 @@ def panel(session, spin: int = 0) -> tuple[str, str] | None:
         else:
             el = fmt_duration(int(t["done_at"] - t["start"]))
             task_rows.append(f"{t['done']} {label:<24} {el:>5}  {_OUTCOME[t['done']]}")
-    body = _fit_panel(header, task_rows)
+    body = _fit_panel(header, task_rows, fits)
     return code_block(body), body
 
 
-def _fit_panel(header: str, task_rows: list[str]) -> str:
-    """Join header + rows; if the code block would exceed a message,
+def _fit_panel(header: str, task_rows: list[str], fits=None) -> str:
+    """Join header + rows; if the code block would exceed a message (or fail `fits`),
     drop the oldest rows (front of the list) until it fits, marking the elision."""
     limit = MAX_MSG - 10  # leave room for the ``` fences and a backtick-escape or two
-    rows = list(task_rows)
-    while rows:
-        shown = [header, *rows]
-        if len(rows) < len(task_rows):
-            shown.insert(1, f"… {len(task_rows) - len(rows)} older job(s) hidden")
-        body = "\n".join(shown)
-        if len(body) <= limit:
-            return body
-        rows.pop(0)
-    return header
+
+    def body(kept: int) -> str:
+        shown = [header, *task_rows[len(task_rows) - kept :]]
+        if kept < len(task_rows):
+            shown.insert(1, f"… {len(task_rows) - kept} older job(s) hidden")
+        return "\n".join(shown)
+
+    def block(kept: int) -> str:
+        return code_block(body(kept))
+
+    def fitting(md: str) -> bool:
+        return len(md) <= limit + 8 and (fits is None or fits(md))  # 8: the fences
+
+    return body(most_that_fits(block, len(task_rows), fitting))
 
 
 def _output_file_held_open(path: str) -> bool:

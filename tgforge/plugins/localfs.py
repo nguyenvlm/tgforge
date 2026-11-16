@@ -13,7 +13,6 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import Plugin, Topic, action, command, launch, on_message
-from tgforge.base.ui import MAX_MSG
 
 PAGE = 10  # dir entries per page
 PREVIEW_BYTES = 3000
@@ -31,13 +30,14 @@ def _human_size(n: int) -> str:
     return f"{size:.1f}P"
 
 
-def _code(content: str, measure) -> str:
-    """`content` as a code block; over the budget once rendered (`measure`, the window's
-    adapter), its first half instead."""
-    budget = MAX_MSG - 10
-    if measure(ui.code_block(content)) > budget:
-        content = content[: budget // 2]
-    return ui.code_block(content)
+def _code(content: str, fits) -> str:
+    """`content` as a code block, cut to its longest head that `fits` one message in
+    every form (`Topic.fits_one_message`)."""
+
+    def head(kept: int) -> str:
+        return ui.code_block(content[:kept])
+
+    return head(ui.most_that_fits(head, len(content), fits))
 
 
 @launch("/localfs", "browse the local filesystem")
@@ -130,7 +130,7 @@ class LocalfsTopic(Topic):
             size = os.path.getsize(path)
         except OSError as e:
             content = f"⚠ {e}"
-            return _code(content, self.adapter.measure), content, ui.keyboard([[back, close]])
+            return _code(content, self.fits_one_message), content, ui.keyboard([[back, close]])
         head = f"📄 {path}\n{_human_size(size)}"
         try:
             with open(path, "rb") as f:
@@ -146,7 +146,7 @@ class LocalfsTopic(Topic):
             preview = f"\n\n⚠ {e}"
         content = head + preview
         dl = ui.act("⬇ download", "fs", "dl")
-        return _code(content, self.adapter.measure), content, ui.keyboard([[dl], [back, close]])
+        return _code(content, self.fits_one_message), content, ui.keyboard([[dl], [back, close]])
 
     def _redraw(self):
         """Record the view's newest frame and return at once: a burst of taps shows the

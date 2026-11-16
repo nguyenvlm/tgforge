@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from tgforge.base import kernel, ui
 from tgforge.base.kernel import Transport
 from tgforge.base.telegram import _markup
-from tgforge.testing import MockBot, telegram_transport
+from tgforge.testing import MockBot, rich_text, telegram_transport
 
 KEYS = ui.keyboard([[ui.button("keys", "k")]])
 
@@ -50,7 +50,12 @@ class _Bot:
         if method in self.reject:
             raise _Rejected()
 
-    async def edit_message_text(self, text, **kw):
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        return await self.send_message(chat_id, rich_text(rich_message.html), **kw)
+
+    async def edit_message_text(self, text=None, **kw):
+        rich = kw.pop("rich_message", None)
+        text = rich_text(rich.html) if rich is not None else text
         self._hit("edit", text)
         return SimpleNamespace(message_id=kw["message_id"])
 
@@ -304,7 +309,9 @@ def test_closing_a_window_forgets_its_frames_and_title(tmp_path):
 
 
 class _SlowEditBot(_Bot):
-    async def edit_message_text(self, text, **kw):
+    async def edit_message_text(self, text=None, **kw):
+        rich = kw.pop("rich_message", None)
+        text = rich_text(rich.html) if rich is not None else text
         await asyncio.sleep(0.05)  # the HTTP round trip
         return await super().edit_message_text(text, **kw)
 
@@ -414,7 +421,8 @@ def test_a_lasting_bottom_re_send_failure_stops_retrying():
         bot.reject.add("send")
         t.show_bottom_frame("7", "panel", "rows")
         await asyncio.wait_for(t.flush_frames(), 2)  # returns: no endless retry
-        assert len(bot.texts("send")) == BOTTOM_RESEND_ATTEMPTS
+        # each re-send tries the plain body as a Rich Message, then as plain text
+        assert len(bot.texts("send")) == 2 * BOTTOM_RESEND_ATTEMPTS
         assert t.bottom_frame_id("panel") is None
 
     asyncio.run(scenario())
@@ -459,20 +467,26 @@ def test_a_markdown_rejected_panel_re_sends_plain_through_a_flood():
         real_send = bot.send_message
         floods = {"plain": 1}
 
+        async def send_rich(chat_id, rich_message, **kw):
+            calls.append("rich")
+            raise _Rejected("Bad Request: can't parse rich message")
+
         async def send(chat_id, text, **kw):
-            calls.append(kw.get("parse_mode"))
-            if kw.get("parse_mode") == "MarkdownV2":
-                raise _Rejected("Bad Request: can't parse entities")
+            calls.append("plain")
             if floods["plain"]:
                 floods["plain"] -= 1
                 raise _Flood(0.05)
             return await real_send(chat_id, text, **kw)
 
+        bot.send_rich_message = send_rich
         bot.send_message = send
         t.show_bottom_frame("7", "panel", "rows", "*rows*")
         await asyncio.wait_for(t.flush_frames(), 2)
         assert t.bottom_frame_id("panel") is not None  # the plain copy landed
-        assert calls[:2] == ["MarkdownV2", None]  # md refused, plain flooded, then retried
+        # rich refused, the plain body refused as rich, plain flooded; then the whole
+        # chain again until plain lands
+        once = ["rich", "rich", "plain"]
+        assert calls == once + once
 
     asyncio.run(scenario())
 
@@ -488,7 +502,8 @@ def test_a_lasting_failure_retries_again_after_new_content():
         await asyncio.wait_for(t.flush_frames(), 2)
         t.show_bottom_frame("7", "panel", "rows, later")  # new content: a fresh burst
         await asyncio.wait_for(t.flush_frames(), 2)
-        assert len(bot.texts("send")) == 2 * BOTTOM_RESEND_ATTEMPTS
+        # two bursts, each re-send trying the rich then the plain body
+        assert len(bot.texts("send")) == 2 * 2 * BOTTOM_RESEND_ATTEMPTS
 
     asyncio.run(scenario())
 
@@ -731,6 +746,13 @@ def test_a_failed_re_send_after_the_delete_retries_up_to_the_attempt_limit():
         failures = {"left": 0}
         tried = []
 
+        real_rich = bot.send_rich_message
+
+        async def send_rich_message(chat_id, rich_message, **kw):
+            if failures["left"]:  # a failed re-send: its rich body is refused too
+                raise _Rejected("Bad Request: something transient")
+            return await real_rich(chat_id, rich_message, **kw)
+
         async def send_message(chat_id, text, **kw):
             if text == "rows":
                 tried.append(text)
@@ -739,6 +761,7 @@ def test_a_failed_re_send_after_the_delete_retries_up_to_the_attempt_limit():
                 raise _Rejected("Bad Request: something transient")
             return await real_send(chat_id, text, **kw)
 
+        bot.send_rich_message = send_rich_message
         bot.send_message = send_message
         t = telegram_transport(bot)
         t.show_bottom_frame("7", "panel", "rows")
@@ -769,12 +792,20 @@ def test_a_panel_left_with_no_copy_is_re_sent_by_the_next_newer_message():
         real_send = bot.send_message
         failures = {"left": 0}
 
+        real_rich = bot.send_rich_message
+
+        async def send_rich_message(chat_id, rich_message, **kw):
+            if failures["left"]:  # a failed re-send: its rich body is refused too
+                raise _Rejected("Bad Request: something transient")
+            return await real_rich(chat_id, rich_message, **kw)
+
         async def send_message(chat_id, text, **kw):
             if text == "rows" and failures["left"]:
                 failures["left"] -= 1
                 raise _Rejected("Bad Request: something transient")
             return await real_send(chat_id, text, **kw)
 
+        bot.send_rich_message = send_rich_message
         bot.send_message = send_message
         t = telegram_transport(bot)
         t.show_bottom_frame("7", "panel", "rows")
@@ -884,7 +915,7 @@ def test_the_stub_edit_drops_the_old_copys_keyboard():
         stub_kw = []
         real_edit = bot.edit_message_text
 
-        async def edit_message_text(text, **kw):
+        async def edit_message_text(text=None, **kw):
             stub_kw.append(kw)
             return await real_edit(text, **kw)
 
@@ -896,7 +927,9 @@ def test_the_stub_edit_drops_the_old_copys_keyboard():
         state["fail"] = True
         await t.send("7", "later")
         await asyncio.wait_for(t.flush_frames(), 2)
-        assert stub_kw == [{"chat_id": 1, "message_id": first}]  # no reply_markup: no buttons
+        # no reply_markup: no buttons
+        assert [sorted(kw) for kw in stub_kw] == [["chat_id", "message_id", "rich_message"]]
+        assert stub_kw[0]["message_id"] == first
         assert bot.last_markup == _markup(KEYS)  # the new copy carries them
 
     asyncio.run(scenario())
@@ -908,7 +941,7 @@ def test_an_undeletable_copy_that_cannot_be_stubbed_stays_the_one_copy():
             lambda: _BadRequest("Bad Request: message can't be deleted")
         )
 
-        async def edit_message_text(text, **kw):
+        async def edit_message_text(text=None, **kw):
             raise _BadRequest("Bad Request: message can't be edited")
 
         bot.edit_message_text = edit_message_text

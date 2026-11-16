@@ -5,7 +5,7 @@ subprocess reaper, persistence (`AppDB`, one SQLite file; `SavedDict`, namespace
 dict-like views), the plugin declaration decorators, the `Topic` and `Plugin` bases,
 the neutral event types (`Inbound`, `Tap`) and call outcomes an adapter reports, the
 `Transport` (one platform adapter behind one pacer and flood-wait deadline, with the
-rich-then-plain retry, chunking, and the frame-skip output for live messages and
+body-by-body fallback, chunking, and the frame-skip output for live messages and
 titles), the command registry (built once at startup; aborts the launch on any name
 clash), the per-call `Context` a handler receives, and the `Kernel` itself. The kernel
 holds one `Transport` per configured platform and picks a window's by its key; it owns
@@ -23,7 +23,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
+import dataclasses
 import datetime
+import functools
 import json
 import logging
 import mimetypes
@@ -40,7 +43,7 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.config import BotConfig
-from tgforge.base.ui import MAX_MSG, chunks, md_chunks
+from tgforge.base.ui import MAX_MSG, chunks, md_pieces
 
 LOGGER = logging.getLogger("tgforge")
 
@@ -63,6 +66,78 @@ def _resolve(waiters: list, landed: bool) -> None:
     for waiter in waiters:
         if not waiter.done():
             waiter.set_result(landed)
+
+
+NOTICE_FALLBACK = "fallback"  # a message went out in a lesser form
+NOTICE_NOT_DELIVERED = "not delivered"  # a message no form could send or edit, or cut to fit
+NOTICE_EXCEPTION = "exception"  # an exception caught at a bot-level boundary
+# set while a notice is being shown as a message: a notice raised then is only logged
+_SHOWING_NOTICE: contextvars.ContextVar[bool] = contextvars.ContextVar("_SHOWING_NOTICE")
+# the windows whose send order the running task holds (a nested call in one goes on)
+_WINDOW_TURNS: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "_WINDOW_TURNS", default=frozenset()
+)
+
+
+@dataclass
+class Notice:
+    """A bot-level event its window's Claude, or the window itself, is told about:
+    `kind` one of the NOTICE_ kinds; `what` the message or task it hit; `forms` the form
+    tried → the form used ("" when none); `error` its type and text; `size` the
+    payload's size in characters; `count` how often it happened."""
+
+    kind: str
+    window: str | None
+    what: str
+    forms: str = ""
+    error: str = ""
+    size: int = 0
+    count: int = 1
+
+
+@dataclass
+class ShownNotice:
+    """A notice shown in its window as a message: `notice` (its count grows with each
+    repeat), the message's id once sent, and the task that sends it and edits the count
+    in (None when idle)."""
+
+    notice: Notice
+    message_id: int | str | None = None
+    task: asyncio.Task | None = None
+
+
+def error_text(error: BaseException) -> str:
+    """An exception as a notice's error: its type and text (its type alone when its
+    text can't be read)."""
+    try:
+        text = str(error)
+    except Exception:  # an exception whose __str__ fails: named by its type alone
+        text = ""
+    return f"{type(error).__name__}: {text}"[:500]
+
+
+def notice_line(notice: Notice) -> str:
+    """One line for a notice: its kind, what it hit, the forms, the error, the size and
+    its count."""
+    line = f"{notice.kind}: {notice.what}"
+    if notice.forms:
+        line += f" ({notice.forms})"
+    if notice.error:
+        line += f" — {notice.error}"
+    if notice.size:
+        line += f", {notice.size} characters"
+    if notice.count > 1:
+        line += f" ×{notice.count}"
+    return line
+
+
+def notice_exception(on_notice, window, what: str, error: BaseException) -> None:
+    """Raise an exception notice through `on_notice`, after the traceback is logged."""
+    on_notice(Notice(NOTICE_EXCEPTION, window, what, error=error_text(error)))
+
+
+def _log_notice(notice: Notice) -> None:
+    LOGGER.warning("notice (window %s) %s", notice.window, notice_line(notice))
 
 
 def _cap(text: str) -> str:
@@ -694,6 +769,11 @@ class Topic:
         """The bot is stopping for a restart (not the window closing). Settle any live
         UI so nothing is left mid-render; the window revives after the restart."""
 
+    def on_notice(self, notice: Notice) -> None:
+        """A bot notice for this window (`Kernel.notice`): shown in the window as a
+        message. A window with a Claude session hands it to Claude instead."""
+        self._core.show_notice(notice)
+
     async def on_restarted(self) -> None:
         """This window asked for the just-completed restart; resume however it needs to.
         Fires only on the requester topic, after revive. Default: nothing."""
@@ -782,6 +862,11 @@ class Topic:
                 first_id=first_id,
             )
         )
+
+    def fits_one_message(self, md) -> bool:
+        """Whether Markdown goes out as one message in every form this window's platform
+        may send it in (`Transport.fits_one_message`): a live message's content must."""
+        return self._tx.fits_one_message(md)
 
     def show_frame(self, msg_id, plain, md=None, reply_markup=None) -> None:
         """Frame-skip update of a live message in this window (`Transport.show_frame`)."""
@@ -896,6 +981,7 @@ class Plugin:
 
     #: set by the core at registration
     saved: SavedDict
+    notice: Callable[[Notice], None]  # raise a bot notice; one with no window goes to General
 
     @property
     def plugin_id(self) -> str:
@@ -924,10 +1010,17 @@ class Plugin:
 # title); close_window(window); window_alive(window, title) -> bool; answer_tap(tap);
 # identity() -> bot name; bind_owner(user id); render(markdown) -> (rich or None,
 # plain); render_pages(pages) -> [(rich or None, plain)]; measure(markdown) ->
-# rendered size; page_size(head, body, first) -> rendered page size; classify(error);
-# run(on message, on tap); close() (after the drain). Attributes: platform, bot_name,
-# key_prefix, general, owner_id, command_prefix, pages_in_thread, renders_tables,
-# max_message, safe_chunk, photo_max, upload_max, download_max.
+# size of its largest form; page_size(head, body, first) -> rendered page size;
+# bodies(body) -> the forms to try in order for one message, each one message (a rich
+# body then its fallbacks, plain text first as the platform's own form); form_name(body)
+# -> the form's name in a notice; payload_size(body) -> its size in characters;
+# prepare() (at startup: start fetching what rendering needs, off the event loop);
+# draw_diagrams(window, rich body) -> the body with its diagrams drawn (async, before
+# the issue order is held; a diagram that does not draw stays code with a notice);
+# classify(error); run(on message, on tap); close() (after the drain). Attributes:
+# platform, bot_name, key_prefix, general, owner_id, command_prefix, pages_in_thread,
+# renders_tables, max_message, photo_max, upload_max, download_max; on_notice (set by
+# the transport: the adapter's own boundaries raise their notices through it).
 
 
 @dataclass
@@ -1034,6 +1127,18 @@ class _Title:
     immediate: bool = False  # an explicit rename: no TITLE_MIN_INTERVAL wait
 
 
+def _in_window_order(method):
+    """A Transport call in `window` (its first argument) that keeps the window's send
+    order (`Transport._window_turn`)."""
+
+    @functools.wraps(method)
+    async def call(self, window, *args, **kwargs):
+        async with self._window_turn(window):
+            return await method(self, window, *args, **kwargs)
+
+    return call
+
+
 class Transport:
     """One platform's adapter behind one pacer and one flood-wait deadline, in two kinds
     of calls.
@@ -1054,6 +1159,9 @@ class Transport:
         self.flood_until = 0.0  # monotonic deadline of the last flood-wait: no call before it
         self._pacer = _Pacer(pace_per_min, pace_burst)
         self._send_order = asyncio.Lock()  # FIFO: essential calls go out in issue order
+        # window → its send order (FIFO): a call takes its place when it starts, before
+        # any drawing, and holds it until it lands
+        self._window_orders: dict[str, asyncio.Lock] = {}
         # window → the newest message id seen there, sent or received (ids grow within a
         # window, so any message above a given id landed below that message)
         self.latest_message_ids: dict[str, int | str] = {}
@@ -1069,6 +1177,27 @@ class Transport:
         self._pushing = False  # a push is in flight (its key already left `_dirty`)
         self.on_title_landed = None  # called with (window, name) once a rename lands
         self.bot_name = ""  # the adapter's identity, learned at startup
+        self.on_notice: Callable[[Notice], None] = _log_notice  # the kernel's, once added
+        adapter.on_notice = self._raise_notice  # the adapter's own boundaries raise here
+
+    def _raise_notice(self, notice: Notice) -> None:
+        self.on_notice(notice)
+
+    def _capped(self, window, text: str, what: str) -> str:
+        """`text` within MAX_MSG; a cut (its tail lost) raises a not-delivered notice."""
+        if len(text) > MAX_MSG:
+            self.on_notice(
+                Notice(NOTICE_NOT_DELIVERED, window, what, forms="cut to fit", size=len(text))
+            )
+        return _cap(text)
+
+    def _report_forms(self, window, what, tried: list, used, refusals: list) -> None:
+        """A fallback notice when a later form landed, a not-delivered one when none did."""
+        form, size = self.adapter.form_name, self.adapter.payload_size
+        kind = NOTICE_FALLBACK if used is not None else NOTICE_NOT_DELIVERED
+        forms = f"{form(tried[0])} → {form(used) if used is not None else 'none'}"
+        error = refusals[0] if refusals else ""
+        self.on_notice(Notice(kind, window, what, forms, error, size(tried[0])))
 
     def note_message(self, window: str, message_id) -> None:
         """Record `message_id` as seen in `window`; a replayed message (a tapped
@@ -1113,6 +1242,7 @@ class Transport:
         paced=True,
         sent_to=None,
         delete_outcome=False,
+        refusals: list | None = None,
     ):
         """Issue one adapter call (its slot already taken). Returns its result,
         `_FLOODED` on a flood-wait (the deadline is recorded), `_NOT_MODIFIED` on a benign
@@ -1140,6 +1270,8 @@ class Transport:
                 if isinstance(kind, Transient):
                     if attempt == TRANSIENT_RETRIES:
                         LOGGER.warning("call failed after %d retries: %r", attempt, e)
+                        if refusals is not None:
+                            refusals.append(error_text(e))
                         return _UNSURE if delete_outcome else None
                     LOGGER.warning("call failed (%r), retry in %.0fs", e, backoff)
                     await asyncio.sleep(backoff)
@@ -1149,6 +1281,8 @@ class Transport:
                 if isinstance(kind, NotModified) and ok_not_modified:
                     return _NOT_MODIFIED
                 LOGGER.debug("call rejected: %r", e)
+                if refusals is not None:
+                    refusals.append(error_text(e))
                 if delete_outcome:
                     return _GONE if isinstance(kind, NotFound) else _REFUSED
                 return None
@@ -1184,22 +1318,52 @@ class Transport:
         rejections, returning None (or `_NOT_MODIFIED`, see `_attempt`). `paced=False` (a
         button-tap answer, which posts no message) skips the pacer slot and the order
         queue but still waits out a flood-wait."""
+        async with self._essential(paced):
+            return await self._land(make_call, ok_not_modified, paced, sent_to)
+
+    @contextlib.asynccontextmanager
+    async def _window_turn(self, window):
+        """A window's place in its send order: a call takes it when it starts and holds it
+        until it is done, so a later call in the window (another task's) never lands
+        first, whatever the earlier one waits on (a diagram drawing); other windows go
+        on. A nested call in a window the task already holds goes straight on."""
+        held = _WINDOW_TURNS.get()
+        if window in held:
+            yield
+            return
+        order = self._window_orders.setdefault(window, asyncio.Lock())
+        async with order:
+            token = _WINDOW_TURNS.set(held | {window})
+            try:
+                yield
+            finally:
+                _WINDOW_TURNS.reset(token)
+
+    @contextlib.asynccontextmanager
+    async def _essential(self, paced: bool = True):
+        """The hold of an essential call: counted as waiting for the pacer, and in issue
+        order (unless not `paced`)."""
         self._pacer.waiting += 1
         try:
             async with self._send_order if paced else contextlib.nullcontext():
-                while True:
-                    await self._clear_to_call(paced=paced)
-                    result = await self._attempt(
-                        make_call,
-                        ok_not_modified,
-                        spare=False,
-                        paced=paced,
-                        sent_to=sent_to,
-                    )
-                    if result is not _FLOODED:
-                        return result
+                yield
         finally:
             self._pacer.waiting -= 1
+
+    async def _land(self, make_call, ok_not_modified, paced, sent_to, refusals=None):
+        """One essential call, retried through flood-waits until it lands or is refused."""
+        while True:
+            await self._clear_to_call(paced=paced)
+            result = await self._attempt(
+                make_call,
+                ok_not_modified,
+                spare=False,
+                paced=paced,
+                sent_to=sent_to,
+                refusals=refusals,
+            )
+            if result is not _FLOODED:
+                return result
 
     # ── Rendering ──────────────────────────────────────────────────
 
@@ -1210,6 +1374,80 @@ class Transport:
         if isinstance(md, ui.Pages):
             return self.adapter.render_pages(_first_page(md))[0][0]
         return self.adapter.render(md)[0]
+
+    def _bodies(self, rich, plain):
+        """Every form to try in order for one message, each one message (built when
+        reached): the rich render's, then the plain body's."""
+        if rich is not None:
+            yield from self.adapter.bodies(rich)
+        yield from self.adapter.bodies(plain)
+
+    async def _attempt_bodies(self, alternatives, make_call, window, what, **kw):
+        """Frame mode: one `_attempt` per form of a single message until the platform
+        takes one; each retry takes a fresh spare slot. The last attempt's result when
+        none is taken. A later form landing raises a fallback notice; none landing is
+        left to the frame's owner (a newer frame replaces it, `land_frame`'s caller goes
+        on to its own fallback)."""
+        result = None
+        tried: list = []
+        refusals: list = []
+        for body in alternatives:
+            if tried:
+                await self._clear_to_call(spare=True)
+            tried.append(body)
+            result = await self._attempt(lambda body=body: make_call(body), refusals=refusals, **kw)
+            if result is _FLOODED:
+                return result
+            if result is not None:
+                if len(tried) > 1:
+                    self._report_forms(window, what, tried, body, refusals)
+                return result
+        return result
+
+    async def _call_bodies(
+        self, alternatives, make_call, window, what, sent_to=None, ok_not_modified=False
+    ):
+        """One message: each form (`make_call(body)` gives its call) until the platform
+        takes one, under one hold of the issue order; None when every form is refused. A
+        later form landing raises a fallback notice, none landing a not-delivered one."""
+        tried: list = []
+        refusals: list = []
+        async with self._essential():
+            for body in alternatives:
+                tried.append(body)
+                result = await self._land(
+                    lambda body=body: make_call(body), ok_not_modified, True, sent_to, refusals
+                )
+                if result is not None:
+                    if len(tried) > 1:
+                        self._report_forms(window, what, tried, body, refusals)
+                    return result
+        if tried:
+            self._report_forms(window, what, tried, None, refusals)
+        return None
+
+    def fits_one_message(self, md) -> bool:
+        """Whether Markdown (or `Pages`) goes out as one message in every form it may
+        take: what a live message's content must be. Markdown is held to the adapter's
+        `measure`, the size of its largest form; `Pages` to its first page's plain body
+        (each page's other forms are packed to fit by `ui.expandable_pages`)."""
+        if isinstance(md, ui.Pages):
+            return len(self._plain(None, md)) <= MAX_MSG
+        return self.adapter.measure(md) <= MAX_MSG
+
+    def _check_frame(self, plain, md) -> None:
+        """Fail loud when a live message's content does not fit one message: its plain
+        body, and every form its Markdown may take (`fits_one_message`)."""
+        if len(plain) > MAX_MSG:
+            raise ValueError(
+                f"a live message over one message ({len(plain)} characters plain): "
+                "the caller cuts it to MAX_MSG before recording it"
+            )
+        if md is not None and not self.fits_one_message(md):
+            raise ValueError(
+                "a live message whose Markdown is over one message in one of its forms: "
+                "the caller cuts it (see Topic.fits_one_message) before recording it"
+            )
 
     def _plain(self, plain, md) -> str:
         """The caller's plain body, else the plain render of `md`."""
@@ -1239,6 +1477,7 @@ class Transport:
 
     def _record_frame(self, window, message_id, plain, md, reply_markup) -> _Frame:
         plain = self._plain(plain, md)
+        self._check_frame(plain, md)
         key = ("msg", window, message_id)
         frame = self._frames.get(key)
         if frame is None:
@@ -1254,6 +1493,8 @@ class Transport:
         (silently), later ones edit it, and a newer message in the window re-sends it
         below and deletes the old copy. `plain=None` deletes it. Returns at once."""
         frame_key = ("bottom", key)
+        if plain is not None:
+            self._check_frame(plain, md)
         frame = self._frames.get(frame_key)
         if frame is None:
             if plain is None:
@@ -1385,8 +1626,11 @@ class Transport:
             self._pushing = True
             try:
                 await self._push(key)
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("frame push failed (%s)", key)
+                frame = self._frames.get(key)
+                window = frame.window if frame is not None else key[1]
+                notice_exception(self.on_notice, window, "live message push", error)
             finally:
                 self._pushing = False
             LOGGER.info(
@@ -1465,7 +1709,11 @@ class Transport:
         if content == frame.shown:
             _resolve(waiters, True)
             return
-        result = await self._edit_attempt(frame.window, frame.message_id, *content)
+        try:
+            result = await self._edit_attempt(frame.window, frame.message_id, *content)
+        except Exception:
+            _resolve(waiters, False)  # a waiting land_frame goes on to its fallback
+            raise
         if result is _FLOODED:
             frame.waiters = waiters + frame.waiters
             frame.must_land = frame.must_land or must_land  # stays first until it lands
@@ -1491,20 +1739,14 @@ class Transport:
         content = (frame.plain, frame.md, frame.reply_markup)  # the newest, read at the send
         plain, md, markup = content
         window = frame.window
-        result = None
         rich = self._rich(md) if md is not None else None
-        if rich is not None:
-            result = await self._attempt(
-                lambda: self.adapter.send(window, rich, markup, None, silent=True),
-                sent_to=window,
-            )
-            if result is None:  # the rich body was rejected: a second, plain attempt
-                await self._clear_to_call(spare=True)
-        if result is None:
-            result = await self._attempt(
-                lambda: self.adapter.send(window, _cap(plain), markup, None, silent=True),
-                sent_to=window,
-            )
+        result = await self._attempt_bodies(
+            self._bodies(rich, self._capped(window, plain, "live message")),
+            lambda body: self.adapter.send(window, body, markup, None, silent=True),
+            window,
+            "live message",
+            sent_to=window,
+        )
         if result is _FLOODED:
             LOGGER.info("bottom frame %s: re-send flood-waited, retrying", key[1])
             self._mark_dirty(key)
@@ -1553,8 +1795,11 @@ class Transport:
                 await self._recheck_flood()
             else:
                 await self._clear_to_call(spare=True)
-            stub = await self._attempt(
-                lambda: self.adapter.edit(window, old, STUB_TEXT, None),
+            stub = await self._attempt_bodies(
+                self.adapter.bodies(STUB_TEXT),
+                lambda body: self.adapter.edit(window, old, body, None),
+                window,
+                "live message stub",
                 ok_not_modified=True,
             )
             if stub is None or stub is _FLOODED:
@@ -1598,21 +1843,17 @@ class Transport:
         rejects it) the plain body. An over-limit render is never sent: a hard cut could
         land on valid markup and silently drop the final words."""
         rich = self._rich(md) if md is not None else None
-        if rich is not None:
-            result = await self._attempt(
-                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
-                ok_not_modified=True,
-            )
-            if result is not None:
-                return result
-            await self._clear_to_call(spare=True)
-        return await self._attempt(
-            lambda: self.adapter.edit(window, msg_id, _cap(plain), reply_markup),
+        return await self._attempt_bodies(
+            self._bodies(rich, self._capped(window, plain, "live message")),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
+            window,
+            "live message",
             ok_not_modified=True,
         )
 
     # ── Essential sends / edits ────────────────────────────────────
 
+    @_in_window_order
     async def send(self, window, text, reply_to=None, buries_bottom=True, reply_markup=None):
         """Send plain text, split to fit; `reply_markup` rides the last piece."""
         mid = None
@@ -1621,23 +1862,31 @@ class Transport:
         for i, chunk in enumerate(pieces):
             buttons = reply_markup if i == len(pieces) - 1 else None
             reply = reply_to if i == 0 else None
-            result = await self._call(
-                lambda chunk=chunk, buttons=buttons, reply=reply: self.adapter.send(
-                    window, _cap(chunk), buttons, reply
+            result = await self._call_bodies(
+                self._bodies(None, self._capped(window, chunk, "message")),
+                lambda body, buttons=buttons, reply=reply: self.adapter.send(
+                    window, body, buttons, reply
                 ),
-                sent_to=sent_to,
+                window,
+                "message",
+                sent_to,
             )
             mid = result if result is not None else mid
         return mid
 
+    @_in_window_order
     async def edit(self, window, msg_id, text, reply_markup=None) -> bool:
         """Replace a message's text (plain); its buttons become `reply_markup`."""
-        result = await self._call(
-            lambda: self.adapter.edit(window, msg_id, _cap(text), reply_markup),
+        result = await self._call_bodies(
+            self._bodies(None, self._capped(window, text, "edit")),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
+            window,
+            "edit",
             ok_not_modified=True,
         )
         return result is not None
 
+    @_in_window_order
     async def set_buttons(self, window, msg_id, reply_markup=None) -> bool:
         """Replace a message's buttons, its text unchanged (None: no buttons)."""
         result = await self._call(
@@ -1646,36 +1895,40 @@ class Transport:
         )
         return result is not None
 
+    @_in_window_order
     async def send_rich(self, window, text, reply_to=None, reply_markup=None):
         """Send standard Markdown, rendered by the adapter (plain fallback per piece),
-        split to fit; the `reply_markup` goes on the last piece."""
+        split so each piece is one message in every form; the `reply_markup` goes on the
+        last piece. Each piece is cut only when the one before it is sent (one ahead, to
+        know the last), and the cut search lets the event loop run, so a long reply never
+        holds it."""
         mid = None
-        pieces = md_chunks(text, self.adapter.measure, self.adapter.safe_chunk)
-        for i, raw in enumerate(pieces):
-            buttons = reply_markup if i == len(pieces) - 1 else None
-            reply = reply_to if i == 0 else None
-            result = await self._send_rendered(window, raw, None, buttons, reply)
+        pieces = md_pieces(text, self.adapter.measure, self.adapter.max_message)
+        piece = await anext(pieces)
+        reply = reply_to
+        while piece is not None:
+            following = await anext(pieces, None)
+            buttons = reply_markup if following is None else None
+            result = await self._send_rendered(window, piece, None, buttons, reply)
             mid = result if result is not None else mid
+            piece, reply = following, None
         return mid
 
     async def _send_rendered(self, window, md, plain, buttons, reply_to, silent=False):
         """One message: the rich render of `md` when it fits, else (or when the platform
-        rejects it) the plain body."""
+        rejects it) each next form, then the plain body."""
         rendered_rich, rendered_plain = self.adapter.render(md)
         plain = rendered_plain if plain is None else plain
-        result = None
-        if rendered_rich is not None:
-            result = await self._call(
-                lambda: self.adapter.send(window, rendered_rich, buttons, reply_to, silent=silent),
-                sent_to=window,
-            )
-        if result is None:
-            result = await self._call(
-                lambda: self.adapter.send(window, _cap(plain), buttons, reply_to, silent=silent),
-                sent_to=window,
-            )
-        return result
+        rendered_rich = await self.adapter.draw_diagrams(window, rendered_rich)
+        return await self._call_bodies(
+            self._bodies(rendered_rich, self._capped(window, plain, "message")),
+            lambda body: self.adapter.send(window, body, buttons, reply_to, silent=silent),
+            window,
+            "message",
+            window,
+        )
 
+    @_in_window_order
     async def send_md(
         self,
         window,
@@ -1708,42 +1961,35 @@ class Transport:
     async def _send_pages_message(self, window, rich, plain, reply_to, thread, silent):
         """One page of `Pages`; a page posted in a thread is not a new message of the
         window's timeline, so it moves no bottom frame."""
-        sent_to = None if thread is not None else window
-        result = None
-        if rich is not None:
-            result = await self._call(
-                lambda: self.adapter.send(
-                    window, rich, None, reply_to, silent=silent, thread=thread
-                ),
-                sent_to=sent_to,
-            )
-        if result is None:
-            result = await self._call(
-                lambda: self.adapter.send(
-                    window, _cap(plain), None, reply_to, silent=silent, thread=thread
-                ),
-                sent_to=sent_to,
-            )
-        return result
+        return await self._call_bodies(
+            self._bodies(rich, self._capped(window, plain, "page")),
+            lambda body: self.adapter.send(
+                window, body, None, reply_to, silent=silent, thread=thread
+            ),
+            window,
+            "page",
+            None if thread is not None else window,
+        )
 
     async def edit_rich(self, window, msg_id, text) -> bool:
         """Edit a message to standard Markdown (plain fallback)."""
         return await self.edit_md(window, msg_id, text, text)
 
+    @_in_window_order
     async def edit_md(self, window, msg_id, md, plain, reply_markup=None) -> bool:
-        """Edit a message to standard Markdown with a caller-bounded plain fallback. An
-        over-limit render goes straight to the plain body, never cut."""
-        rich = self._rich(md)
-        result = None
-        if rich is not None:
-            result = await self._call(
-                lambda: self.adapter.edit(window, msg_id, rich, reply_markup),
-                ok_not_modified=True,
-            )
-        if result is not None:
-            return True
-        return await self.edit(window, msg_id, self._plain(plain, md), reply_markup=reply_markup)
+        """Edit a message to standard Markdown with a plain fallback: one message in every
+        form. An over-limit render goes straight to the next form, never cut."""
+        rich = await self.adapter.draw_diagrams(window, self._rich(md))
+        result = await self._call_bodies(
+            self._bodies(rich, self._capped(window, self._plain(plain, md), "edit")),
+            lambda body: self.adapter.edit(window, msg_id, body, reply_markup),
+            window,
+            "edit",
+            ok_not_modified=True,
+        )
+        return result is not None
 
+    @_in_window_order
     async def delete_msg(self, window, msg_id) -> None:
         """Delete a message (its pending frame is dropped); a rejection (the message is
         already gone) counts as done."""
@@ -1760,6 +2006,7 @@ class Transport:
             lambda: self.adapter.send_photo(window, raw, None, buttons=reply_markup, name=name),
         )
 
+    @_in_window_order
     async def _upload(self, window, make_call):
         """An essential upload. One the platform took without reporting its message id
         still lands below the window's bottom frames: they are marked buried."""
@@ -1775,6 +2022,7 @@ class Transport:
             self.bury_bottom_frames(window)
         return result
 
+    @_in_window_order
     async def edit_photo_b64(self, window, msg_id, media_type, b64, reply_markup=None) -> bool:
         """Replace an existing photo message's image in place (keeps one live frame
         instead of a growing pile). Returns False if the edit was rejected."""
@@ -2152,6 +2400,11 @@ class Kernel:
         self.transports: list[Transport] = list(transports or [])
         for tx in self.transports:
             tx.on_title_landed = self._title_landed
+            tx.on_notice = self.notice
+        # window → the notices shown there as messages since its last inbound message,
+        # by kind, what and error (a repeat counts up on that message)
+        self._shown_notices: dict[str, dict[tuple, ShownNotice]] = {}
+        self._notice_tasks: set[asyncio.Task] = set()  # notices being shown as messages
         self.shutting_down = False  # set on a graceful stop so drivers stay quiet
         self._start_mono = time.monotonic()
         self.db = AppDB(config.db_file)
@@ -2182,10 +2435,69 @@ class Kernel:
         for p in self.plugins:
             ns = core_ns() if p.plugin_id == "core" else plugin_ns(p.plugin_id)
             p.saved = self.db.saved(ns)
+            p.notice = self.notice_in_general
             self.plugin_saved[p.plugin_id] = p.saved
         self._reconcile_task: asyncio.Task | None = None
 
     # ── Platforms ──────────────────────────────────────────────────
+
+    def notice(self, notice: Notice) -> None:
+        """Raise a bot notice: logged, then handed to its window (`Topic.on_notice`), or
+        shown in the window as a message when no window instance takes it. One raised
+        while a notice is being shown is only logged, so a failing notice never loops."""
+        _log_notice(notice)
+        if notice.window is None or _SHOWING_NOTICE.get(False):
+            return
+        instance = self.instances.get(notice.window)
+        if instance is not None:
+            instance.on_notice(notice)
+        else:
+            self.show_notice(notice)
+
+    def notice_in_general(self, notice: Notice) -> None:
+        """Raise a notice; one with no window goes to the first platform's General."""
+        if notice.window is None and self.transports:
+            notice = dataclasses.replace(notice, window=self.transports[0].adapter.general)
+        self.notice(notice)
+
+    def show_notice(self, notice: Notice) -> None:
+        """Show a notice in its window as a message, from its own task (a notice may be
+        raised while the transport holds its issue order). The message moves no bottom
+        frame, and a repeat (same kind, what and error) before the window's next inbound
+        message counts up on that message (an edit), so no message path can feed a stream
+        of notices."""
+        tx = self.find_transport(notice.window)
+        if tx is None:
+            return
+        shown = self._shown_notices.setdefault(notice.window, {})
+        key = (notice.kind, notice.what, notice.error)
+        entry = shown.get(key)
+        if entry is None:
+            entry = shown[key] = ShownNotice(dataclasses.replace(notice))
+        else:
+            entry.notice.count += notice.count
+        if entry.task is None:
+            entry.task = asyncio.get_running_loop().create_task(self._keep_shown(tx, entry))
+            self._notice_tasks.add(entry.task)
+            entry.task.add_done_callback(self._notice_tasks.discard)
+
+    async def _keep_shown(self, tx: Transport, entry: ShownNotice) -> None:
+        """Send a shown notice, then edit its count in until it no longer changes; a
+        notice its own message raises is only logged."""
+        _SHOWING_NOTICE.set(True)
+        window = entry.notice.window
+        on_screen = None
+        try:
+            while (text := f"⚠️ bot notice — {notice_line(entry.notice)}") != on_screen:
+                if entry.message_id is None:
+                    entry.message_id = await tx.send(window, text, buries_bottom=False)
+                    if entry.message_id is None:
+                        return
+                else:
+                    await tx.edit(window, entry.message_id, text)
+                on_screen = text
+        finally:
+            entry.task = None
 
     def find_transport(self, window: str) -> Transport | None:
         """The transport whose adapter owns `window`: the longest key prefix that leaves
@@ -2796,10 +3108,12 @@ class Kernel:
         for tx in self.transports:
             try:
                 tx.bot_name = await tx.adapter.identity()
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("%s failed to start; serving without it", tx.adapter.platform)
+                notice_exception(self.notice, tx.adapter.general, "platform startup", error)
                 failed.append(tx)
                 continue
+            tx.adapter.prepare()
             live.append(tx)
         self.transports = live
         # rebuild live windows from persisted ownership (a window of a platform not
@@ -2814,6 +3128,7 @@ class Kernel:
     async def rejoin(self, tx: Transport, bot_name: str) -> None:
         """A platform that failed at startup connected: serve it and revive its windows."""
         tx.bot_name = bot_name
+        tx.adapter.prepare()
         self.transports.append(tx)
         await self._revive(tx)
 
@@ -2827,8 +3142,9 @@ class Kernel:
             inst = self._instantiate(cls, window, names.get(window, cls_id))
             try:
                 await inst.on_revive()
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("on_revive failed for %s (%s)", window, cls_id)
+                notice_exception(self.notice, window, "window revive", error)
 
     async def _announce_online(self) -> None:
         """A readiness ping in each bound platform's General on every startup (the lobby
@@ -2847,8 +3163,9 @@ class Kernel:
             if inst is not None:
                 try:
                     await inst.on_restarted()
-                except Exception:
+                except Exception as error:
                     LOGGER.exception("on_restarted failed for %s", window)
+                    notice_exception(self.notice, window, "restart notice", error)
 
     async def broadcast_shutdown(self) -> None:
         """A graceful stop: flag it (drivers skip crash warnings) and let every live
@@ -2857,8 +3174,9 @@ class Kernel:
         for inst in list(self.instances.values()):
             try:
                 await inst.on_shutdown()
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("on_shutdown failed (%s)", inst.window)
+                notice_exception(self.notice, inst.window, "shutdown", error)
         try:
             await asyncio.wait_for(self.flush_frames(), SHUTDOWN_FLUSH)
         except TimeoutError:
@@ -2896,8 +3214,9 @@ class Kernel:
         if inst is not None:
             try:
                 await self._teardown(inst)
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("on_close failed on delete (%s)", window)
+                notice_exception(self.notice, window, "window close", error)
         self.db.drop(window_ns(self.owners.get(window, "core"), window))
         self._forget(window)
 
@@ -2931,12 +3250,22 @@ class Kernel:
         return True
 
     async def handle_message(self, message: Inbound) -> None:
+        """Route an inbound message to its window's handler; a handler that raises is
+        logged and raised as an exception notice for that window."""
+        try:
+            await self._handle_message(message)
+        except Exception as error:
+            LOGGER.exception("message handler failed (%s)", message.window)
+            notice_exception(self.notice, message.window, "message handler", error)
+
+    async def _handle_message(self, message: Inbound) -> None:
         window = message.window
         tx = self.find_transport(window)
         if tx is None:
             return
         if not message.in_thread:
             tx.note_message(window, message.message_id)
+        self._shown_notices.pop(window, None)  # a notice after it is shown afresh
         text = message.text.strip()
         has_media = bool(message.attachments)
         mentioned = message.mentioned
@@ -3122,6 +3451,15 @@ class Kernel:
     # ── Taps ───────────────────────────────────────────────────────
 
     async def handle_tap(self, tap: Tap) -> None:
+        """Route a button tap to its handler; a handler that raises is logged and raised
+        as an exception notice for that window."""
+        try:
+            await self._handle_tap(tap)
+        except Exception as error:
+            LOGGER.exception("tap handler failed (%s)", tap.window)
+            notice_exception(self.notice, tap.window, "button handler", error)
+
+    async def _handle_tap(self, tap: Tap) -> None:
         data = tap.data or ""
         head = data.split(":")[0]
         if head in self.pending_callbacks:

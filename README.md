@@ -60,6 +60,18 @@ Writing a plugin: subclass `Topic` (one window class), declare commands with dec
 
 `token` configures Telegram, the `slack` block configures Slack; set either or both. `home` is the bot's state dir and process cwd; the wizard puts each bot under `~/.tgforge/<name>`. `service` names the user service, which enables `/restart`. The bot writes each platform's owner (and Telegram's group, Slack's control channel) back into this file.
 
+## Mermaid diagrams
+
+On Telegram, a ```` ```mermaid ```` code block in a message is drawn as an image in its place (HTML labels such as `<sub>` and `<br>` included). It is part of the default install: tgforge draws each diagram with the mermaid.js bundle in a headless Chromium driven by Playwright. Neither file ships in the package; tgforge pins mermaid.js by version and sha256 and fetches both once into the bot home, under `<home>/mermaid/` (the bundle, about 5 MB, and `browsers/`, about 270 MB):
+
+```
+tgforge fetch-mermaid --app mybot
+```
+
+`tgforge install` runs this step itself, and the bot fetches whichever file is missing at startup, in the background. A bundle whose sha256 differs from the pinned one is deleted and never loaded. On a bare Linux the browser may also need its system libraries: `python -m playwright install-deps chromium-headless-shell` (it installs system packages, so it asks for root).
+
+The browser starts on the first diagram (about 1.3 s) and closes after 5 idle minutes (about 400–700 MB while open). Offline, or whenever a file is missing or a diagram does not draw, the block goes out as code with a fallback notice saying why (a Claude window's agent gets it with the next prompt, any other window shows it as a message), and the bot tries the fetch again at most once every 5 minutes. Slack shows the block as code.
+
 ## Slack
 
 Slack support is an extra: `uv pip install "tgforge[slack]"` (a `slack` block without it stops at startup with this command).

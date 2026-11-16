@@ -331,7 +331,8 @@ def test_pages_on_telegram_stay_one_message_per_page(tmp_path):
         await tx.send_md(TG_WINDOW, ui.Pages("🔧 2", ["one", "two"]))
         sent = kernel_bot(core).sent
         assert len(sent) == 2 and all(t == 1001 for t, _ in sent)  # both in the topic itself
-        assert sent[1][1].startswith("**>↳ 2/2")
+        page_2 = kernel_bot(core).created[1][0]
+        assert kernel_bot(core).rich[page_2].startswith("<blockquote expandable>↳ 2/2")
 
     asyncio.run(scenario())
 
@@ -653,7 +654,9 @@ def test_the_session_note_quotes_the_windows_platform_and_limits(tmp_path):
     assert telegram_note.startswith("[via Telegram bot") and "20MB Telegram download cap" in (
         telegram_note
     )
-    assert "Telegram renders them as raw text" in telegram_note
+    # Telegram's Rich Messages render tables; Slack's markdown block does not
+    assert "Markdown tables" not in telegram_note
+    assert "Slack renders them as raw text" in slack_note
 
 
 def test_a_claude_session_gets_its_window_key_in_the_env(tmp_path):

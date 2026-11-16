@@ -17,7 +17,8 @@ from aiogram.exceptions import (
 )
 
 from tgforge.base.kernel import TRANSIENT_BACKOFF, TRANSIENT_RETRIES
-from tgforge.testing import telegram_transport
+from tgforge.base.ui import MAX_MSG
+from tgforge.testing import rich_text, telegram_transport
 
 
 class _Flood(TelegramRetryAfter):
@@ -117,16 +118,16 @@ def test_essential_calls_go_out_in_issue_order(monkeypatch):
 
 
 def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
-    """An md render over MAX_MSG (MarkdownV2 escaping inflates a live panel past the
-    limit) must never be hard-cut and sent — its final words would vanish mid-word.
+    """An md render over MAX_MSG must never be hard-cut and sent — its final words would
+    vanish mid-word.
     edit_md skips the oversized md and edits the caller-bounded plain in full."""
-    from tgforge.base.kernel import MAX_MSG
 
     async def scenario():
         sent = []
 
-        async def rec(text, **kw):
-            sent.append(text)
+        async def rec(text=None, **kw):  # the plain body goes as escaped Rich HTML first
+            rich = kw.get("rich_message")
+            sent.append(rich_text(rich.html) if rich is not None else text)
             return SimpleNamespace(message_id=kw.get("message_id"))
 
         t = telegram_transport(SimpleNamespace(edit_message_text=rec))

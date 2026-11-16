@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
 from tgforge.plugins.claude import Claude, ClaudeTopic
-from tgforge.testing import kernel_bot, telegram_kernel
+from tgforge.testing import kernel_bot, rich_text, telegram_kernel
 
 FAKE_CLI = """#!/usr/bin/env python3
 import sys, json
@@ -40,7 +40,12 @@ class MockBot:
         self.sent.append(text)
         return SimpleNamespace(message_id=self._n)
 
-    async def edit_message_text(self, text, **kw):
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        return await self.send_message(chat_id, rich_text(rich_message.html), **kw)
+
+    async def edit_message_text(self, text=None, **kw):
+        rich = kw.pop("rich_message", None)
+        text = rich_text(rich.html) if rich is not None else text
         self.edited.append(text)
         return SimpleNamespace(message_id=kw.get("message_id"))
 

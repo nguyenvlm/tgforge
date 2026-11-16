@@ -9,6 +9,8 @@ import logging
 import re
 from pathlib import Path
 
+from tgforge.base.kernel import notice_exception
+
 LOGGER = logging.getLogger("tgforge")
 
 _WRAPPER_START = "# >>> tgforge claude system-prompt >>>"
@@ -45,9 +47,10 @@ _CLAUDE_AS = (
 )
 
 
-def install_claude_as() -> None:
+def install_claude_as(on_notice=None) -> None:
     """Install ~/.local/bin/claude-as: `claude-as <name> [args]` runs the CLI
-    under the '.claude-<name>' config dir."""
+    under the '.claude-<name>' config dir. A failure is logged and, given `on_notice`
+    (the bot's), raised as an exception notice."""
     dest = Path.home() / ".local" / "bin" / "claude-as"
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -57,10 +60,14 @@ def install_claude_as() -> None:
             LOGGER.info("installed %s", dest)
     except OSError as e:
         LOGGER.warning("claude-as install failed: %r", e)
+        if on_notice is not None:
+            notice_exception(on_notice, None, "claude-as install", e)
 
 
-def install_shell_wrapper() -> None:
-    """Install/refresh the interactive `claude` wrapper in ~/.bashrc + ~/.zshrc."""
+def install_shell_wrapper(on_notice=None) -> None:
+    """Install/refresh the interactive `claude` wrapper in ~/.bashrc + ~/.zshrc. A
+    failure is logged and, given `on_notice` (the bot's), raised as an exception
+    notice."""
     pattern = re.compile(re.escape(_WRAPPER_START) + r".*?" + re.escape(_WRAPPER_END), re.DOTALL)
     for rc in (Path.home() / ".bashrc", Path.home() / ".zshrc"):
         text = rc.read_text() if rc.exists() else ""
@@ -76,3 +83,5 @@ def install_shell_wrapper() -> None:
                 LOGGER.info("claude system-prompt wrapper written to %s", rc)
             except OSError as e:
                 LOGGER.warning("shell wrapper install failed for %s: %r", rc, e)
+                if on_notice is not None:
+                    notice_exception(on_notice, None, f"shell wrapper install ({rc.name})", e)

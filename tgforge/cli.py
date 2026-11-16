@@ -112,6 +112,11 @@ def main(argv: list[str] | None = None) -> None:
     ws_p.add_argument("value", nargs="?", help="a path/glob (add) or index/glob (rm)")
     ws_p.add_argument("--app", help="app name (omit if only one is installed)")
     ws_p.add_argument("--home", help="explicit bot home dir (overrides --app)")
+    fm_p = sub.add_parser(
+        "fetch-mermaid", help="fetch mermaid.js and the headless browser into a bot home"
+    )
+    fm_p.add_argument("--app", help="app name (omit if only one is installed)")
+    fm_p.add_argument("--home", help="explicit bot home dir (overrides --app)")
     rs_p = sub.add_parser("restart", help="restart a bot's service (detached)")
     rs_p.add_argument("--app", help="app name (omit if only one is installed)")
     rs_p.add_argument("--home", help="explicit bot home dir (overrides --app)")
@@ -142,3 +147,9 @@ def _dispatch(args) -> None:
         _workspaces(args.action, args.value, args.app, args.home)
     elif args.command == "restart":
         _restart(args.app, args.home)
+    elif args.command == "fetch-mermaid":
+        from tgforge.install import fetch_diagram_files
+
+        home_path = _resolve_home(args.app, args.home)
+        if home_path is not None:
+            fetch_diagram_files(home_path)

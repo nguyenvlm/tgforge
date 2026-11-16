@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -25,14 +26,21 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import (
+    NOTICE_EXCEPTION,
+    NOTICE_FALLBACK,
+    NOTICE_NOT_DELIVERED,
     SHUTDOWN_FLUSH,
     STALL_WARN,
+    Notice,
     Plugin,
     Topic,
     action,
     command,
+    error_text,
     kill_file_holders,
     launch,
+    notice_exception,
+    notice_line,
     on_message,
     on_unknown,
     prefix,
@@ -79,6 +87,7 @@ from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answ
 
 LOGGER = logging.getLogger("tgforge")
 
+SEND_STEP_STALL = 60.0  # s a send step waits on the one before it before a WARNING
 EDIT_INTERVAL = 2.5  # seconds between live-card frames (the kernel skips what it can't show)
 MESSAGE_DEBOUNCE = 1.0  # quiet seconds before buffered messages go out as one prompt
 RELEASE_IDLE_SEC = 1800
@@ -114,7 +123,12 @@ SESSION_BRIEF = (
     "per file: `[[attach]] /absolute/path` — sent after the text as a photo (images "
     "≤{photo_cap}) or a document (≤{upload_cap}); the marker line never renders. "
     "{table_rule}Keep lists one level deep — no nested bullets; group detail into short "
-    "paragraphs led by a bold label instead."
+    "paragraphs led by a bold label instead. The bot reports trouble with its own "
+    "messages in a [Bot notice(s)] block, one line each (kind: what it hit, the form "
+    "tried → the form used, the error): `not delivered` — that message, or the cut tail "
+    "of it, never reached the user, so send it again; `exception` — the bot itself "
+    "failed, so tell the user what failed; `fallback` — it went out in a plainer form, "
+    "no action."
 )
 TABLE_RULE = (
     "Do not use Markdown tables in replies — {platform} renders them as raw text, not a "
@@ -194,6 +208,12 @@ class ClaudeTopic(Topic):
         self.spin = 0
         self.pending_writes: list[dict] = []
         self.turn_seq = 0  # boundary counter: bumped once per result; stamps each ack's turn
+        # bot notices held for the next prompt's [Bot notice(s)] block, keyed by kind,
+        # what and error (a repeat counts up); a notice prompt sent closes immediate ones
+        # until the user's next prompt, so a failing reply to it never starts another
+        self.pending_notices: dict[tuple, Notice] = {}
+        self.notice_prompt_open = False
+        self.notice_task: asyncio.Task | None = None
         self.cancel_requested = False
         self.cancel_msg_id: int | None = None  # the "cancelling…" bubble, settled at turn end
         self.control_waiters: dict[str, asyncio.Future] = {}  # request_id → its response
@@ -295,6 +315,11 @@ class ClaudeTopic(Topic):
         self.mirror_tools = data.get("mirror_tools", 0)
         self.mirror_start = data.get("mirror_start", 0.0)
         self._start_mirror()
+        held = self.saved.get("notices", [])
+        if held:
+            del self.saved["notices"]
+            for fields in held:  # raised while the bot stopped: delivered now
+                self.on_notice(Notice(**fields))
 
     async def on_close(self):
         for t in (
@@ -445,11 +470,23 @@ class ClaudeTopic(Topic):
 
         async def run():
             if previous is not None:
-                await asyncio.wait([previous])
+                done, _pending = await asyncio.wait([previous], timeout=SEND_STEP_STALL)
+                if not done:  # a step that never ends holds every later message back
+                    LOGGER.warning(
+                        "send step (%s) waits over %ss on the step before it",
+                        self.name,
+                        SEND_STEP_STALL,
+                    )
+                    stalled = f"waits over {SEND_STEP_STALL:.0f}s on the step before it"
+                    self._core.notice(
+                        Notice(NOTICE_EXCEPTION, self.window, "send step", "", stalled)
+                    )
+                    await asyncio.wait([previous])
             try:
                 await step()
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("send step failed (%s)", self.name)
+                notice_exception(self._core.notice, self.window, "send step", error)
 
         task = asyncio.create_task(run())
         self.send_chain = task
@@ -619,6 +656,7 @@ class ClaudeTopic(Topic):
         """A graceful restart: let queued output land, then settle a live turn card into a
         final bubble (drop the spinner, keep the timeline) so nothing is left mid-render;
         the session revives and re-mirrors after the restart."""
+        self._save_notices()  # held for the next prompt, which comes after the restart
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._sent(), SHUTDOWN_FLUSH)
         turn = self.turn
@@ -728,8 +766,9 @@ class ClaudeTopic(Topic):
                         break
                 if has_background_launch(ev):
                     has_background_tasks = True
-        except Exception:
+        except Exception as error:
             LOGGER.exception("reader error (%s)", self.name)
+            notice_exception(self._core.notice, self.window, "CLI reader", error)
         finally:
             if self.release_task is not None:
                 self.release_task.cancel()
@@ -823,7 +862,7 @@ class ClaudeTopic(Topic):
         """Record the background-jobs panel: its own message, kept by the kernel as the
         window's bottom-most (re-sent below any newer message); nothing to show →
         deleted."""
-        panel = background.panel(self, spin)
+        panel = background.panel(self, spin, self.fits_one_message)
         if panel is None:
             self.show_bottom_frame(PANEL_FRAME, None)
         else:
@@ -939,6 +978,11 @@ class ClaudeTopic(Topic):
                 await self.send_file(Path(p).expanduser())
             except (RuntimeError, OSError) as e:
                 await self.send(f"⚠️ could not attach {p}: {e}")
+                self._core.notice(
+                    Notice(
+                        NOTICE_NOT_DELIVERED, self.window, f"attachment {p}", error=error_text(e)
+                    )
+                )
         await self._sync_title()
         await self._settle_cancel_note()  # settle a '/cancel' bubble at the turn boundary
         if self._jsonl().exists():
@@ -966,10 +1010,11 @@ class ClaudeTopic(Topic):
                 self.show_frame(turn.card_id, self._live_view(turn))
         except asyncio.CancelledError:
             pass  # normal stop
-        except Exception:
+        except Exception as error:
             # the painter died mid-turn (not a clean cancel) — the card freezes at its
             # last frame, the exact fault behind a "spinner stuck on one number" report
             LOGGER.exception("heartbeat died mid-turn (%s): panel frozen", self.name)
+            notice_exception(self._core.notice, self.window, "live card heartbeat", error)
 
     def _suggestion_markup(self, options):
         token = uuid.uuid4().hex[:8]
@@ -1000,8 +1045,9 @@ class ClaudeTopic(Topic):
             try:
                 if await self._mirror_once():
                     self._save()
-            except Exception:
+            except Exception as error:
                 LOGGER.exception("mirror failed (%s)", self.name)
+                notice_exception(self._core.notice, self.window, "transcript mirror", error)
 
     async def _mirror_once(self) -> bool:
         jsonl = self._jsonl()
@@ -1195,6 +1241,7 @@ class ClaudeTopic(Topic):
             LOGGER.exception("message flush (%s): prompt build failed", self.name)
             raise
         if prompt:
+            self.notice_prompt_open = False  # a user's prompt: immediate notices may go again
             await self.submit(prompt, reply_to=buffered[0][0].message_id)
 
     def _context_prefix(self, message) -> str:
@@ -1230,7 +1277,54 @@ class ClaudeTopic(Topic):
         if paths:
             listing = "\n".join(str(p) for p in paths)
             parts.append(f"[Attached file(s), saved locally — Read to view:\n{listing}\n]")
+        block = self._take_notice_block()
+        if block:
+            parts.append(block)
         return "\n\n".join(parts).strip()
+
+    def _take_notice_block(self) -> str:
+        """The held notices as a [Bot notice(s)] block (one counted line each), cleared;
+        "" when none is held."""
+        if not self.pending_notices:
+            return ""
+        lines = "\n".join(f"- {notice_line(n)}" for n in self.pending_notices.values())
+        self.pending_notices = {}
+        return f"[Bot notice(s):\n{lines}\n]"
+
+    def on_notice(self, notice: Notice) -> None:
+        """A bot notice for this window's Claude: held for the next prompt's [Bot
+        notice(s)] block (a repeat of the same kind, what and error counts up). An
+        exception or a message not delivered is also submitted at once as its own prompt
+        (`submit` queues it behind a running turn), unless a notice prompt already went
+        since the user's last prompt: then it rides that next prompt, so a failure on a
+        reply to a notice prompt never starts another."""
+        key = (notice.kind, notice.what, notice.error)
+        held = self.pending_notices.get(key)
+        if held is None:
+            self.pending_notices[key] = dataclasses.replace(notice)
+        else:
+            held.count += notice.count
+        if self._core.shutting_down:  # no prompt while the bot stops: delivered after it
+            self._save_notices()
+            return
+        if notice.kind == NOTICE_FALLBACK or self.notice_prompt_open or self.notice_task:
+            return
+        self.notice_task = asyncio.get_running_loop().create_task(self._submit_notices())
+
+    def _save_notices(self) -> None:
+        """Keep the held notices with the window, for `on_revive` after a restart."""
+        if self.pending_notices:
+            self.saved["notices"] = [dataclasses.asdict(n) for n in self.pending_notices.values()]
+
+    async def _submit_notices(self) -> None:
+        """Submit the held notices as a prompt of their own; notices raised before this
+        task first runs are counted into it."""
+        self.notice_task = None
+        block = self._take_notice_block()
+        if not block:
+            return
+        self.notice_prompt_open = True
+        await self.submit(block)
 
     async def _download_attachments(self, attachments) -> list[Path]:
         out: list[Path] = []
@@ -1716,8 +1810,8 @@ class Claude(Plugin):
         self._save()
 
     async def on_startup(self):
-        setup.install_claude_as()
-        setup.install_shell_wrapper()
+        setup.install_claude_as(self.notice)
+        setup.install_shell_wrapper(self.notice)
         self._load()
         self.seed_accounts()
 
@@ -2037,7 +2131,9 @@ class Claude(Plugin):
         def show_view():
             view["timer"] = None
             view["last"] = time.monotonic()
-            topic.show_frame(hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, ""))
+            topic.show_frame(
+                hid, shell_view(cmd, buf, "…"), shell_md(cmd, buf, "", topic.fits_one_message)
+            )
 
         status = ""
         proc = None
@@ -2096,7 +2192,7 @@ class Claude(Plugin):
             buf.append(tail)
         result = shell_view(cmd, buf, status)
         if hid is not None:
-            await topic.land_frame(hid, result, shell_md(cmd, buf, status))
+            await topic.land_frame(hid, result, shell_md(cmd, buf, status, topic.fits_one_message))
         payload = f"[shell result]\n{result}"
         if chain:
             await topic.submit(payload)
