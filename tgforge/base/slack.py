@@ -38,6 +38,7 @@ from tgforge.base.kernel import (
     Refused,
     Tap,
     Transient,
+    notice_exception,
 )
 
 LOGGER = logging.getLogger("tgforge")
@@ -180,6 +181,24 @@ class SlackAdapter:
     def bodies(body) -> list:
         """One form of one message: no fallback of its own."""
         return [body]
+
+    def prepare(self) -> None:
+        """Nothing to fetch: Slack draws no diagrams."""
+
+    async def draw_diagrams(self, window, body):
+        """A body as it is: a Mermaid block stays code (Slack's image block takes a URL
+        or a file uploaded beforehand, never an image inline in the message)."""
+        return body
+
+    @staticmethod
+    def form_name(body) -> str:
+        """A body's form, for a notice."""
+        return "Markdown" if isinstance(body, SlackMarkdown) else "plain"
+
+    @staticmethod
+    def payload_size(body) -> int:
+        """A body's size in characters, for a notice."""
+        return len(body.markdown if isinstance(body, SlackMarkdown) else str(body))
 
     def classify(self, error: Exception):
         if isinstance(error, SlackApiError):
@@ -509,8 +528,9 @@ class SlackAdapter:
                     await on_tap(tap)
             elif kind == "slash_commands" and payload.get("command") == COMMAND:
                 await on_message(self.command_to_inbound(payload))
-        except Exception:
+        except Exception as error:
             LOGGER.exception("slack %s handler failed", kind)
+            notice_exception(self.on_notice, self.general, f"slack {kind} event", error)
 
     async def close(self) -> None:
         """Nothing to close: the Web API client opens a session per call and the Socket

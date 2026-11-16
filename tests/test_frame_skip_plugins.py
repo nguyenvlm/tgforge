@@ -58,8 +58,8 @@ def test_the_one_shot_pump_keeps_reading_through_a_flood(tmp_path, monkeypatch):
 
 
 def test_a_one_shot_output_of_backslashes_lands_within_one_message(tmp_path, monkeypatch):
-    """Output that MarkdownV2 escapes to twice its length still shows as one message,
-    while the command runs and when it ends."""
+    """Backslash-heavy output still shows as one message, while the command runs and
+    when it ends."""
     monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.1)
 
     async def scenario():
@@ -371,8 +371,8 @@ def test_the_files_view_moves_as_one_copy_below_a_burst_of_messages(tmp_path):
 
 
 def test_a_file_of_regex_text_opens_in_the_files_view(tmp_path):
-    """Its backslashes escape to twice their length in MarkdownV2: the view's code block
-    is cut to one message in every form."""
+    """A backslash-heavy file: the view's code block is cut to one message in every
+    form."""
 
     async def scenario():
         c = TestClient(Localfs(), home=str(tmp_path))

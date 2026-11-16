@@ -40,6 +40,9 @@ class _Adapter:
             raise ConnectionError("platform down")
         return "bot"
 
+    def prepare(self):
+        pass
+
     async def run(self, on_message, on_tap):
         self.runs += 1
         await on_message(self.message)
@@ -248,6 +251,9 @@ def test_the_restart_backoff_doubles_up_to_its_cap(monkeypatch):
 
     class _Failing:
         platform = "Fake"
+        general = "0"
+        notices: list = []
+        on_notice = notices.append  # set by its transport on a real adapter
 
         async def run(self, on_message, on_tap):
             starts.append(asyncio.get_running_loop().time())

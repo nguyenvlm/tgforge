@@ -224,7 +224,7 @@ def test_tui_intercept_posts_notice(tmp_path):
             "sys.stdout.flush(); time.sleep(30)'"
         )
         await core.handle_message(_msg(cmd, inst.window))
-        # MarkdownV2 escaping mangles "full-screen"; "terminal UI" survives clean
+        # the notice names the program as a terminal UI
         assert await _until(lambda: any("terminal UI" in t for t in kernel_bot(core).sent))
         await inst._kill()
 
@@ -256,8 +256,8 @@ def test_tui_process_is_stopped_and_shell_is_handed_back(tmp_path):
 
 
 def test_backslash_heavy_output_keeps_the_panel_updating(tmp_path):
-    """Windows paths escape to twice their length in MarkdownV2: the panel's code block is
-    cut to one message in every form, so later output still shows."""
+    """Windows paths: the panel's code block is cut to one message in every form, so
+    later output still shows."""
 
     async def scenario():
         core = _kernel(tmp_path)

@@ -1,8 +1,8 @@
 """Every Telegram message goes out as a Rich Message: Markdown renders to Rich HTML
 (math as `<tg-math>`, `<sub>`/`<sup>` as sub/superscripts), plain text as escaped Rich
 HTML; sends, edits, card pages, buttons and frames take the rich methods; sizes are
-measured against the Rich Message limits; a refused rich body falls back to MarkdownV2,
-then plain, in issue order."""
+measured against the Rich Message limits; a refused rich body falls back to escaped
+Rich, then plain, in issue order."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from tgforge.base.slack import SlackAdapter
 from tgforge.base.telegram import (
     RICH_COLUMN_LIMIT,
     RICH_DEPTH_LIMIT,
-    MarkdownV2,
     PlainText,
     RichMessage,
     TelegramAdapter,
@@ -37,7 +36,7 @@ from tgforge.base.telegram import (
     rich_depth,
     rich_fits,
     rich_html,
-    to_md,
+    rich_size,
 )
 from tgforge.base.ui import HALF_FULL, MAX_MSG, md_chunks
 from tgforge.testing import MockBot, rich_text, telegram_transport
@@ -60,7 +59,7 @@ class _Refused(TelegramBadRequest):
 
 
 class _RefusingBot(MockBot):
-    """Refuses the forms named in `refuse` ("rich", "MarkdownV2", "plain"); `tried`
+    """Refuses the forms named in `refuse` ("rich", "plain"); `tried`
     lists the form of every send and edit attempt in call order."""
 
     def __init__(self, refuse=()):
@@ -134,18 +133,16 @@ def test_a_stray_closing_tag_stays_text_and_an_unclosed_one_is_closed_in_order()
     assert rich_html("# H<sub>2") == "<h1>H<sub>2</sub></h1>"
 
 
-def test_render_carries_its_markdown_for_the_fallback():
+def test_render_gives_one_rich_form_and_the_plain_body():
     rich, plain = TelegramAdapter(None, None).render("**bold** $x$")
-    assert rich == RichMessage("<p><b>bold</b> <tg-math>x</tg-math></p>", None, "**bold** $x$")
-    forms = list(TelegramAdapter.bodies(rich))
-    assert forms[0] == rich and len(forms) == 2  # each form one message
-    assert isinstance(forms[1], MarkdownV2) and forms[1].startswith("*bold*")
+    assert rich == RichMessage("<p><b>bold</b> <tg-math>x</tg-math></p>")
+    assert list(TelegramAdapter.bodies(rich)) == [rich]  # the plain body's forms follow
     assert plain == "**bold** $x$"
 
 
 def test_markdown_over_one_message_in_one_of_its_forms_gets_no_rich_body():
     adapter = TelegramAdapter(None, None)
-    for markdown in ("- a\n" * 600, "a.b " * 1000):  # 601 blocks; MarkdownV2 escapes each dot
+    for markdown in ("- a\n" * 600,):  # 601 blocks
         assert len(markdown) <= MAX_MSG
         assert adapter.render(markdown) == (None, markdown)  # the plain body goes instead
     rich, _ = adapter.render("- a\n" * 400)
@@ -154,7 +151,7 @@ def test_markdown_over_one_message_in_one_of_its_forms_gets_no_rich_body():
 
 def test_plain_text_goes_rich_first_then_plain():
     rich, plain = TelegramAdapter.bodies("a < b\nc")
-    assert rich == RichMessage("<p>a &lt; b<br/>c</p>", None, None)
+    assert rich == RichMessage("<p>a &lt; b<br/>c</p>", escaped=True)
     assert plain == "a < b\nc" and isinstance(plain, PlainText)
     assert list(TelegramAdapter.bodies(plain)) == [plain]  # the plain body is the last
 
@@ -208,15 +205,15 @@ def test_the_split_finds_each_cut_in_a_few_measures():
     assert sum(calls) <= 12 * len(text)  # each search measures about its own piece, not the text
 
 
-def test_a_page_at_its_markdown_v2_limit_fits_the_rich_limits():
-    # the costliest characters in Rich HTML per MarkdownV2 character: `&` (5 bytes),
-    # `<` (4), a 4-byte emoji, a newline (`<br/>`)
+def test_a_page_at_its_plain_limit_fits_the_rich_limits():
+    # the costliest characters in Rich HTML per plain character: `&` (5 bytes), `<` (4),
+    # a 4-byte emoji, a newline (`<br/>`)
     entries = ["&<😀\n&&&&" * 200] * 40
     pages = ui.expandable_pages("🔧 40", entries, TelegramAdapter.page_size)
     assert len(pages.pages) > 1
     for i, body in enumerate(pages.pages):
         head = ui.page_head(pages, i)
-        assert len(_page(head, body, i == 0)[0]) <= MAX_MSG
+        assert len(_page(head, body, i == 0)) <= MAX_MSG
         assert rich_fits(_rich_page(head, body, i == 0))
 
 
@@ -374,55 +371,80 @@ def test_a_bottom_frame_is_sent_rich():
 # ── Refusal fallback ───────────────────────────────────────────────
 
 
-def test_a_refused_rich_send_falls_back_to_markdown_v2_and_logs_it(caplog):
+def test_a_refused_rich_send_falls_back_to_plain_and_logs_it(caplog):
     async def scenario():
         bot = _RefusingBot(refuse={"rich"})
         tx = telegram_transport(bot)
         with caplog.at_level(logging.WARNING, logger="tgforge"):
             await tx.send_rich(WINDOW, "**F**<sub>1</sub>")
-        assert bot.tried == ["rich", "MarkdownV2"]
-        assert [bot.forms[i] for i, _t, _x in bot.created] == ["MarkdownV2"]
+        # the Markdown body as Rich; then its plain body as escaped Rich, then plain
+        assert bot.tried == ["rich", "rich", "plain"]
+        assert [(bot.forms[i], t) for i, _t, t in bot.created] == [("plain", "**F**<sub>1</sub>")]
         refusal = [
             r.getMessage() for r in caplog.records if "rich message refused" in r.getMessage()
         ]
         size = len(rich_html("**F**<sub>1</sub>").encode())
-        assert refusal == [
+        assert refusal[0] == (
             f"rich message refused ({size} bytes, 1 blocks): Bad Request: can't parse rich message"
-        ]
+        )
+        assert len(refusal) == 2  # the escaped Rich form's refusal too
 
     _run(scenario())
 
 
-def test_a_send_refused_rich_and_markdown_v2_lands_plain():
+class _RenderedRefusingBot(MockBot):
+    """Refuses a Rich Message that is not escaped plain text (`tried` lists the forms)."""
+
+    def __init__(self):
+        super().__init__()
+        self.tried: list[str] = []
+
+    def _check(self, html):
+        escaped = html.startswith("<p>") and html.count("<") == html.count("<br/>") + 2
+        self.tried.append("escaped Rich" if escaped else "Rich")
+        if not escaped:
+            raise _Refused()
+
+    async def send_rich_message(self, chat_id, rich_message, **kw):
+        self._check(rich_message.html)
+        return await super().send_rich_message(chat_id, rich_message, **kw)
+
+    async def edit_message_text(self, text=None, **kw):
+        if kw.get("rich_message") is not None:
+            self._check(kw["rich_message"].html)
+        return await super().edit_message_text(text, **kw)
+
+
+def test_a_refused_rich_send_lands_as_escaped_rich():
     async def scenario():
-        bot = _RefusingBot(refuse={"rich", "MarkdownV2"})
+        bot = _RenderedRefusingBot()
         tx = telegram_transport(bot)
-        await tx.send_rich(WINDOW, "**F**")
-        # the Markdown body: rich, MarkdownV2; then its plain body: rich, plain
-        assert bot.tried == ["rich", "MarkdownV2", "rich", "plain"]
-        assert [(bot.forms[i], text) for i, _t, text in bot.created] == [("plain", "**F**")]
+        await tx.send_rich(WINDOW, "**F** and x<y")
+        assert bot.tried == ["Rich", "escaped Rich"]
+        ((message_id, _thread, text),) = bot.created
+        assert bot.rich[message_id] == "<p>**F** and x&lt;y</p>" and text == "**F** and x<y"
 
     _run(scenario())
 
 
-def test_a_refused_rich_edit_falls_back_to_markdown_v2():
+def test_a_refused_rich_edit_falls_back_to_escaped_rich():
     async def scenario():
-        bot = _RefusingBot(refuse={"rich"})
+        bot = _RenderedRefusingBot()
         tx = telegram_transport(bot)
         assert await tx.edit_md(WINDOW, 50, "**x**", "x")
-        assert bot.tried == ["rich", "MarkdownV2"]
-        assert bot.forms[50] == "MarkdownV2"
+        assert bot.tried == ["Rich", "escaped Rich"]
+        assert bot.rich[50] == "<p>x</p>"
 
     _run(scenario())
 
 
-def test_a_refused_rich_frame_edit_falls_back_to_markdown_v2():
+def test_a_refused_rich_frame_edit_falls_back_to_escaped_rich():
     async def scenario():
-        bot = _RefusingBot(refuse={"rich"})
+        bot = _RenderedRefusingBot()
         tx = telegram_transport(bot)
         assert await tx.land_frame(WINDOW, 50, "x", "**x**")
-        assert bot.tried == ["rich", "MarkdownV2"]
-        assert bot.forms[50] == "MarkdownV2"
+        assert bot.tried == ["Rich", "escaped Rich"]
+        assert bot.rich[50] == "<p>x</p>"
 
     _run(scenario())
 
@@ -433,8 +455,8 @@ def test_a_refused_card_page_falls_back_and_pages_stay_in_order():
         tx = telegram_transport(bot)
         await tx.send_md(WINDOW, ui.Pages("🔧 2", ["a", "b"], ""))
         texts = [text for _i, _t, text in bot.created]
-        assert texts == ["🔧 2\n**>a||", "**>↳ 2/2\n>\n>b||"]
-        assert [bot.forms[i] for i, _t, _x in bot.created] == ["MarkdownV2", "MarkdownV2"]
+        assert texts == ["🔧 2\na", "↳ 2/2\n\nb"]
+        assert [bot.forms[i] for i, _t, _x in bot.created] == ["plain", "plain"]
 
     _run(scenario())
 
@@ -469,7 +491,7 @@ def test_a_refused_send_keeps_issue_order_against_a_concurrent_send():
         await asyncio.gather(first, second)
         texts = [text for _i, _t, text in bot.created]
         assert texts == ["first", "second"]  # the fallback lands before the later send
-        assert [bot.forms[i] for i, _t, _x in bot.created] == ["MarkdownV2", "rich"]
+        assert [bot.forms[i] for i, _t, _x in bot.created] == ["plain", "rich"]
 
     _run(scenario())
 
@@ -1015,12 +1037,11 @@ def _rows(texts: list[str]) -> list[str]:
     return [row for text in texts for row in re.findall(r"\bk(\d+)\b", text)]
 
 
-@pytest.mark.parametrize(
-    "refuse, form", [({"rich"}, "MarkdownV2"), ({"rich", "MarkdownV2"}, "plain")]
-)
-def test_a_refused_rich_table_arrives_whole_in_the_next_form(refuse, form, caplog):
+def test_a_refused_rich_table_arrives_whole_in_the_next_form(caplog):
+    form = "plain"
+
     async def scenario():
-        bot = _RefusingBot(refuse=refuse)
+        bot = _RefusingBot(refuse={"rich"})
         tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
         with caplog.at_level(logging.WARNING, logger="tgforge"):
             await tx.send_rich(WINDOW, WIDE_TABLE)
@@ -1172,11 +1193,12 @@ def test_a_table_in_a_quote_or_list_repeats_its_head(prefix, before):
     ]
 
 
-def test_a_live_message_whose_markdown_v2_is_over_one_message_fails_loud_when_recorded():
+def test_a_live_message_over_one_message_fails_loud_when_recorded():
     async def scenario():
         bot = _RefusingBot(refuse={"rich"})
         tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
-        assert not tx.fits_one_message(WIDE_TABLE)  # its Rich form fits, its MarkdownV2 not
+        assert len(WIDE_TABLE) > MAX_MSG and rich_fits(rich_html(WIDE_TABLE))  # plain over
+        assert not tx.fits_one_message(WIDE_TABLE)
         for record in (
             lambda: tx.land_frame(WINDOW, 50, WIDE_TABLE[:MAX_MSG], WIDE_TABLE),
             lambda: tx.show_frame(WINDOW, 50, WIDE_TABLE[:MAX_MSG], WIDE_TABLE),
@@ -1346,7 +1368,7 @@ def test_inline_nesting_past_the_depth_limit_goes_out_rich_with_every_word(text)
 def test_every_piece_is_one_message_in_every_form(text):
     for piece in _telegram_chunks(text):
         rich = rich_html(piece)
-        assert len(piece) <= MAX_MSG and len(to_md(piece)) <= MAX_MSG and rich_fits(rich)
+        assert len(piece) <= MAX_MSG and rich_fits(rich)
 
 
 # 21 inline levels; inline math, code and a footnote reference innermost
@@ -1441,11 +1463,11 @@ def test_an_unmatched_spoiler_is_closed_within_its_paragraph():
 
 
 def test_measure_counts_every_form_of_a_piece():
-    shorter_in_markdown_v2 = "**b** " * 700  # 4200 characters; MarkdownV2 `*b* ` is 2800
-    assert len(to_md(shorter_in_markdown_v2)) < MAX_MSG < len(shorter_in_markdown_v2)
-    assert TelegramAdapter.measure(shorter_in_markdown_v2) > MAX_MSG  # its plain text is over
-    longer_in_markdown_v2 = "a.b " * 1000  # 4000 characters; MarkdownV2 escapes each dot
-    assert TelegramAdapter.measure(longer_in_markdown_v2) > MAX_MSG
+    bold = "**b** " * 700  # 4200 characters; its Rich size is far under MAX_MSG
+    assert rich_size(rich_html(bold)) < MAX_MSG < len(bold)
+    assert TelegramAdapter.measure(bold) > MAX_MSG  # its plain text is over
+    dots = "a.b " * 1000  # 4000 characters: one message in both forms
+    assert TelegramAdapter.measure(dots) == len(dots)
 
 
 @pytest.mark.parametrize(
@@ -1490,20 +1512,12 @@ def _counting(monkeypatch, name: str) -> list[str]:
     return calls
 
 
-def test_a_probe_over_by_its_plain_or_rich_size_skips_the_markdown_v2_render(monkeypatch):
-    rendered = _counting(monkeypatch, "to_md")
-    assert TelegramAdapter.measure("x" * (MAX_MSG + 1)) > MAX_MSG  # over by its plain length
-    assert TelegramAdapter.measure("- a\n" * 1000) > MAX_MSG  # 1,000 blocks: over by Rich size
-    assert rendered == []
-    assert TelegramAdapter.measure("- a\n" * 100) <= MAX_MSG and len(rendered) == 1
-
-
 def test_the_send_reuses_the_split_measure_of_its_piece(monkeypatch):
-    rendered = _counting(monkeypatch, "to_md")
+    sized = _counting(monkeypatch, "rich_size")
     piece = "Some **bold** text and $x$\n" * 20
-    assert TelegramAdapter.measure(piece) <= MAX_MSG and len(rendered) == 1
+    assert TelegramAdapter.measure(piece) <= MAX_MSG and len(sized) == 1
     rich, _plain = TelegramAdapter(None, None).render(piece)
-    assert rich is not None and len(rendered) == 1  # no second MarkdownV2 render
+    assert rich is not None and len(sized) == 1  # the piece's measure, not a second one
 
 
 def test_measure_counts_a_piece_over_the_depth_or_column_limit_as_over(monkeypatch):
@@ -1613,8 +1627,8 @@ def test_a_long_reply_keeps_its_order_while_another_window_sends():
 
 
 class _BoldRefusingBot(_RefusingBot):
-    """Refuses a rich body holding bold (the Markdown's Rich form) and every MarkdownV2
-    body; takes a rich body without it (plain text as escaped Rich HTML)."""
+    """Refuses a rich body holding bold (the Markdown's Rich form); takes a rich body
+    without it (plain text as escaped Rich HTML)."""
 
     async def send_rich_message(self, chat_id, rich_message, **kw):
         if "<b>" in rich_message.html:
@@ -1625,24 +1639,23 @@ class _BoldRefusingBot(_RefusingBot):
 
 def test_each_fallback_is_one_message_and_each_refusal_is_logged(caplog):
     async def scenario():
-        bot = _BoldRefusingBot(refuse={"MarkdownV2"})
+        bot = _BoldRefusingBot()
         tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
         with caplog.at_level(logging.WARNING):
             await tx.send_rich(WINDOW, "Some **bold** text")
         return bot
 
     bot = _run(scenario())
-    assert bot.tried == ["rich", "MarkdownV2", "rich"]  # Rich, MarkdownV2, escaped Rich
+    assert bot.tried == ["rich", "rich"]  # Rich, escaped Rich
     ((message_id, _thread, text),) = bot.created
     assert bot.forms[message_id] == "rich" and text == "Some **bold** text"  # the plain text
     logged = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("rich message refused" in m and "bytes" in m for m in logged)
-    assert any("MarkdownV2 message refused" in m and "characters" in m for m in logged)
 
 
 def test_an_edit_is_one_message_in_every_form():
     async def scenario():
-        for refuse, form in (({"rich"}, "MarkdownV2"), ({"rich", "MarkdownV2"}, "plain")):
+        for refuse, form in (({"rich"}, "plain"),):
             bot = _RefusingBot(refuse=refuse)
             tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
             assert await tx.edit_md(WINDOW, 50, "| a |\n|---|\n" + "| row |\n" * 300, None)
@@ -1671,22 +1684,6 @@ def test_a_repeated_edit_with_unchanged_text_changes_nothing():
         assert len(bot.edits) == 1 and bot.created == [] and bot.forms[50] == "rich"
 
     _run(scenario())
-
-
-def test_a_refused_markdown_v2_message_is_logged_with_its_size(caplog):
-    async def scenario():
-        bot = _RefusingBot(refuse={"rich", "MarkdownV2"})
-        tx = telegram_transport(bot, pace_per_min=0, pace_burst=0)
-        with caplog.at_level(logging.WARNING):
-            await tx.send_rich(WINDOW, "Some **bold** text")
-            await tx.edit_md(WINDOW, bot.created[0][0], "Other **bold** text", None)
-        return bot
-
-    bot = _run(scenario())
-    refused = [r for r in caplog.records if "MarkdownV2 message refused" in r.getMessage()]
-    assert len(refused) == 2 and all(r.levelno == logging.WARNING for r in refused)
-    assert all("characters" in r.getMessage() and "parse" in r.getMessage() for r in refused)
-    assert bot.forms[bot.created[0][0]] == "plain"
 
 
 # ── A live message fits one message when recorded ──────────────────
@@ -1720,7 +1717,6 @@ def test_most_that_fits_finds_the_largest_amount():
 def test_a_shell_view_code_block_fits_one_message_in_every_form():
     tx = telegram_transport(MockBot())
     output = ["\\" * 10 + f" line {i}\n" for i in range(5000)]
-    assert not tx.fits_one_message(ui.shell_md("cat log", output, "running"))  # MarkdownV2 over
     view = ui.shell_md("cat log", output, "running", tx.fits_one_message)
     assert len(view) <= MAX_MSG and tx.fits_one_message(view) and "line 4999" in view
     assert len(ui.shell_md("cat log", ["line\n"] * 5000, "running")) <= MAX_MSG

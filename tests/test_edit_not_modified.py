@@ -1,6 +1,6 @@
 """A "message is not modified" 400 on an edit is a no-op success, not a failure.
 Without this, `edit_md`'s plain-text fallback fires on the benign 400 and rewrites
-the message with no parse_mode — flipping a monospace panel from shell to raw format
+the message as plain text — flipping a monospace panel from shell to raw format
 on every unchanged tick (the background panel flashing between raw and shell)."""
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class _OtherBadRequest(TelegramBadRequest):
 
 
 class _Bot:
-    """Raises `exc` on every edit but a plain one (no rich body, no parse mode)."""
+    """Raises `exc` on every edit but a plain one (no rich body)."""
 
     def __init__(self, exc):
         self.exc = exc
@@ -40,10 +40,8 @@ class _Bot:
         if kw.get("rich_message") is not None:
             self.tried.append("rich")
             raise self.exc
-        self.tried.append(kw.get("parse_mode") or "plain")
-        if kw.get("parse_mode") == "MarkdownV2":
-            raise self.exc
-        self.plain_edits.append(text)  # the last fallback (no parse_mode)
+        self.tried.append("plain")
+        self.plain_edits.append(text)  # the last fallback
         return None
 
 
@@ -63,8 +61,8 @@ def test_other_bad_request_still_falls_back_to_plain():
         bot = _Bot(_OtherBadRequest())
         tx = telegram_transport(bot)
         await tx.edit_md(100, 7, "```\nshell\n```", "shell")
-        # rich, its MarkdownV2 fallback, the plain body as rich, then plain
-        assert bot.tried == ["rich", "MarkdownV2", "rich", "plain"]
+        # rich, the plain body as escaped rich, then plain
+        assert bot.tried == ["rich", "rich", "plain"]
         assert bot.plain_edits == ["shell"]  # a real markdown failure still degrades
 
     asyncio.run(scenario())
@@ -72,7 +70,7 @@ def test_other_bad_request_still_falls_back_to_plain():
 
 def test_a_live_message_edit_not_modified_tries_no_other_form():
     """A frame edit Telegram answers "message is not modified" (content that renders the
-    same Rich HTML) has landed: no MarkdownV2, escaped Rich or plain retry flips its form."""
+    same Rich HTML) has landed: no escaped Rich or plain retry flips its form."""
 
     async def scenario():
         bot = _Bot(_NotModified())

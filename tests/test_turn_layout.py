@@ -88,10 +88,8 @@ def test_a_long_timeline_folds_into_several_messages_with_every_entry(tmp_path):
         folds = [markup for markup in markups(c) if _is_fold(markup)]
         assert len(folds) >= 3  # 40 × ~320 chars cannot fit one message
         assert all(rich_fits(markup) for markup in folds)
-        # each fold's MarkdownV2 fallback fits a message too
         fold_bodies = [b for b in bodies if isinstance(b, RichMessage) and _is_fold(b.html)]
         assert len(fold_bodies) >= len(folds)
-        assert all(b.fallback is not None and len(b.fallback) <= MAX_MSG for b in fold_bodies)
         joined = "".join(folds)
         for i in range(40):
             assert f"step {i:03d}" in joined  # every entry present
@@ -463,14 +461,15 @@ def test_a_late_settle_keeps_the_next_turns_launch_labels(tmp_path):
 def test_a_hundred_page_timeline_keeps_every_page_within_a_message():
     """Entries sized to fill a page exactly under a 2-digit `↳ 99/99` header: past 99
     pages the 3-digit header must still fit, so packing sizes it on the real count."""
-    from tgforge.base.telegram import TelegramAdapter, pages_md
-    from tgforge.base.telegram import _expandable as expandable
+    from tgforge.base.telegram import TelegramAdapter, _page, pages_plain
     from tgforge.base.ui import expandable_pages
 
-    size = next(n for n in range(MAX_MSG, 0, -1) if len(expandable("↳ 99/99", "x" * n)) <= MAX_MSG)
-    pages = pages_md(expandable_pages("🔧 120", ["x" * size] * 120, TelegramAdapter.page_size))
+    size = next(
+        n for n in range(MAX_MSG, 0, -1) if len(_page("↳ 99/99", "x" * n, False)) <= MAX_MSG
+    )
+    pages = pages_plain(expandable_pages("🔧 120", ["x" * size] * 120, TelegramAdapter.page_size))
     assert len(pages) >= 100
-    assert all(len(md) <= MAX_MSG for md, _plain in pages)  # 3-digit headers fit too
-    assert sum(md.count("x") for md, _plain in pages) == 120 * size  # nothing lost
-    assert pages[-1][1].startswith(f"↳ {len(pages)}/{len(pages)}")
-    assert pages[0][0].startswith("🔧 120\n**>x")  # page 1: plain summary over its block
+    assert all(len(page) <= MAX_MSG for page in pages)  # 3-digit headers fit too
+    assert sum(page.count("x") for page in pages) == 120 * size  # nothing lost
+    assert pages[-1].startswith(f"↳ {len(pages)}/{len(pages)}")
+    assert pages[0].startswith("🔧 120\nx")  # page 1: the summary over its body

@@ -129,6 +129,21 @@ def uninstall(name: str | None = None, keep_home: bool = False, assume_yes: bool
     print(f"   ✓ removed home {home}")
 
 
+def fetch_diagram_files(home: Path) -> None:
+    """Fetch mermaid.js and the headless browser into the bot home (Mermaid diagrams);
+    a failure is reported and left to the bot, which fetches them at startup."""
+    from tgforge.base.mermaid import DiagramError, diagram_files, fetch_files
+
+    files = diagram_files(home)
+    print(f"   … fetching mermaid.js and the headless browser into {files.bundle.parent}")
+    try:
+        fetch_files(files)
+    except DiagramError as error:
+        print(f"   ✗ {error} — the bot fetches them at startup")
+        return
+    print("   ✓ fetched the Mermaid diagram files")
+
+
 def main() -> None:
     print("── tgforge install ──\n")
 
@@ -201,6 +216,7 @@ def main() -> None:
     setup.install_claude_as()
     setup.install_shell_wrapper()
     print("   ✓ installed the claude shell helpers")
+    fetch_diagram_files(home)
     unit = install_unit(service, home)
     print(f"   ✓ installed {unit}")
     logs = (

@@ -472,9 +472,7 @@ def test_a_markdown_rejected_panel_re_sends_plain_through_a_flood():
             raise _Rejected("Bad Request: can't parse rich message")
 
         async def send(chat_id, text, **kw):
-            calls.append(kw.get("parse_mode") or "plain")
-            if kw.get("parse_mode") == "MarkdownV2":
-                raise _Rejected("Bad Request: can't parse entities")
+            calls.append("plain")
             if floods["plain"]:
                 floods["plain"] -= 1
                 raise _Flood(0.05)
@@ -485,9 +483,9 @@ def test_a_markdown_rejected_panel_re_sends_plain_through_a_flood():
         t.show_bottom_frame("7", "panel", "rows", "*rows*")
         await asyncio.wait_for(t.flush_frames(), 2)
         assert t.bottom_frame_id("panel") is not None  # the plain copy landed
-        # rich and MarkdownV2 refused, the plain body refused as rich, plain flooded;
-        # then the whole chain again until plain lands
-        once = ["rich", "MarkdownV2", "rich", "plain"]
+        # rich refused, the plain body refused as rich, plain flooded; then the whole
+        # chain again until plain lands
+        once = ["rich", "rich", "plain"]
         assert calls == once + once
 
     asyncio.run(scenario())

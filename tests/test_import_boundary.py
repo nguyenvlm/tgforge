@@ -1,5 +1,5 @@
 """The adapter boundary: only `base/telegram.py`, `base/slack.py` and `testing.py` import a
-platform library, and only `base/telegram.py` the MarkdownV2 converter; the kernel, the
+platform library, and only `base/telegram.py` the Markdown converter; the kernel, the
 app, `ui.py` and every plugin import none of them."""
 
 from __future__ import annotations

@@ -17,7 +17,7 @@ import signal
 import time
 
 from tgforge.base.config import BotConfig
-from tgforge.base.kernel import LOGGER, Kernel, Transport, setup_logging
+from tgforge.base.kernel import LOGGER, Kernel, Transport, notice_exception, setup_logging
 
 SLACK_INSTALL = 'uv pip install "tgforge[slack]"'
 SOURCE_BACKOFF = 5.0  # s before a stopped platform loop is restarted, doubling
@@ -160,7 +160,8 @@ async def _serve(adapter, on_message, on_tap, join=None) -> None:
     connect at startup), first retry its `identity()` with the same backoff and hand the
     name to `join`. A loop that ends (an error or a return) is logged and restarted
     after SOURCE_BACKOFF, doubling while it keeps ending quickly, up to
-    SOURCE_BACKOFF_MAX."""
+    SOURCE_BACKOFF_MAX. Each failure is raised as an exception notice in the platform's
+    General (its `on_notice`, set by its transport)."""
     loop = asyncio.get_running_loop()
     backoff = SOURCE_BACKOFF
     if join is not None:
@@ -168,10 +169,11 @@ async def _serve(adapter, on_message, on_tap, join=None) -> None:
             try:
                 name = await adapter.identity()
                 break
-            except Exception:
+            except Exception as error:
                 LOGGER.exception(
                     "%s still not connected; retrying in %.0fs", adapter.platform, backoff
                 )
+                notice_exception(adapter.on_notice, adapter.general, "platform connect", error)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, SOURCE_BACKOFF_MAX)
         await join(name)
@@ -181,8 +183,9 @@ async def _serve(adapter, on_message, on_tap, join=None) -> None:
         try:
             await adapter.run(on_message, on_tap)
             LOGGER.warning("%s loop ended; restarting in %.0fs", adapter.platform, backoff)
-        except Exception:
+        except Exception as error:
             LOGGER.exception("%s loop failed; restarting in %.0fs", adapter.platform, backoff)
+            notice_exception(adapter.on_notice, adapter.general, "platform loop", error)
         if loop.time() - started > SOURCE_BACKOFF_MAX:
             backoff = SOURCE_BACKOFF  # it had been serving: start the backoff over
         await asyncio.sleep(backoff)

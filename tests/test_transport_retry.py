@@ -118,8 +118,8 @@ def test_essential_calls_go_out_in_issue_order(monkeypatch):
 
 
 def test_edit_md_oversized_markdown_sends_full_plain_not_a_tail_cut():
-    """An md render over MAX_MSG (MarkdownV2 escaping inflates a live panel past the
-    limit) must never be hard-cut and sent — its final words would vanish mid-word.
+    """An md render over MAX_MSG must never be hard-cut and sent — its final words would
+    vanish mid-word.
     edit_md skips the oversized md and edits the caller-bounded plain in full."""
 
     async def scenario():

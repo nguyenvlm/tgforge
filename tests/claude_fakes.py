@@ -106,6 +106,16 @@ def window(c: TestClient, tmp_path, thread: str = THREAD) -> ClaudeTopic:
     c.core.owners[thread] = "claude"
     t.workspace = str(tmp_path)
     t._jsonl = lambda: tmp_path / "none.jsonl"
+    t.notice_prompts = []  # notice prompts, recorded instead of launching the CLI
+
+    async def submit_notices():
+        t.notice_task = None
+        block = t._take_notice_block()
+        if block:
+            t.notice_prompt_open = True
+            t.notice_prompts.append(block)
+
+    t._submit_notices = submit_notices
     return t
 
 

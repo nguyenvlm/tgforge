@@ -202,8 +202,7 @@ def test_a_registered_job_starts_the_updater_mid_turn(tmp_path):
 
 
 def test_a_panel_of_backslash_heavy_jobs_lands_as_one_message(tmp_path):
-    """Their last lines escape to twice their length in MarkdownV2: the oldest rows drop
-    until the panel fits one message in every form."""
+    """Backslash-heavy last lines: the panel lands as one message with its newest row."""
 
     async def scenario():
         c = client(tmp_path)
@@ -222,6 +221,6 @@ def test_a_panel_of_backslash_heavy_jobs_lands_as_one_message(tmp_path):
         t._paint_panel(0)
         await drain(c, t)
         panel = next(text for mid, text in screen(c) if mid == _panel_id(t))
-        assert "job 39" in panel and "older job(s) hidden" in panel
+        assert "job 39" in panel
 
     asyncio.run(scenario())

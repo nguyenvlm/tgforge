@@ -26,14 +26,22 @@ from types import SimpleNamespace
 
 from tgforge.base.config import BotConfig
 from tgforge.base.kernel import Inbound, Kernel, Transport
+from tgforge.base.mermaid import DiagramError, MermaidRenderer
 from tgforge.base.telegram import TelegramAdapter
 from tgforge.base.ui import blabel
+
+
+async def fetch_nothing(files) -> None:
+    """The test client's diagram fetch: no network, the files stay missing."""
+    raise DiagramError("the test client fetches no diagram files")
 
 
 def telegram_transport(bot, config: BotConfig | None = None, **pacing) -> Transport:
     """A `Transport` over the real `TelegramAdapter` on `bot` (chat 1 by default)."""
     config = config or BotConfig(token="x", chat_id=1)
-    return Transport(TelegramAdapter(bot, config), **pacing)
+    adapter = TelegramAdapter(bot, config)
+    adapter.diagrams = MermaidRenderer(adapter.diagrams.files, fetch=fetch_nothing)
+    return Transport(adapter, **pacing)
 
 
 def telegram_kernel(bot, config: BotConfig, plugins: list) -> Kernel:
@@ -85,6 +93,11 @@ def kernel_bot(kernel: Kernel):
     return kernel.transports[0].adapter.bot
 
 
+def _uploaded(rich_message) -> list[tuple[str, bytes]]:
+    """The (media id, file bytes) a Rich Message uploads with its HTML."""
+    return [(item.id, item.media.media.data) for item in rich_message.media or []]
+
+
 class MockBot:
     """A stand-in for `aiogram.Bot` that records instead of calling Telegram."""
 
@@ -101,9 +114,12 @@ class MockBot:
         self.last_markup = None
         # ("create" | "edit" | "delete", message id, text) in call order
         self.screen_log: list[tuple[str, int, str | None]] = []
-        # the form each message's newest text landed in: "rich", "MarkdownV2" or "plain"
+        # the form each message's newest text landed in: "rich" or "plain" (a parse mode
+        # a caller passed, by its name)
         self.forms: dict[int, str] = {}
         self.rich: dict[int, str] = {}  # message id → its newest Rich HTML
+        # message id → the (media id, PNG) uploaded with its newest Rich HTML
+        self.rich_media: dict[int, list[tuple[str, bytes]]] = {}
 
     def _id(self) -> int:
         self._next += 1
@@ -144,6 +160,7 @@ class MockBot:
         message = await self.send_message(chat_id, rich_text(rich_message.html), **kw)
         self.forms[message.message_id] = "rich"
         self.rich[message.message_id] = rich_message.html
+        self.rich_media[message.message_id] = _uploaded(rich_message)
         return message
 
     async def send_photo(self, chat_id, photo, **kw):
@@ -168,6 +185,7 @@ class MockBot:
         if rich is not None:
             text = rich_text(rich.html)
             self.rich[kw.get("message_id")] = rich.html
+            self.rich_media[kw.get("message_id")] = _uploaded(rich)
         self.forms[kw.get("message_id")] = (
             "rich" if rich is not None else kw.get("parse_mode") or "plain"
         )
