@@ -523,6 +523,36 @@ def _attachments(message) -> list[Attachment]:
     return out
 
 
+_RICH_TEXT_FIELDS = ("summary", "text", "expression", "alternative_text", "caption")
+_RICH_BLOCK_FIELDS = ("blocks", "items")
+
+
+def _rich_plain(node) -> str:
+    """The plain text of a received Rich Message, from its dumped blocks: each block on
+    its own line, a table row's cells joined by ` | `."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):  # a rich text's pieces
+        return "".join(_rich_plain(piece) for piece in node)
+    if not isinstance(node, dict):
+        return ""
+    parts = [_rich_plain(node[field]) for field in _RICH_TEXT_FIELDS if field in node]
+    for field in _RICH_BLOCK_FIELDS:
+        parts += [_rich_plain(block) for block in node.get(field, [])]
+    for row in node.get("cells", []):
+        parts.append(" | ".join(_rich_plain(cell) for cell in row))
+    return "\n".join(part for part in parts if part)
+
+
+def _message_text(message) -> str:
+    """A message's text: its text, its caption, or its Rich Message's plain text."""
+    text = getattr(message, "text", None) or getattr(message, "caption", None)
+    if text:
+        return text
+    rich = getattr(message, "rich_message", None)
+    return _rich_plain(rich.model_dump(mode="json", exclude_none=True)) if rich else ""
+
+
 def _mentioned_user_ids(message, bot_id) -> list[int]:
     """The users a message names by a tap-mention (`text_mention`, the one mention that
     carries the user), the bot left out."""
@@ -878,7 +908,7 @@ class TelegramAdapter:
                 self._init_chats[user_id] = chat_id
         elif chat_id != self._chat:
             return None
-        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        text = _message_text(message)
         mention = f"@{self.config.bot_username}"
         mentioned = bool(self.config.bot_username) and mention in text
         if mentioned:
@@ -898,9 +928,7 @@ class TelegramAdapter:
         reply = getattr(message, "reply_to_message", None)
         if reply is not None and not getattr(reply, "forum_topic_created", None):
             author = getattr(reply, "from_user", None)
-            inbound.replied_text = (
-                getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
-            ).strip()
+            inbound.replied_text = _message_text(reply).strip()
             inbound.replied_author = getattr(author, "full_name", None) if author else None
             inbound.replied_user_id = getattr(author, "id", None)
             inbound.replied_attachments = _attachments(reply)

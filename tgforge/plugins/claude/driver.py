@@ -1265,7 +1265,7 @@ class ClaudeTopic(Topic):
         if message.replied_text is not None:
             rtext = message.replied_text
             has_file = bool(message.replied_attachments)
-            if rtext or has_file:
+            if message.quote or rtext or has_file:
                 label, quoted = (
                     ("Quoting", message.quote)
                     if message.quote
