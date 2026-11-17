@@ -523,13 +523,15 @@ def _attachments(message) -> list[Attachment]:
     return out
 
 
-_RICH_TEXT_FIELDS = ("summary", "text", "expression", "alternative_text", "caption")
-_RICH_BLOCK_FIELDS = ("blocks", "items")
+_RICH_TEXT_FIELDS = ("summary", "text", "expression", "alternative_text", "button")
+_RICH_BLOCK_FIELDS = ("blocks", "items", "buttons")
+_RICH_AFTER_FIELDS = ("caption", "credit")
 
 
 def _rich_plain(node) -> str:
     """The plain text of a received Rich Message, from its dumped blocks: each block on
-    its own line, a table row's cells joined by ` | `."""
+    its own line, a table row's cells joined by ` | `, a caption or credit after what it
+    labels."""
     if isinstance(node, str):
         return node
     if isinstance(node, list):  # a rich text's pieces
@@ -541,6 +543,7 @@ def _rich_plain(node) -> str:
         parts += [_rich_plain(block) for block in node.get(field, [])]
     for row in node.get("cells", []):
         parts.append(" | ".join(_rich_plain(cell) for cell in row))
+    parts += [_rich_plain(node[field]) for field in _RICH_AFTER_FIELDS if field in node]
     return "\n".join(part for part in parts if part)
 
 

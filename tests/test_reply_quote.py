@@ -129,3 +129,38 @@ def test_forwarded_rich_message_carries_its_plain_text():
         None, rich_message=answer.rich_message, forward_origin=None, reply_to_message=None
     )
     assert message.text == "Delete the branch\npush it\nbundle it\nrepo | tip\nsee notes.md"
+
+
+def test_rich_message_credits_and_button_labels_are_read_and_their_targets_are_not():
+    answer = Message.model_validate(
+        dict(
+            _BOT_ANSWER,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "blockquote",
+                        "blocks": [{"type": "paragraph", "text": "a saying"}],
+                        "credit": "its author",
+                    },
+                    {
+                        "type": "paragraph",
+                        "text": [
+                            "tap ",
+                            {
+                                "type": "button",
+                                "button": {"text": "here", "url": "https://x.example"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "buttons",
+                        "buttons": [
+                            {"text": "Yes", "callback_data": "y"},
+                            {"text": "No", "callback_data": "n"},
+                        ],
+                    },
+                ]
+            },
+        )
+    )
+    assert _prefix(_msg(answer)) == "[Replying to mybot: a saying\nits author\ntap here\nYes\nNo]"
