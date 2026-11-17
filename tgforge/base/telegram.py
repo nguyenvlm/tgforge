@@ -558,6 +558,18 @@ def _message_text(message) -> str:
     return _rich_plain(rich.model_dump(mode="json", exclude_none=True)) if rich else ""
 
 
+def _quote_text(quote) -> str | None:
+    """A reply quote's text: its text, or the plain text of its rich texts (a quote chosen
+    from a Rich Message) when that is empty."""
+    text = getattr(quote, "text", None)
+    if text:
+        return text
+    rich_texts = getattr(quote, "rich_texts", None)
+    if not rich_texts:
+        return text
+    return _rich_plain(quote.model_dump(mode="json", exclude_none=True)["rich_texts"])
+
+
 def _mentioned_user_ids(message, bot_id) -> list[int]:
     """The users a message names by a tap-mention (`text_mention`, the one mention that
     carries the user), the bot left out."""
@@ -938,7 +950,15 @@ class TelegramAdapter:
             inbound.replied_user_id = getattr(author, "id", None)
             inbound.replied_attachments = _attachments(reply)
             quote = getattr(message, "quote", None)
-            inbound.quote = getattr(quote, "text", None) if quote is not None else None
+            if quote is not None:
+                inbound.quote = _quote_text(quote)
+                LOGGER.info(
+                    "inbound msg %s quote: text %d chars, rich_texts %s, used %d chars",
+                    inbound.message_id,
+                    len(getattr(quote, "text", None) or ""),
+                    "present" if getattr(quote, "rich_texts", None) else "absent",
+                    len(inbound.quote or ""),
+                )
         sent = getattr(message, "date", None)
         if sent is not None:  # a late delivery reads off this line
             age = (datetime.now(UTC) - sent).total_seconds()

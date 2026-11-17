@@ -3,10 +3,13 @@ a bot's Rich Message read as plain text when replied to or forwarded."""
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 from aiogram.types import Message
 
+from tgforge.base.config import BotConfig
+from tgforge.base.telegram import TelegramAdapter
 from tgforge.plugins.claude import ClaudeTopic
 from tgforge.testing import telegram_inbound
 
@@ -190,3 +193,63 @@ def test_rich_message_captions_follow_their_content_and_file_details_stay_out():
     assert _prefix(_msg(answer)) == (
         "[Replying to mybot: a | b\nthe table\nthe diagram\nits source]"
     )
+
+
+def _quote_of_bot_answer(quote: dict) -> str:
+    """The reply note for a user's real Telegram message replying to the bot answer with
+    `quote`."""
+    return _prefix(_inbound_quoting_bot_answer(quote))
+
+
+def _inbound_quoting_bot_answer(quote: dict):
+    message = Message.model_validate(
+        {
+            "message_id": 11,
+            "date": 1700000001,
+            "chat": _BOT_ANSWER["chat"],
+            "from": {"id": 1, "is_bot": False, "first_name": "Alice"},
+            "text": "what about this?",
+            "reply_to_message": _BOT_ANSWER,
+            "quote": quote,
+        }
+    )
+    adapter = TelegramAdapter(None, BotConfig(token="x", chat_id=100, bot_username="bot"))
+    return adapter.to_inbound(message)
+
+
+def test_quote_from_a_rich_message_reads_plain_rich_texts():
+    quote = {"text": "", "position": 7, "rich_texts": ["the ", "branch"], "is_manual": True}
+    assert _quote_of_bot_answer(quote) == "[Quoting mybot: the branch]"
+
+
+def test_quote_from_a_rich_message_reads_formatted_and_nested_rich_texts():
+    rich_texts = [
+        "Delete ",
+        {"type": "bold", "text": "the"},
+        " ",
+        ["bra", {"type": "italic", "text": ["n", {"type": "bold", "text": "ch"}]}],
+        "\n1. push it",
+    ]
+    quote = {"text": "", "position": 0, "rich_texts": rich_texts, "is_manual": True}
+    assert _quote_of_bot_answer(quote) == "[Quoting mybot: Delete the branch\n1. push it]"
+
+
+def test_quote_with_no_text_and_no_rich_texts_falls_back_to_the_replied_text():
+    quote = {"text": "", "position": 0, "is_manual": True}
+    assert _quote_of_bot_answer(quote) == (
+        "[Replying to mybot: Delete the branch\n1. push it\n2. bundle it\nrepo | tip\nsee notes.md]"
+    )
+
+
+def test_quote_text_wins_over_rich_texts():
+    quote = {"text": "push it", "position": 0, "rich_texts": ["bundle it"], "is_manual": True}
+    assert _quote_of_bot_answer(quote) == "[Quoting mybot: push it]"
+
+
+def test_quote_log_line_carries_lengths_and_no_content(caplog):
+    quote = {"text": "", "position": 0, "rich_texts": ["secret ", "words"], "is_manual": True}
+    with caplog.at_level(logging.INFO, logger="tgforge"):
+        _inbound_quoting_bot_answer(quote)
+    lines = [r.getMessage() for r in caplog.records if "quote" in r.getMessage()]
+    assert lines == ["inbound msg 11 quote: text 0 chars, rich_texts present, used 12 chars"]
+    assert "secret" not in caplog.text
