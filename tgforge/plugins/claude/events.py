@@ -104,6 +104,12 @@ def prompt_block_count(ev: dict) -> int:
     return 0
 
 
+def is_notification_result(ev: dict) -> bool:
+    """A `result` closing the CLI's own turn for a background-task notification."""
+    origin = ev.get("origin")
+    return isinstance(origin, dict) and origin.get("kind") == "task-notification"
+
+
 def extract_tool_status(ev: dict) -> str | None:
     t = ev.get("type")
     if t == "assistant" and ev.get("message", {}).get("content"):
