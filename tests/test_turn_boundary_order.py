@@ -16,6 +16,7 @@ from claude_fakes import (
     assistant_text,
     client,
     drain,
+    line,
     replay,
     result,
     screen,
@@ -322,5 +323,200 @@ def test_a_failed_card_move_keeps_the_old_card(tmp_path):
         await asyncio.wait_for(t._reorder_holder(), 2)
         assert t.turn.card_id == card  # still the live card
         assert card not in c.bot.deleted  # never deleted without a replacement
+
+    asyncio.run(scenario())
+
+
+NOTIFICATION = {"kind": "task-notification"}
+
+
+def _initiator(c, t, text):
+    """The prompt that opened the turn (submit with no turn running): its user message,
+    the turn's card replying to it, and its pending write awaiting the replay."""
+    user_msg = _user_message(c, text)
+    t._open_holder(reply_to=user_msg, awaits_replay=True)
+    entry = {"is_initiator": True, "bubble_id": None, "reply_to": user_msg}
+    entry["turn_seq"] = t.turn_seq
+    t.pending_writes.append(entry)
+    return user_msg, entry
+
+
+def test_a_stale_notification_result_keeps_the_prompts_turn_open(tmp_path):
+    """On --resume the CLI first closes a background task the previous process left
+    unrecorded: `task_notification`, then an empty `result` (no model call), then the
+    prompt's replay and its own result. The empty result is not the prompt's turn end:
+    nothing settles, the process is kept, and the reply lands on the prompt's card."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        replies = _replies(c)
+        user_msg, entry = _initiator(c, t, "Write the plan")
+        await drain(c, t)
+        card = t.turn.card_id
+        prompt_runs = asyncio.Event()
+        proc = FakeProc(
+            [
+                line({"type": "system", "subtype": "task_notification", "status": "stopped"}),
+                result("", num_turns=0, origin=NOTIFICATION),
+                prompt_runs,
+                replay("Write the plan"),
+                assistant_text("the plan"),
+                result("REPLYTOKEN", num_turns=1),
+            ]
+        )
+        t.proc = proc
+        reader = asyncio.create_task(t._reader())
+        await asyncio.sleep(0.05)
+        await drain(c, t)
+
+        assert proc.returncode is None  # kept: the prompt is still to run
+        assert t.turn_open and t.turn.card_id == card and t.turn_seq == entry["turn_seq"]
+        assert t.pending_writes == [entry]
+        assert "(no reply)" not in texts(c)
+
+        prompt_runs.set()
+        await asyncio.wait_for(reader, 5)
+        await drain(c, t)
+        reply = next(mid for mid, text in screen(c) if "REPLYTOKEN" in text)
+        assert card not in c.bot.deleted and replies[card] == user_msg  # the card settled
+        assert reply > card
+        assert t.turn_seq == entry["turn_seq"] + 1
+        assert proc.returncode == -9 and not t.pending_writes
+        assert "(no reply)" not in texts(c) and UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_notification_turn_run_before_the_prompt_keeps_the_prompt(tmp_path):
+    """A background task ends just as the user sends a prompt to an idle process: the
+    CLI runs the notification's turn (a model call, its own `result`) first. That result
+    does not end the prompt's turn; the prompt's reply still lands."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        _user_msg, entry = _initiator(c, t, "hi")
+        await drain(c, t)
+        proc = FakeProc(
+            [
+                assistant_text("the job is done"),
+                result("the job is done", num_turns=1, origin=NOTIFICATION),
+                replay("hi"),
+                assistant_text("hello"),
+                result("REPLYTOKEN", num_turns=1),
+            ]
+        )
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        assert any("REPLYTOKEN" in text for text in texts(c))
+        assert proc.stdout.consumed == 5  # read to the prompt's result, not killed before
+        assert proc.returncode == -9 and not t.pending_writes
+        assert UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_notification_turn_run_before_a_queued_prompt_keeps_the_prompt(tmp_path):
+    """A message queued past the previous result: the CLI runs a background-task
+    notification's turn before it. Its first event opens the queued message's turn;
+    the notification's result does not end that turn, the message's own result does."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        t._open_holder()
+        await drain(c, t)
+        _user_msg, entry = await _midturn_message(c, t)
+        proc = FakeProc(
+            [
+                result("FIRSTTOKEN"),
+                assistant_text("the job is done"),
+                result("the job is done", num_turns=1, origin=NOTIFICATION),
+                replay("also do this"),
+                assistant_text("on it"),
+                result("SECONDTOKEN", num_turns=1),
+            ]
+        )
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        assert entry["bubble_id"] in c.bot.deleted
+        assert any("SECONDTOKEN" in text for text in texts(c))
+        assert proc.stdout.consumed == 6  # read to the message's result, not killed before
+        assert proc.returncode == -9 and not t.pending_writes
+        assert UNDELIVERED_NOTE not in texts(c)
+
+    asyncio.run(scenario())
+
+
+def test_a_notification_result_after_the_prompts_replay_ends_the_turn(tmp_path):
+    """Once the turn's prompt has been echoed, a result tagged with a notification
+    origin (the CLI ran both in one turn) is that turn's end, not one to wait past."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        _initiator(c, t, "hi")
+        await drain(c, t)
+        proc = FakeProc(
+            [
+                replay("hi"),
+                assistant_text("hello"),
+                result("REPLYTOKEN", num_turns=1, origin=NOTIFICATION),
+            ]
+        )
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        assert any("REPLYTOKEN" in text for text in texts(c))
+        assert proc.returncode == -9 and not t.turn_open and not t.pending_writes
+
+    asyncio.run(scenario())
+
+
+def test_an_unreplayed_prompt_without_a_notification_still_ends_its_turn(tmp_path):
+    """A local slash command opens a turn and is never replayed: its plain `result`
+    still ends that turn and the idle process."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        _initiator(c, t, "/cost")
+        await drain(c, t)
+        proc = FakeProc([assistant_text("cost: 1%"), result("COSTTOKEN", num_turns=0)])
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        assert any("COSTTOKEN" in text for text in texts(c))
+        assert proc.returncode == -9 and not t.pending_writes and not t.turn_open
+
+    asyncio.run(scenario())
+
+
+def test_a_notification_turn_with_no_prompt_waiting_settles(tmp_path):
+    """A background completion on an idle process with nothing sent: the notification's
+    result ends its own turn as before."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        proc = FakeProc(
+            [
+                assistant_text("the job is done"),
+                result("DONETOKEN", num_turns=1, origin=NOTIFICATION),
+            ]
+        )
+        t.proc = proc
+        await asyncio.wait_for(t._reader(), timeout=5)
+        await drain(c, t)
+
+        assert any("DONETOKEN" in text for text in texts(c))
+        assert proc.returncode == -9 and not t.turn_open
 
     asyncio.run(scenario())

@@ -68,6 +68,7 @@ from tgforge.plugins.claude.config import (
 )
 from tgforge.plugins.claude.events import (
     has_background_launch,
+    is_notification_result,
     is_prompt_replay,
     mirror_parse,
     prompt_block_count,
@@ -518,12 +519,15 @@ class ClaudeTopic(Topic):
         if self.send_chain is not None:
             await asyncio.wait([self.send_chain])
 
-    def _open_holder(self, reply_to=None, ack=None):
+    def _open_holder(self, reply_to=None, ack=None, awaits_replay=False):
         """Open a turn: fresh turn state, then queue its live card behind the previous
         turn's output, so the card always lands below that turn's last message. `ack` is
         the queued message this turn starts from: its "queued ✓" bubble is deleted and
-        the card replies to the user's message instead."""
-        self.turn = TurnState(reply_to=reply_to, started=time.monotonic())
+        the card replies to the user's message instead. `awaits_replay`: the turn is a
+        user prompt's, and the CLI has not echoed that prompt yet."""
+        self.turn = TurnState(
+            reply_to=reply_to, started=time.monotonic(), awaits_replay=awaits_replay
+        )
         self.turn_open = True
         self.busy = True
         self.last_reader_event = self.turn.started
@@ -550,7 +554,7 @@ class ClaudeTopic(Topic):
         replay), else its own (a background completion)."""
         if self.pending_writes:
             entry = self.pending_writes.pop(0)
-            self._open_holder(reply_to=entry["reply_to"], ack=entry)
+            self._open_holder(reply_to=entry["reply_to"], ack=entry, awaits_replay=True)
         else:
             self._open_holder(reply_to=self.turn.reply_to)
 
@@ -636,7 +640,7 @@ class ClaudeTopic(Topic):
             else:
                 LOGGER.info("submit (%s): NEW turn (busy was False)", self.name)
                 self.cancel_requested = False
-                self._open_holder(reply_to=reply_to)
+                self._open_holder(reply_to=reply_to, awaits_replay=True)
                 self.pending_writes.append(
                     {
                         "is_initiator": True,
@@ -715,7 +719,7 @@ class ClaudeTopic(Topic):
                     if self.background_tasks:
                         self._ensure_background_updater()
                 apply_event(self.turn, ev)
-                if t == "user" and is_prompt_replay(ev) and self.pending_writes:
+                if t == "user" and is_prompt_replay(ev):
                     folded = False
                     n = min(prompt_block_count(ev), len(self.pending_writes))
                     for _ in range(n):
@@ -728,7 +732,17 @@ class ClaudeTopic(Topic):
                             folded = True
                     if folded:
                         self._reorder_holder()
+                    self.turn.awaits_replay = False
                 elif t == "result":
+                    if is_notification_result(ev) and self.turn_open and self.turn.awaits_replay:
+                        # the CLI ran a background-task notification ahead of the prompt
+                        # that opened this turn; that prompt's replay and result follow
+                        LOGGER.info(
+                            "reader (%s): notification result before the turn's prompt "
+                            "→ turn stays open",
+                            self.name,
+                        )
+                        continue
                     if not self.turn_open:
                         self._open_next_turn()
                     await self._finalize_turn(

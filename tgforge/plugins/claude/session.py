@@ -27,6 +27,7 @@ class TurnState:
     tok_base: int = 0
     tok_latest: int = 0
     compacted: bool = False
+    awaits_replay: bool = False  # opened for a user prompt whose replay has not come
     _think_delta_seen: bool = False  # did the current message stream thinking deltas
 
 
