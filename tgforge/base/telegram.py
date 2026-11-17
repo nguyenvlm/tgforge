@@ -530,8 +530,8 @@ _RICH_AFTER_FIELDS = ("caption", "credit")
 
 def _rich_plain(node) -> str:
     """The plain text of a received Rich Message, from its dumped blocks: each block on
-    its own line, a table row's cells joined by ` | `, a caption or credit after what it
-    labels."""
+    its own line, a list item after its label, a table row's cells joined by ` | `, a
+    caption or credit after what it labels."""
     if isinstance(node, str):
         return node
     if isinstance(node, list):  # a rich text's pieces
@@ -544,7 +544,9 @@ def _rich_plain(node) -> str:
     for row in node.get("cells", []):
         parts.append(" | ".join(_rich_plain(cell) for cell in row))
     parts += [_rich_plain(node[field]) for field in _RICH_AFTER_FIELDS if field in node]
-    return "\n".join(part for part in parts if part)
+    text = "\n".join(part for part in parts if part)
+    label = node.get("label")  # a list item's number or bullet
+    return f"{label} {text}" if label else text
 
 
 def _message_text(message) -> str:

@@ -114,7 +114,7 @@ def _bot_answer() -> Message:
 def test_reply_to_a_rich_message_carries_its_plain_text():
     note = _prefix(_msg(_bot_answer()))
     assert note == (
-        "[Replying to mybot: Delete the branch\npush it\nbundle it\nrepo | tip\nsee notes.md]"
+        "[Replying to mybot: Delete the branch\n1. push it\n2. bundle it\nrepo | tip\nsee notes.md]"
     )
 
 
@@ -128,7 +128,7 @@ def test_forwarded_rich_message_carries_its_plain_text():
     message = telegram_inbound(
         None, rich_message=answer.rich_message, forward_origin=None, reply_to_message=None
     )
-    assert message.text == "Delete the branch\npush it\nbundle it\nrepo | tip\nsee notes.md"
+    assert message.text == "Delete the branch\n1. push it\n2. bundle it\nrepo | tip\nsee notes.md"
 
 
 def test_rich_message_credits_and_button_labels_are_read_and_their_targets_are_not():
@@ -164,3 +164,29 @@ def test_rich_message_credits_and_button_labels_are_read_and_their_targets_are_n
         )
     )
     assert _prefix(_msg(answer)) == "[Replying to mybot: a saying\nits author\ntap here\nYes\nNo]"
+
+
+def test_rich_message_captions_follow_their_content_and_file_details_stay_out():
+    photo = {"file_id": "photo-id", "file_unique_id": "u", "width": 1, "height": 1}
+    answer = Message.model_validate(
+        dict(
+            _BOT_ANSWER,
+            rich_message={
+                "blocks": [
+                    {
+                        "type": "table",
+                        "cells": [[{"align": "left", "valign": "top", "text": "a | b"}]],
+                        "caption": "the table",
+                    },
+                    {
+                        "type": "photo",
+                        "photo": [photo],
+                        "caption": {"text": "the diagram", "credit": "its source"},
+                    },
+                ]
+            },
+        )
+    )
+    assert _prefix(_msg(answer)) == (
+        "[Replying to mybot: a | b\nthe table\nthe diagram\nits source]"
+    )
