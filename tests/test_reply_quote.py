@@ -218,20 +218,30 @@ def _inbound_quoting_bot_answer(quote: dict):
 
 
 def test_quote_from_a_rich_message_reads_plain_rich_texts():
-    quote = {"text": "", "position": 7, "rich_texts": ["the ", "branch"], "is_manual": True}
+    quote = {"text": "", "position": 7, "rich_texts": ["the branch"], "is_manual": True}
     assert _quote_of_bot_answer(quote) == "[Quoting mybot: the branch]"
 
 
 def test_quote_from_a_rich_message_reads_formatted_and_nested_rich_texts():
-    rich_texts = [
+    paragraph = [
         "Delete ",
         {"type": "bold", "text": "the"},
         " ",
         ["bra", {"type": "italic", "text": ["n", {"type": "bold", "text": "ch"}]}],
-        "\n1. push it",
+    ]
+    quote = {"text": "", "position": 0, "rich_texts": [paragraph], "is_manual": True}
+    assert _quote_of_bot_answer(quote) == "[Quoting mybot: Delete the branch]"
+
+
+def test_quote_across_blocks_puts_each_block_on_its_own_line():
+    # the shape Telegram sent for a selection from a paragraph with a bold word into a list
+    rich_texts = [
+        ["Delete ", {"type": "bold", "text": "the"}, " branch"],
+        "push it",
+        "bund",
     ]
     quote = {"text": "", "position": 0, "rich_texts": rich_texts, "is_manual": True}
-    assert _quote_of_bot_answer(quote) == "[Quoting mybot: Delete the branch\n1. push it]"
+    assert _quote_of_bot_answer(quote) == "[Quoting mybot: Delete the branch\npush it\nbund]"
 
 
 def test_quote_with_no_text_and_no_rich_texts_falls_back_to_the_replied_text():
@@ -251,5 +261,5 @@ def test_quote_log_line_carries_lengths_and_no_content(caplog):
     with caplog.at_level(logging.INFO, logger="tgforge"):
         _inbound_quoting_bot_answer(quote)
     lines = [r.getMessage() for r in caplog.records if "quote" in r.getMessage()]
-    assert lines == ["inbound msg 11 quote: text 0 chars, rich_texts present, used 12 chars"]
+    assert lines == ["inbound msg 11 quote: text 0 chars, rich_texts [str7, str5], used 13 chars"]
     assert "secret" not in caplog.text

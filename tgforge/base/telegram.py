@@ -558,16 +558,31 @@ def _message_text(message) -> str:
     return _rich_plain(rich.model_dump(mode="json", exclude_none=True)) if rich else ""
 
 
+def _rich_shape(node) -> str:
+    """A dumped rich text's structure without its text: `str7` for a 7-character
+    string, `bold(…)` for a typed node, `[…]` for a list."""
+    if isinstance(node, str):
+        return f"str{len(node)}"
+    if isinstance(node, list):
+        return "[" + ", ".join(_rich_shape(piece) for piece in node) + "]"
+    if isinstance(node, dict):
+        inner = ", ".join(_rich_shape(value) for key, value in node.items() if key != "type")
+        return f"{node.get('type', '?')}({inner})"
+    return type(node).__name__
+
+
 def _quote_text(quote) -> str | None:
     """A reply quote's text: its text, or the plain text of its rich texts (a quote chosen
-    from a Rich Message) when that is empty."""
+    from a Rich Message) when that is empty, one line per rich text — each is one quotable
+    text of the message, which the Bot API joins with line feeds."""
     text = getattr(quote, "text", None)
     if text:
         return text
     rich_texts = getattr(quote, "rich_texts", None)
     if not rich_texts:
         return text
-    return _rich_plain(quote.model_dump(mode="json", exclude_none=True)["rich_texts"])
+    dumped = quote.model_dump(mode="json", exclude_none=True)["rich_texts"]
+    return "\n".join(_rich_plain(rich_text) for rich_text in dumped)
 
 
 def _mentioned_user_ids(message, bot_id) -> list[int]:
@@ -952,11 +967,14 @@ class TelegramAdapter:
             quote = getattr(message, "quote", None)
             if quote is not None:
                 inbound.quote = _quote_text(quote)
+                rich_texts = getattr(quote, "rich_texts", None)
                 LOGGER.info(
                     "inbound msg %s quote: text %d chars, rich_texts %s, used %d chars",
                     inbound.message_id,
                     len(getattr(quote, "text", None) or ""),
-                    "present" if getattr(quote, "rich_texts", None) else "absent",
+                    _rich_shape(quote.model_dump(mode="json", exclude_none=True)["rich_texts"])
+                    if rich_texts
+                    else "absent",
                     len(inbound.quote or ""),
                 )
         sent = getattr(message, "date", None)
