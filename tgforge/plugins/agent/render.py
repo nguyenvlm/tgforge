@@ -1,4 +1,4 @@
-"""Claude-domain rendering: tool lines, the live-status head, the turn timeline,
+"""Agent-window rendering: tool lines, the live-status head, the turn timeline,
 and the `[[suggest]]`/`[[attach]]` answer markers. Builds on the base
 downstream-agnostic primitives in `tgforge.base.ui`.
 """
@@ -102,12 +102,6 @@ def status_head(seed: int, spin: int, elapsed: int, tokens: int, usage: list[str
     word = WORDS[(seed + elapsed // 20) % len(WORDS)]
     parts = [fmt_duration(elapsed), f"↓ {fmt_tokens(tokens)}", *usage]
     return f"{frame} {word}… {' · '.join(parts)}"
-
-
-def default_context_window(model: str) -> int:
-    """The context window assumed before a result reports one: 1M for a `[1m]` model
-    id, else 200k."""
-    return 1_000_000 if model.endswith("[1m]") else 200_000
 
 
 def context_part(tokens: int, window: int) -> str | None:

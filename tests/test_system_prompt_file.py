@@ -13,9 +13,8 @@ from pathlib import Path
 
 from tgforge.base.config import BotConfig
 from tgforge.base.telegram import TelegramAdapter
+from tgforge.plugins.agent.window import session_brief, system_prompt_file
 from tgforge.plugins.claude import Claude, ClaudeTopic
-from tgforge.plugins.claude.config import system_prompt_file
-from tgforge.plugins.claude.driver import session_brief
 from tgforge.testing import MockBot, telegram_kernel
 
 _FAKE_CLI = """#!/usr/bin/env python3

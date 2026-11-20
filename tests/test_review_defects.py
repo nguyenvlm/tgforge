@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from claude_fakes import THREAD, client, window
 
-from tgforge.plugins.claude.config import write_roots
+from tgforge.plugins.agent.window import write_roots
 from tgforge.plugins.gcloud import Gcloud
 from tgforge.plugins.shell import Shell, ShellTopic
 from tgforge.testing import TestClient

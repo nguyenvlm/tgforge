@@ -13,7 +13,7 @@ from claude_fakes import THREAD, client, window
 
 from tgforge.base import kernel
 from tgforge.plugins import localfs
-from tgforge.plugins.claude import driver as drv
+from tgforge.plugins.agent import window as drv
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.testing import TestClient
 

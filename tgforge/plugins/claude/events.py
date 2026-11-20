@@ -1,4 +1,5 @@
-"""Pure parsing of the Claude CLI stream-json / transcript events.
+"""Pure parsing of the Claude CLI stream-json / transcript events: the Claude backend's
+translation of its stream into the agent core's neutral events.
 
 Transport-agnostic and side-effect-free, so it can be tested against fixed inputs.
 """
@@ -7,7 +8,81 @@ from __future__ import annotations
 
 import json
 
-from tgforge.plugins.claude.render import tool_line
+from tgforge.plugins.agent.render import tool_line
+from tgforge.plugins.agent.session import (
+    BlockDone,
+    Compacted,
+    MessageDone,
+    StepStart,
+    TextDelta,
+    ThoughtDelta,
+    ToolStart,
+    TurnState,
+    Usage,
+    apply,
+)
+
+_STEP_START = StepStart()
+_MESSAGE_DONE = MessageDone()
+_COMPACTED = Compacted()
+
+
+def turn_events(ev: dict) -> list:
+    """One stream-json event → the neutral turn events it carries: stream deltas, the
+    token roll and context size of a model call, completed text/thinking blocks, the
+    message's tool line, and the compaction flag."""
+    t = ev.get("type")
+    if t == "stream_event":
+        inner = ev.get("event", {})
+        it = inner.get("type")
+        if it == "content_block_delta":
+            delta = inner.get("delta", {})
+            dt = delta.get("type")
+            if dt == "text_delta":
+                return [TextDelta(delta.get("text", ""))]
+            if dt == "thinking_delta":
+                return [ThoughtDelta(delta.get("text", ""))]
+            return []
+        if it == "message_start":
+            usage = inner.get("message", {}).get("usage") or {}
+            if usage and ev.get("parent_tool_use_id") is None:  # the main agent, not a subagent
+                used = (
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                )
+                return [_STEP_START, Usage(context_used=used)]
+            return [_STEP_START]
+        if it == "message_delta":
+            usage = inner.get("usage") or {}
+            return [Usage(output_tokens=usage.get("output_tokens"))]
+        return []
+    if t == "assistant":
+        # each block is its own assistant message; completed text/thinking in order,
+        # then the live tails clear, then the message's (first) tool line
+        out: list = []
+        for b in ev.get("message", {}).get("content", []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                out.append(BlockDone("text", b.get("text") or ""))
+            elif b.get("type") == "thinking":
+                out.append(BlockDone("thinking", b.get("thinking") or ""))
+        out.append(_MESSAGE_DONE)
+        for b in ev.get("message", {}).get("content") or []:
+            if b.get("type") == "tool_use":
+                out.append(ToolStart(b.get("id") or "", b.get("name", "tool"), b.get("input")))
+                break
+        return out
+    if t == "system" and ev.get("subtype") == "compact_boundary":
+        return [_COMPACTED]
+    return []
+
+
+def apply_event(st: TurnState, ev: dict) -> None:
+    """Fold one stream-json event into the turn state."""
+    for neutral in turn_events(ev):
+        apply(st, neutral)
 
 
 def mirror_parse(raw: str) -> tuple[list[str], list[str], list[tuple[str, str]], bool]:

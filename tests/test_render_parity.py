@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from tgforge.base import ui as base_render
+from tgforge.plugins.agent import render as agent_render
 from tgforge.plugins.claude import events
-from tgforge.plugins.claude import render as claude_render
 
 GOLDENS_DIR = Path(__file__).resolve().parent / "goldens"
 sys.path.insert(0, str(GOLDENS_DIR))
@@ -22,7 +22,7 @@ GOLDENS = json.loads((GOLDENS_DIR / "render_goldens.json").read_text())
 
 
 def _resolve(name):
-    for mod in (base_render, claude_render, events):
+    for mod in (base_render, agent_render, events):
         if hasattr(mod, name):
             return getattr(mod, name)
     raise KeyError(name)

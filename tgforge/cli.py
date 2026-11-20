@@ -57,24 +57,24 @@ def _resolve_home(app: str | None, home: str | None) -> Path | None:
 
 def _workspaces(action: str, value: str | None, app: str | None, home: str | None) -> None:
     """List/add/remove the agent's workspace roots in a bot home."""
-    from tgforge.plugins.claude import config as claude_config
+    from tgforge.plugins.agent.window import read_roots, resolve_roots, write_roots
 
     home_path = _resolve_home(app, home)
     if home_path is None:
         return
-    roots = claude_config.read_roots(home_path)
+    roots = read_roots(home_path)
     if action == "add" and value:
         roots.append(value)
-        claude_config.write_roots(home_path, roots)
+        write_roots(home_path, roots)
     elif action in ("rm", "remove") and value:
         if value.isdigit() and 1 <= int(value) <= len(roots):
             roots.pop(int(value) - 1)
         elif value in roots:
             roots.remove(value)
-        claude_config.write_roots(home_path, roots)
+        write_roots(home_path, roots)
     for i, g in enumerate(roots, 1):
         print(f"  {i}. {g}")
-    for w in claude_config.resolve_roots(roots):
+    for w in resolve_roots(roots):
         print(f"  • {w}")
 
 

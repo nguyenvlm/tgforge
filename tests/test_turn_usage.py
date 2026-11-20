@@ -9,9 +9,9 @@ import copy
 
 from claude_fakes import FakeProc, client, drain, fixture_events, line, result, texts, window
 
-from tgforge.plugins.claude.events import rate_limit_windows, result_context_window
-from tgforge.plugins.claude.render import quota_part
-from tgforge.plugins.claude.session import TurnState, apply_event
+from tgforge.plugins.agent.render import quota_part
+from tgforge.plugins.agent.session import TurnState
+from tgforge.plugins.claude.events import apply_event, rate_limit_windows, result_context_window
 
 
 def _message_start(input_tokens, created, read, parent=None):

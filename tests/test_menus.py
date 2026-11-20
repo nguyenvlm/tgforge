@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import asyncio
 
+from tgforge.plugins.agent.window import SESSION_BRIEF
 from tgforge.plugins.claude import Claude, ClaudeTopic
-from tgforge.plugins.claude.driver import SESSION_BRIEF
 from tgforge.testing import TestClient
 
 

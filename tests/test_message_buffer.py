@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from claude_fakes import THREAD, client, window
 
-from tgforge.plugins.claude import driver
+from tgforge.plugins.agent import window as driver
 from tgforge.testing import telegram_inbound
 
 DEBOUNCE = 0.05

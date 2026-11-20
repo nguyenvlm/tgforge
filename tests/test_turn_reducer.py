@@ -7,8 +7,15 @@ callable) — a straight unit test of the extracted logic. Live parity is 2g.
 
 from __future__ import annotations
 
-from tgforge.plugins.claude.render import render_timeline
-from tgforge.plugins.claude.session import TurnState, apply_event, finalize_answer
+import functools
+
+from tgforge.plugins.agent import session
+from tgforge.plugins.agent.render import render_timeline
+from tgforge.plugins.agent.session import TurnState
+from tgforge.plugins.claude.events import apply_event
+
+# the Claude window's answer selection (the core takes the agent's name)
+finalize_answer = functools.partial(session.finalize_answer, agent="Claude")
 
 
 def _turn(events):
