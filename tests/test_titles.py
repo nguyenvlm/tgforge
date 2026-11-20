@@ -74,53 +74,6 @@ def test_claude_session_title_becomes_the_topic_name(tmp_path):
     asyncio.run(scenario())
 
 
-def _write_jsonl(t, tmp_path, lines):
-    import json as _json
-    from pathlib import Path
-
-    from tgforge.plugins.claude.driver import _project_dir
-
-    t.workspace = str(tmp_path / "ws")
-    t.config_dir = str(tmp_path / "cfg")
-    jsonl = _project_dir(Path(t.config_dir), Path(t.workspace)) / f"{t.session_id}.jsonl"
-    jsonl.parent.mkdir(parents=True, exist_ok=True)
-    jsonl.write_text("".join(_json.dumps(ev) + "\n" for ev in lines))
-
-
-def test_sync_title_renames_topic_to_the_ai_title(tmp_path):
-    async def scenario():
-        c = TestClient(Claude(), home=str(tmp_path))
-        t = _instantiate(c, ClaudeTopic, "claude")
-        _write_jsonl(t, tmp_path, [{"type": "ai-title", "aiTitle": "Retry bug hunt"}])
-        await t._sync_title()
-        await c.core.flush_frames()
-        assert c.core._names()["555"] == "🤖 Retry bug hunt"
-
-    asyncio.run(scenario())
-
-
-def test_sync_title_custom_outranks_ai(tmp_path):
-    """Same priority as telegram_bot.py: a custom-title (user /rename) beats the
-    auto ai-title regardless of order."""
-
-    async def scenario():
-        c = TestClient(Claude(), home=str(tmp_path))
-        t = _instantiate(c, ClaudeTopic, "claude")
-        _write_jsonl(
-            t,
-            tmp_path,
-            [
-                {"type": "custom-title", "customTitle": "My name"},
-                {"type": "ai-title", "aiTitle": "Auto name"},
-            ],
-        )
-        await t._sync_title()
-        await c.core.flush_frames()
-        assert c.core._names()["555"] == "🤖 My name"
-
-    asyncio.run(scenario())
-
-
 # ── Flood-safe rename guard ────────────────────────────────────────────
 def test_unchanged_title_skips_the_api_call(tmp_path):
     async def scenario():
@@ -148,3 +101,58 @@ def test_bookmark_add_remove(tmp_path):
     removed = fs.remove_bookmark(0)
     assert removed == "/seed" and fs.bookmarks == ["/srv/work"]
     assert fs.remove_bookmark(9) is None  # out of range is a no-op
+
+
+# ── Only /rename renames an agent window ──────────────────────────────
+def test_a_session_title_in_the_claude_session_file_never_renames_the_topic(tmp_path):
+    import json as _json
+
+    from claude_fakes import FakeProc, assistant_text, drain, result, window
+
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        renames = _spy_renames(c.core)
+        t = window(c, tmp_path)
+        (tmp_path / "none.jsonl").write_text(
+            _json.dumps({"type": "ai-title", "aiTitle": "Retry bug hunt"}) + "\n"
+        )
+
+        async def spawn(*cmd, **kwargs):
+            return FakeProc([assistant_text("ok"), result("ok")])
+
+        t.spawn = spawn
+        await t.submit("hi")
+        await drain(c, t)
+        await c.core.flush_frames()
+        assert "ok" in [text for _m, _t, text in c.bot.created]  # the turn settled
+        assert renames == [] and "base_name" not in t.saved and t.title is None
+
+    asyncio.run(scenario())
+
+
+def test_agys_title_mid_turn_renames_nothing_and_a_bare_rename_takes_it(tmp_path):
+    from types import SimpleNamespace
+
+    from agy_fakes import ACP, client, message, settle, window
+
+    async def scenario():
+        c = client(tmp_path)
+        renames = _spy_renames(c.core)
+        t = window(c, tmp_path)
+        await t.submit("hi", reply_to=None)
+        agent = t.agents[-1]
+        agent.send(message("session_info_update", title="Named by agy"))
+        await settle(c, t)
+        assert t.turn_open  # it came mid-turn
+        agent.send({**ACP["prompt_reply_end_turn"], "id": agent.prompt_ids()[-1]})
+        await settle(c, t)
+        await c.core.flush_frames()
+        assert renames == [] and "base_name" not in t.saved and t.title is None
+        assert t.agent_title == "Named by agy"
+        await t.rename_cmd(SimpleNamespace(args=""))
+        await c.core.flush_frames()
+        assert t.saved["base_name"] == "Named by agy"
+        assert renames == [f"{t.icon} Named by agy"]
+        await t.on_close()
+
+    asyncio.run(scenario())

@@ -104,11 +104,13 @@ def status_head(seed: int, spin: int, elapsed: int, tokens: int, usage: list[str
     return f"{frame} {word}… {' · '.join(parts)}"
 
 
-def context_part(tokens: int, window: int) -> str | None:
-    """`ctx 21% (42.4k)`, or None before the first model call."""
-    if not tokens or not window:
+def context_part(tokens: int, window: int | None) -> str | None:
+    """`ctx 21% (42.4k)`; `ctx ??% (42.4k)` while the backend has not reported the
+    model's window; None before the first model call."""
+    if not tokens:
         return None
-    return f"ctx {round(100 * tokens / window)}% ({fmt_tokens(tokens)})"
+    percent = f"{round(100 * tokens / window)}%" if window else "??%"
+    return f"ctx {percent} ({fmt_tokens(tokens)})"
 
 
 def quota_part(quota: dict | None) -> str | None:

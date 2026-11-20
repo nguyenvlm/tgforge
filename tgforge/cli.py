@@ -3,9 +3,11 @@
 `tgforge run` (no target) starts the default app (every bundled plugin).
 `tgforge run module:app` resolves the import string and starts a custom app.
 `tgforge install` runs the setup wizard; `tgforge uninstall <name>` tears a bot
-down; `tgforge workspaces` edits the agent's workspace roots; `tgforge restart`
-restarts a bot's service, detached, from any caller. `run(app)` is the library
-entry for a custom __main__.
+down; `tgforge workspaces` edits the agent's workspace roots; `tgforge model`,
+`tgforge mode` and `tgforge window` change an agent plugin's model list, permission
+mode and a window's model / effort (the running bot reads them at each use);
+`tgforge restart` restarts a bot's service, detached, from any caller. `run(app)` is
+the library entry for a custom __main__.
 """
 
 from __future__ import annotations
@@ -78,6 +80,97 @@ def _workspaces(action: str, value: str | None, app: str | None, home: str | Non
         print(f"  • {w}")
 
 
+def _agent_plugin(plugin_id: str, home: Path):
+    """An agent plugin bound to a bot home's stores, as the running bot binds it."""
+    from tgforge.base.kernel import AppDB, bind_store
+
+    if plugin_id == "agy":
+        from tgforge.plugins.agy import Agy as plugin_class
+    else:
+        from tgforge.plugins.claude import Claude as plugin_class
+    plugin = plugin_class()
+    bind_store(plugin, AppDB(home / "state.db"))
+    return plugin
+
+
+def _plugin_id(plugin_id: str | None) -> str:
+    """The agent plugin a command is for: `--plugin`, else the window's own
+    (`TGFORGE_PLUGIN`, set in an agent window's CLI), else `claude`."""
+    return plugin_id or os.environ.get("TGFORGE_PLUGIN") or "claude"
+
+
+def _pool_model(plugin, plugin_id: str, model: str) -> str:
+    """The model value a label or value names in the plugin's model list; refused
+    when the list has no such model."""
+    pool = plugin.model_pool()
+    match = next((v for label, v in pool if model in (label, v)), None)
+    if match is None:
+        offered = ", ".join(v for _, v in pool) or "none — add one with  tgforge model add"
+        raise SystemExit(f"model '{model}' is not in the {plugin_id} model list: {offered}")
+    return match
+
+
+def _model(action: str, value: str | None, plugin_id: str, home: Path) -> None:
+    """List or edit an agent plugin's model list, or set its default model."""
+    plugin = _agent_plugin(plugin_id, home)
+    if action in ("add", "rm", "default") and not value:
+        raise SystemExit(f"tgforge model {action} needs a value")
+    if action == "default":
+        value = _pool_model(plugin, plugin_id, value)
+        plugin.set_default_model(value)
+        print(f"default model → {value}")
+    elif action != "list":
+        print(plugin.edit_models(f"{action} {value or ''}"))
+    print(plugin.models_text())
+
+
+def _mode(value: str | None, plugin_id: str, home: Path) -> None:
+    """Print an agent plugin's permission mode, or set it to one of its modes."""
+    plugin = _agent_plugin(plugin_id, home)
+    if value is not None:
+        modes = plugin.topics[0].PERMISSION_MODES
+        if value not in modes:
+            raise SystemExit(f"unknown mode '{value}' — one of: {', '.join(modes)}")
+        plugin.set_permission_mode(value)
+        print(f"{plugin_id} mode → {value} (each window's next process runs it)")
+        return
+    print(f"{plugin_id} mode: {plugin.permission_mode}")
+
+
+def _window(
+    model: str | None,
+    effort: str | None,
+    plugin_id: str,
+    window: str | None,
+    home: Path,
+) -> None:
+    """Print or set the model and effort of the agent window the command runs in
+    (`TGFORGE_PLUGIN` / `TGFORGE_WINDOW`); the window applies a change before its next
+    turn. Every value is checked before any is written."""
+    from tgforge.base.kernel import AppDB, window_ns
+    from tgforge.plugins.agent.window import write_window_setting
+
+    window = window or os.environ.get("TGFORGE_WINDOW")
+    if not window:
+        raise SystemExit("no window — run this inside an agent window or pass --window <key>")
+    plugin = _agent_plugin(plugin_id, home)
+    topic_class = plugin.topics[0]
+    store = AppDB(home / "state.db").saved(window_ns(topic_class.id, window))
+    if "session" not in store:
+        raise SystemExit(f"no {plugin_id} window '{window}'")
+    wanted: dict[str, str | None] = {}
+    if model is not None:
+        wanted["model"] = None if model == "default" else _pool_model(plugin, plugin_id, model)
+    if effort is not None:
+        if effort != "default" and effort not in topic_class.EFFORTS:
+            levels = ", ".join((*topic_class.EFFORTS, "default"))
+            raise SystemExit(f"effort '{effort}' is not one of: {levels}")
+        wanted["effort"] = None if effort == "default" else effort
+    for name, value in wanted.items():
+        write_window_setting(store, name, value)
+    print(f"model {store.get('model') or 'default'} · effort {store.get('effort') or 'default'}")
+
+
 def _restart(app: str | None, home: str | None) -> None:
     """Restart a bot's service, source-agnostic: any caller runs the same verb. The
     requester topic (for the post-restart re-entry) is read from env, set only when a
@@ -112,6 +205,24 @@ def main(argv: list[str] | None = None) -> None:
     ws_p.add_argument("value", nargs="?", help="a path/glob (add) or index/glob (rm)")
     ws_p.add_argument("--app", help="app name (omit if only one is installed)")
     ws_p.add_argument("--home", help="explicit bot home dir (overrides --app)")
+    agent_help = "agent plugin (claude or agy)"
+    md_p = sub.add_parser("model", help="list/edit an agent plugin's model list")
+    md_p.add_argument(
+        "action", nargs="?", default="list", choices=["list", "add", "rm", "reset", "default"]
+    )
+    md_p.add_argument(
+        "value", nargs="?", help="label|value (add), n or value (rm), value (default)"
+    )
+    mo_p = sub.add_parser("mode", help="show or set an agent plugin's permission mode")
+    mo_p.add_argument("value", nargs="?", help="the mode to set")
+    wn_p = sub.add_parser("window", help="show or set this agent window's model / effort")
+    wn_p.add_argument("--model", help="a model from the plugin's list, or default")
+    wn_p.add_argument("--effort", help="an /effort level, or default")
+    wn_p.add_argument("--window", help="the window key (default: $TGFORGE_WINDOW)")
+    for p in (md_p, mo_p, wn_p):
+        p.add_argument("--plugin", choices=["claude", "agy"], help=agent_help)
+        p.add_argument("--app", help="app name (omit if only one is installed)")
+        p.add_argument("--home", help="explicit bot home dir (overrides --app)")
     fm_p = sub.add_parser(
         "fetch-mermaid", help="fetch mermaid.js and the headless browser into a bot home"
     )
@@ -145,6 +256,16 @@ def _dispatch(args) -> None:
         uninstall(args.name, keep_home=args.keep_home, assume_yes=args.yes)
     elif args.command == "workspaces":
         _workspaces(args.action, args.value, args.app, args.home)
+    elif args.command in ("model", "mode", "window"):
+        home_path = _resolve_home(args.app, args.home)
+        if home_path is None:
+            return
+        if args.command == "model":
+            _model(args.action, args.value, _plugin_id(args.plugin), home_path)
+        elif args.command == "mode":
+            _mode(args.value, _plugin_id(args.plugin), home_path)
+        else:
+            _window(args.model, args.effort, _plugin_id(args.plugin), args.window, home_path)
     elif args.command == "restart":
         _restart(args.app, args.home)
     elif args.command == "fetch-mermaid":

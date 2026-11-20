@@ -16,6 +16,7 @@ from agy_fakes import (
 
 from tgforge.plugins.agy import Agy, driver, setup
 from tgforge.plugins.agy.config import TOKEN_FILE, data_dir
+from tgforge.testing import TestClient
 
 
 def _signed_in(home):
@@ -26,7 +27,7 @@ def _signed_in(home):
 
 
 def test_accounts_are_homes_holding_a_token(tmp_path):
-    plugin = Agy()
+    plugin = TestClient(Agy(), home=str(tmp_path)).core.plugin_by_id["agy"]
     plugin.accounts_root = tmp_path
     _signed_in(tmp_path / ".agy-work")
     (tmp_path / ".agy-empty" / ".gemini").mkdir(parents=True)
@@ -35,7 +36,7 @@ def test_accounts_are_homes_holding_a_token(tmp_path):
     assert plugin.account_dir_for("x") == tmp_path / ".agy-x"
     assert plugin.account_name(tmp_path / ".agy-work") == "work"
     assert plugin.account_name(tmp_path) == "default"
-    plugin.accounts = {"empty": str(tmp_path / ".agy-empty")}
+    plugin.saved["accounts"] = {"empty": str(tmp_path / ".agy-empty")}
     rows = {r["name"]: r["label"] for r in plugin.account_status()}
     assert rows == {
         "default": "✅ default — signed in",
@@ -81,7 +82,7 @@ def _login_plugin(tmp_path, monkeypatch):
     fake.write_text(_LOGIN)
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("DISPLAY", ":0")
-    plugin = Agy()
+    plugin = TestClient(Agy(), home=str(tmp_path)).core.plugin_by_id["agy"]
     plugin.accounts_root = tmp_path
     plugin.agy_bin = str(fake)
     return plugin

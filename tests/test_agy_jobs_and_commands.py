@@ -490,10 +490,9 @@ def test_rename_sets_the_title_and_a_bare_rename_takes_agys_title(tmp_path):
         await t.submit("hi")
         t.agents[0].send(message("session_info_update", title="Named by agy"))
         await settle(c, t)
-        assert t.title == "Named by agy"  # the auto-title
-        t.title = "changed"
+        assert t.title == "My window" and t.saved["base_name"] == "My window"  # no rename
         await t.rename_cmd(SimpleNamespace(args=""))
-        assert t.title == "Named by agy"
+        assert t.title == "Named by agy" and t.saved["base_name"] == "Named by agy"
         await t.on_close()
 
     asyncio.run(scenario())
@@ -749,5 +748,70 @@ def test_both_agent_plugins_share_the_bang_prefixes_login_and_the_service(tmp_pa
         await c.send("!echo shared-bang", window=THREAD)
         await settle(c, t)
         assert any("shared-bang" in text for text in texts(c))
+
+    asyncio.run(scenario())
+
+
+def _close_question(c, t):
+    """Run the kernel's `/close` in the window; returns the question it asks."""
+    asked = []
+
+    async def ask_buttons(question, buttons, **kw):
+        asked.append(question)
+        return None, None
+
+    ctx = SimpleNamespace(topic=t, ask_buttons=ask_buttons)
+    return asked, c.core._core_plugin.close(ctx)
+
+
+def test_close_with_a_running_job_says_closing_also_stops_it(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        asked, run = _close_question(c, t)
+        await run
+        assert asked == ["Close this window?"]  # no job: no warning
+        await _with_job_kept_plain(c, t)
+        asked, run = _close_question(c, t)
+        await run
+        label = next(iter(t.background_tasks.values()))["label"]
+        assert asked == [f"Close this window? This also stops the running job ({label})."]
+        await t.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_stops_confirm_reads_as_before(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        await _with_job_kept_plain(c, t)
+        asked = []
+
+        async def ask_buttons(question, buttons, **kw):
+            asked.append(question)
+            return None, None
+
+        t.ask_buttons = ask_buttons
+        await t.stop(None)
+        label = next(iter(t.background_tasks.values()))["label"]
+        assert asked == [
+            "Close topic 'work'? The session stays on disk, resumable with /cli. "
+            f"This also stops the running job ({label})."
+        ]
+        await t.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_close_in_a_claude_window_carries_no_warning(tmp_path):
+    from claude_fakes import window as claude_window
+
+    async def scenario():
+        c = TestClient(Claude(), home=str(tmp_path))
+        t = claude_window(c, tmp_path)
+        asked, run = _close_question(c, t)
+        await run
+        assert asked == ["Close this window?"]
 
     asyncio.run(scenario())

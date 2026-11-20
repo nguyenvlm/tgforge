@@ -810,6 +810,11 @@ class Topic:
         explicit rename) skips the spacing between renames."""
         self._core.refresh_title(self.window, immediate=immediate)
 
+    def close_warning(self) -> str:
+        """What closing this window also ends, added to `/close`'s question ("" for
+        nothing)."""
+        return ""
+
     # ── Lifecycle hooks (override as needed) ───────────────────────
     async def on_open(self) -> None:
         """A fresh window was just opened."""
@@ -1028,6 +1033,14 @@ class Topic:
 
 
 # ── Plugin base ─────────────────────────────────────────────────────
+
+
+def bind_store(plugin: Plugin, db: AppDB) -> None:
+    """Point a plugin at its stores in `db`: its own namespace and its shared stores
+    (the running bot and the offline CLI both bind this way)."""
+    ns = core_ns() if plugin.plugin_id == "core" else plugin_ns(plugin.plugin_id)
+    plugin.saved = db.saved(ns)
+    plugin.shared = {name: db.saved(shared_ns(name)) for name in plugin.shared_stores}
 
 
 class Plugin:
@@ -2237,6 +2250,8 @@ def build_registry(plugins: list) -> Registry:
         pid = plugin.plugin_id
         # universal commands + prefixes declared on the plugin
         for attr in dir(plugin):
+            if isinstance(getattr(type(plugin), attr, None), property):
+                continue  # a handler is a method; a property may read the unset store
             fn = getattr(plugin, attr)
             if not callable(fn):
                 continue
@@ -2419,8 +2434,9 @@ class _CorePlugin(Plugin):
         if ctx.topic is None:
             await ctx.send("run /close inside a window")
             return
+        warning = ctx.topic.close_warning()
         choice, _ = await ctx.ask_buttons(
-            "Close this window?",
+            f"Close this window?{f' {warning}' if warning else ''}",
             [("Keep (history stays)", "keep"), ("Delete", "delete")],
             timeout=60,
             announce=lambda label: f"🗂 {label}",
@@ -2512,11 +2528,9 @@ class Kernel:
         self.plugin_by_id = {p.plugin_id: p for p in self.plugins}
         self.plugin_saved = {}
         for p in self.plugins:
-            ns = core_ns() if p.plugin_id == "core" else plugin_ns(p.plugin_id)
-            p.saved = self.db.saved(ns)
+            bind_store(p, self.db)
             p.notice = self.notice_in_general
             p.peers = tuple(self.plugins)
-            p.shared = {name: self.db.saved(shared_ns(name)) for name in p.shared_stores}
             self.plugin_saved[p.plugin_id] = p.saved
         self._reconcile_task: asyncio.Task | None = None
 

@@ -8,6 +8,7 @@ import json
 import time
 
 from tgforge.plugins.claude import Claude
+from tgforge.testing import TestClient
 
 
 def _write_creds(dir_path, *, expires_at, refresh_expires_at, sub="pro"):
@@ -26,9 +27,8 @@ def _write_creds(dir_path, *, expires_at, refresh_expires_at, sub="pro"):
 
 
 def _plugin(tmp_path):
-    p = Claude()
+    p = TestClient(Claude(), home=str(tmp_path)).core.plugin_by_id["claude"]
     p.claude_dir = tmp_path / ".claude"  # siblings scanned from tmp_path
-    p.accounts = {}
     return p
 
 
@@ -59,7 +59,8 @@ def test_account_status_covers_every_state(tmp_path):
     (tmp_path / ".claude-bad" / ".credentials.json").write_text("{not json")
 
     plugin = _plugin(tmp_path)
-    plugin.accounts = {"empty": str(tmp_path / ".claude-empty")}  # a known account, creds gone
+    # a known account, creds gone
+    plugin.saved["accounts"] = {"empty": str(tmp_path / ".claude-empty")}
     rows = plugin.account_status()
 
     assert "OK" in _row(rows, "ok")["label"]

@@ -32,7 +32,6 @@ from tgforge.base.kernel import (
 from tgforge.plugins.agent import background as jobs
 from tgforge.plugins.agent.session import (
     PromptFolded,
-    Title,
     TokenTotal,
     ToolEnd,
     Usage,
@@ -76,6 +75,7 @@ QUOTA_POLL_TIMEOUT = 30.0
 # ours: how long `session/close` may take to answer before the window kills the process
 # (the captured session/new and session/load answered in 1.5-1.7 s)
 CLOSE_TIMEOUT = 5.0
+OFFERED_MODELS = "offered_models"  # the plugin-store key of the models agy lists
 QUOTA_POLL_INTERVAL = 60.0  # seconds between two `/usage` polls of one account (user-set)
 
 
@@ -103,7 +103,6 @@ class AgyTopic(AgentTopic):
         # tears down only once the exit is noticed (stdout's end)
         self.ended_proc = None
         self.transcript_offset = 0  # bytes of the transcript the backend has read
-        self.agent_title: str | None = None  # the newest title agy gave the session
         self.session_model: str | None = None  # the session's model when the window sets none
         # the session's own defaults: the `model` / `thought_level` values its first
         # session/new or session/load reply carried (kept with the session id)
@@ -150,9 +149,6 @@ class AgyTopic(AgentTopic):
         brain = src / "brain" / self.session_id
         if brain.is_dir():
             shutil.copytree(brain, dst / "brain" / self.session_id, dirs_exist_ok=True)
-
-    async def _generate_title(self) -> str | None:
-        return self.agent_title
 
     def _quota(self) -> dict | None:
         """The quota of the group naming the window's model (by its display name)."""
@@ -249,6 +245,7 @@ class AgyTopic(AgentTopic):
             **os.environ,
             "PATH": f"{Path.home()}/.local/bin:" + os.environ.get("PATH", ""),
             "TGFORGE_WINDOW": self.window,
+            "TGFORGE_PLUGIN": self.id,  # the window store's namespace: `win:<id>:<key>`
             "TGFORGE_BOT_DRIVEN": "1",
         }
         self.proc = await self.spawn(
@@ -296,6 +293,7 @@ class AgyTopic(AgentTopic):
         self.transcript_task = asyncio.create_task(self._transcript_loop())
         self._arm_heartbeat()
         LOGGER.info("agy acp spawn (%s): session %s", self.name, self.session_id)
+        self.plugin.poll_quota(self)  # the first turn shows the quota too
 
     async def _sync_options(self) -> None:
         """Bring the session's model, thought level and mode to the window's."""
@@ -431,9 +429,7 @@ class AgyTopic(AgentTopic):
             return
         if kind is ToolEnd and not self.turn_open:
             return  # a job's tool line belongs to the turn that started it
-        if kind is Title:
-            self.agent_title = event.text
-        elif kind is backend.JobEnded and not self.turn_open:
+        if kind is backend.JobEnded and not self.turn_open:
             await self.on_event(event)  # the job ended between turns: a wake turn opens
             self._drain_transcript()  # steps already written belong to the earlier turn
             self._open_next_turn()
@@ -558,13 +554,18 @@ class Agy(AgentPlugin):
         super().__init__(roots, model, models, brief, permission_mode)
         self.agy_bin = agy_bin()
         self.accounts_root = accounts_root()
-        self.offered: list[list[str]] = []  # the models agy lists for a session
         self.model_names: dict[str, str] = {}  # model option value → its display name
         # account data dir → its `/usage` quota groups; the newest poll's, kept on failure
         self.usage_groups: dict[str, list[dict]] = {}
         self.quota_polled: dict[str, float] = {}  # account → when its last poll started
         self.quota_polls: dict[str, asyncio.Task] = {}  # account → its newest poll
         self.quota_noticed: set[str] = set()  # accounts whose failing poll raised a notice
+
+    @property
+    def offered(self) -> list[list[str]]:
+        """The models agy listed for the newest session (stored, so `tgforge window`
+        checks against them too)."""
+        return self.saved.get(OFFERED_MODELS) or []
 
     def model_pool(self) -> list[list[str]]:
         return self.models or self.offered
@@ -574,17 +575,19 @@ class Agy(AgentPlugin):
         its current value."""
         for option in session.get("configOptions") or []:
             if option.get("id") == "model":
-                self.offered = [
+                offered = [
                     [o.get("name") or o["value"], o["value"]] for o in option.get("options") or []
                 ]
-                self.model_names.update({value: name for name, value in self.offered})
+                if offered != self.offered:
+                    self.saved[OFFERED_MODELS] = offered
+                self.model_names.update({value: name for name, value in offered})
                 return option.get("currentValue")
         return None
 
     # ── Quota ──────────────────────────────────────────────────────
     def poll_quota(self, topic: AgyTopic) -> None:
-        """After a turn: start a `/usage` poll of the window's account, unless one ran
-        for it within QUOTA_POLL_INTERVAL or one is still running."""
+        """When a process starts and after a turn: start a `/usage` poll of the window's
+        account, unless one ran for it within QUOTA_POLL_INTERVAL or one is running."""
         key = topic._account_key()
         now = time.monotonic()
         running = self.quota_polls.get(key)
@@ -634,6 +637,7 @@ class Agy(AgentPlugin):
             return
         self.quota_noticed.discard(key)
         self.usage_groups[key] = groups
+        LOGGER.info("agy quota poll (%s): %d group(s)", key, len(groups))
 
     # ── Accounts ───────────────────────────────────────────────────
     @property

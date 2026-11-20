@@ -44,17 +44,12 @@ LOGGER = logging.getLogger("tgforge")
 
 CONTROL_TIMEOUT = 10.0  # seconds to wait for the CLI's answer to a control request
 PROJECT_DIR_MAX = 200  # the CLI's longest project dir name kept whole
+READER_TEARDOWN_WAIT = 5.0  # seconds an ended process's reader gets to finish its teardown
 
 # Claude CLI --permission-mode values, passed on every spawn. The app default is
 # `auto` (a bot has no human to answer prompts); set it on the plugin or via /mode.
 PERMISSION_MODES = ("auto", "acceptEdits", "bypassPermissions", "dontAsk", "manual", "plan")
 DEFAULT_PERMISSION_MODE = "auto"
-
-
-def default_context_window(model: str) -> int:
-    """The context window assumed before a result reports one: 1M for a `[1m]` model
-    id, else 200k."""
-    return 1_000_000 if model.endswith("[1m]") else 200_000
 
 
 def _project_dir(config_dir: Path, workspace: Path) -> Path:
@@ -91,6 +86,7 @@ class ClaudeTopic(AgentTopic):
         super().__init__(core, window, name, saved)
         self.proc: asyncio.subprocess.Process | None = None
         self.reader_task: asyncio.Task | None = None
+        self.ended_proc = None  # the process the window ended: gone for it at once
         self.control_waiters: dict[str, asyncio.Future] = {}  # request_id → its response
         self.background_probe_at = 0.0
 
@@ -117,9 +113,6 @@ class ClaudeTopic(AgentTopic):
     def _mirror_parse(self, raw: str):
         return mirror_parse(raw)
 
-    def _default_context_window(self) -> int:
-        return default_context_window(self._model_id())
-
     def _probe_jobs(self) -> None:
         background.mark_orphans(self)
 
@@ -129,7 +122,11 @@ class ClaudeTopic(AgentTopic):
 
     # ── Backend boundary ───────────────────────────────────────────
     def backend_alive(self) -> bool:
-        return self.proc is not None and self.proc.returncode is None
+        return (
+            self.proc is not None
+            and self.proc is not self.ended_proc
+            and self.proc.returncode is None
+        )
 
     async def backend_start(self) -> None:
         await self._ensure_proc()
@@ -150,6 +147,7 @@ class ClaudeTopic(AgentTopic):
         self._respawn_idle()
 
     def backend_end(self) -> None:
+        self.ended_proc = self.proc  # gone for the window at once, before its exit is seen
         self.proc.kill()
 
     async def backend_close(self) -> None:
@@ -196,12 +194,11 @@ class ClaudeTopic(AgentTopic):
 
     # ── The CLI process ────────────────────────────────────────────
     async def _ensure_proc(self):
-        if self.proc is not None and self.proc.returncode is None:
+        if self.backend_alive():
             # reused across turns (kept alive for background tasks); _open_holder arms
             LOGGER.info("proc reuse (%s)", self.name)
             return
-        if self.reader_task is not None and not self.reader_task.done():
-            self.reader_task.cancel()
+        await self._end_reader()
         if self.heartbeat_task is not None:
             self.heartbeat_task.cancel()
         is_new = not self._jsonl().exists()
@@ -229,6 +226,7 @@ class ClaudeTopic(AgentTopic):
         cmd += ["--append-system-prompt-file", str(self._write_session_note())]
         env = self._login_env(self._session_config_dir())
         env["TGFORGE_WINDOW"] = self.window
+        env["TGFORGE_PLUGIN"] = self.id  # the window store's namespace: `win:<id>:<key>`
         env["TGFORGE_BOT_DRIVEN"] = "1"
         proc = await self.spawn(
             *cmd,
@@ -244,6 +242,19 @@ class ClaudeTopic(AgentTopic):
         self.reader_task = asyncio.create_task(self._reader())
         self._arm_heartbeat()
         LOGGER.info("proc spawn (%s): reader + heartbeat armed", self.name)
+
+    async def _end_reader(self) -> None:
+        """The old process's reader tears down before a new spawn: its teardown clears
+        the window's turn state and its process, so it never runs after the spawn."""
+        reader = self.reader_task
+        if reader is None or reader is asyncio.current_task() or reader.done():
+            return
+        if self.proc is not None and self.proc.returncode is None:
+            await self.proc.wait()  # an ended process: its exit comes at once
+        await asyncio.wait({reader}, timeout=READER_TEARDOWN_WAIT)  # its teardown whole
+        if not reader.done():  # a teardown stuck behind the lock this spawn holds
+            reader.cancel()
+            await asyncio.wait({reader})
 
     async def _write_prompt(self, prompt: str):
         # A queued write can race the reader's teardown (which closes stdin + kills the
@@ -343,22 +354,6 @@ class ClaudeTopic(AgentTopic):
         quota.update(rate_limit_windows(ev))
 
     # ── Title ──────────────────────────────────────────────────────
-    def _read_title(self) -> str | None:
-        jsonl = self._jsonl()
-        if not jsonl.exists():
-            return None
-        ai = custom = None
-        for line in jsonl.read_text().splitlines():
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "ai-title":
-                ai = ev.get("aiTitle") or ai
-            elif ev.get("type") == "custom-title":
-                custom = ev.get("customTitle") or custom
-        return custom or ai
-
     def _write_title(self, title):
         jsonl = self._jsonl()
         if not jsonl.exists():

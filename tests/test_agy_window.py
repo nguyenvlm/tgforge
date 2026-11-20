@@ -438,7 +438,8 @@ def test_a_usage_update_between_turns_opens_no_turn(tmp_path):
         await settle(c, t)
         assert not t.turn_open and len(screen(c)) == before
         assert t.context_window == 2000000
-        assert t.title == "Named by agy" and t.saved["base_name"] == "Named by agy"
+        assert t.agent_title == "Named by agy"
+        assert t.title is None and "base_name" not in t.saved  # the topic keeps its name
         await t.on_close()
 
     asyncio.run(scenario())
@@ -651,6 +652,20 @@ def test_a_message_right_after_an_idle_end_runs_in_a_fresh_process(tmp_path):
         assert not any("exited" in x for x in texts(c))
         _reply(new, 0, "prompt_reply_end_turn")
         await settle(c, t)
+        await t.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_the_first_turn_shows_the_context_percent_from_its_first_usage_update(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        await t.submit("hi", reply_to=_user(c, "hi"))
+        agent = t.agents[-1]
+        agent.send(message("usage_update", used=104858, size=1048576))
+        await settle(c, t)
+        assert " · ctx 10% (104.9k)" in t._live_view(t.turn).splitlines()[0]
         await t.on_close()
 
     asyncio.run(scenario())

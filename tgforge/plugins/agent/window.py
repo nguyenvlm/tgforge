@@ -169,6 +169,24 @@ def system_prompt_file(workspace: Path) -> Path | None:
     return None
 
 
+APP_MODELS = "app_models"  # the plugin-store key holding the app's own model list
+WINDOW_SETTINGS = ("model", "effort")  # a window's settings `tgforge window` also writes
+SETTING_ICONS = {"model": "🧠", "effort": "⚡"}
+
+
+def write_window_setting(store: SavedDict, name: str, value: str | None) -> None:
+    """Write one window setting's own key (None: the default, no key)."""
+    if value is None:
+        store.pop(name, None)
+    else:
+        store[name] = value
+
+
+def setting_note(name: str, value: str | None) -> str:
+    """The note a model or effort switch posts in its window: `🧠 model → <value>`."""
+    return f"{SETTING_ICONS[name]} {name} → {value or 'default'}"
+
+
 ROOTS_STORE = "agent"  # the shared store holding the workspace roots (`roots`)
 LEGACY_ROOTS_NS = plugin_ns("claude")  # where the roots lived before the shared store
 
@@ -230,11 +248,15 @@ class AgentTopic(Topic):
         super().__init__(core, window, name, saved)
         # persisted (window store)
         self.session_id: str | None = self._new_session_id()
-        self.model: str | None = None
-        self.effort: str | None = None
+        # the effective model and effort (read from the window store at each use) as the
+        # window last noted them in its thread and as its backend runs them; a value
+        # written from outside differs from both until the next turn
+        self.noted_settings: dict[str, str | None] = {}  # filled by on_open / on_revive
+        self.applied_settings: dict[str, str | None] = {}
         self.config_dir: str | None = None  # the account's data dir; None = the default one
         self.workspace = ""
         self.title: str | None = None  # the session name shown as the title suffix
+        self.agent_title: str | None = None  # the newest title the agent gave the session
         self.mirror_offset = -1
         self.context_window: int | None = None  # the model's, as the backend reported it
         # runtime
@@ -330,16 +352,13 @@ class AgentTopic(Topic):
         """New transcript lines → (messages, tool lines, images, whether mid-turn)."""
         raise NotImplementedError
 
-    def _read_title(self) -> str | None:
-        """The session's title as its files hold it, or None."""
-        return None
-
     def _write_title(self, title: str) -> None:
         """Record a user-given title with the session, where the CLI keeps one."""
 
     async def _generate_title(self) -> str | None:
-        """A title for the session, for `/rename` with no name."""
-        return None
+        """A title for the session, for `/rename` with no name: the newest title the
+        agent gave the session (`Title`), if any."""
+        return self.agent_title
 
     def _carry_transcript(self, old_dir: Path, new_dir: Path) -> None:
         """Copy the session's files from one account's data dir to another's."""
@@ -358,10 +377,6 @@ class AgentTopic(Topic):
     def _quota(self) -> dict | None:
         """The quota the status line shows: the account's newest one."""
         return self.plugin.quota.get(self._account_key())
-
-    def _default_context_window(self) -> int | None:
-        """The context window assumed before the backend reports one."""
-        return None
 
     def _held_jobs(self) -> list[str]:
         """The labels of the running jobs that ending this window's process would take
@@ -444,6 +459,77 @@ class AgentTopic(Topic):
         ws = self.plugin.workspaces
         return str(ws[0]) if ws else str(self._core.config.home_path)
 
+    # ── Window settings: the window store's own keys, read at each use ──
+    @property
+    def model(self) -> str | None:
+        return self.saved.get("model")
+
+    @model.setter
+    def model(self, value: str | None) -> None:
+        self._write_setting("model", value)
+
+    @property
+    def effort(self) -> str | None:
+        return self.saved.get("effort")
+
+    @effort.setter
+    def effort(self, value: str | None) -> None:
+        self._write_setting("effort", value)
+
+    def _write_setting(self, name: str, value: str | None) -> None:
+        """Write one window setting's own key (None: the default); the window's own
+        switch posts its note itself."""
+        write_window_setting(self.saved, name, value)
+        self.noted_settings[name] = self._effective_setting(name)
+
+    def _effective_setting(self, name: str) -> str | None:
+        """The model or effort the next process runs: the window's own, else the
+        plugin's default model (None: the CLI's own default)."""
+        return (self._model_id() or None) if name == "model" else self.effort
+
+    def _setting_note(self, name: str) -> str:
+        """`🧠 model → <value>`; a window on the default names the default model."""
+        value = self.saved.get(name)
+        effective = self._effective_setting(name)
+        if value is None and name == "model" and effective:
+            return f"{setting_note(name, None)} ({effective})"
+        return setting_note(name, value)
+
+    def _settings_now(self) -> dict[str, str | None]:
+        return {name: self._effective_setting(name) for name in WINDOW_SETTINGS}
+
+    async def _apply_settings(self) -> None:
+        """Bring an idle backend to the window's model and effort (after `/model`,
+        `/effort` or a write from outside); a running turn keeps its settings, so the
+        next turn applies them."""
+        if self.busy:
+            return
+        for name in WINDOW_SETTINGS:
+            value = self._effective_setting(name)
+            if name in self.applied_settings and value == self.applied_settings[name]:
+                continue
+            self.applied_settings[name] = value
+            self._save()
+            await self.backend_set_option(name, value)
+
+    async def _sync_settings(self) -> None:
+        """Before a turn: note a model or effort the window has not noted yet (written
+        by `tgforge window`, or a new plugin default model for a window on the
+        default) the way `/model` / `/effort` do, then apply it."""
+        for name in WINDOW_SETTINGS:
+            value = self._effective_setting(name)
+            if name not in self.noted_settings:  # nothing noted yet: nothing changed
+                self.noted_settings[name] = value
+            if value == self.noted_settings[name]:
+                continue
+            self.noted_settings[name] = value
+            if name == "model":
+                self.context_window = None  # the backend reports the new model's window
+            self._save()
+            note = self._setting_note(name)
+            self._send_in_order(lambda note=note: self.send(note))
+        await self._apply_settings()
+
     # ── Lifecycle ──────────────────────────────────────────────────
     async def on_open(self):
         self.workspace = self._default_workspace()
@@ -455,13 +541,19 @@ class AgentTopic(Topic):
         await self._pick_workspace()
         await self._pick_account(allow_new=False)
         await self._pick_model_effort()
+        self.noted_settings, self.applied_settings = self._settings_now(), self._settings_now()
+        self._save()
         self._start_mirror()
 
     async def on_revive(self):
         data = self.saved.get("session", {})
         self.session_id = data.get("session_id", self.session_id)
-        self.model = data.get("model")
-        self.effort = data.get("effort")
+        for name in WINDOW_SETTINGS:  # saved inside the session record before: moved once
+            if name in data and name not in self.saved:
+                write_window_setting(self.saved, name, data[name])
+        now = self._settings_now()  # a record from before noted and applied what it held
+        self.noted_settings = {**now, **data.get("noted", {})}
+        self.applied_settings = {**now, **data.get("applied", {})}
         self.config_dir = data.get("config_dir")
         self.workspace = data.get("workspace") or self._default_workspace()
         self.title = data.get("title")
@@ -470,6 +562,7 @@ class AgentTopic(Topic):
         self.mirror_holder = data.get("mirror_holder")
         self.mirror_tools = data.get("mirror_tools", 0)
         self.mirror_start = data.get("mirror_start", 0.0)
+        self._save()  # the record without the moved settings, so a reset stays reset
         self._start_mirror()
         held = self.saved.get("notices", [])
         if held:
@@ -497,10 +590,10 @@ class AgentTopic(Topic):
             "workspace": self.workspace,
             "mirror_offset": self.mirror_offset,
             **({"title": self.title} if self.title else {}),
-            **({"model": self.model} if self.model else {}),
-            **({"effort": self.effort} if self.effort else {}),
             **({"config_dir": self.config_dir} if self.config_dir else {}),
             **({"context_window": self.context_window} if self.context_window else {}),
+            "noted": self.noted_settings,
+            "applied": self.applied_settings,
             **(
                 {
                     "mirror_holder": self.mirror_holder,
@@ -675,6 +768,8 @@ class AgentTopic(Topic):
                 self.turn_open = False
                 self.pending_writes = []
             try:
+                if not self.busy:  # a running turn keeps its settings
+                    await self._sync_settings()
                 await self.backend_start()
             except Exception as exc:
                 note = f"failed to launch: {exc}"  # `exc` is unbound once the block ends
@@ -784,7 +879,7 @@ class AgentTopic(Topic):
             if background.end_job(self, ev.id, ev.mark):
                 self._ensure_background_updater()
         elif kind is Title:
-            await self._set_title(ev.text)
+            self.agent_title = ev.text  # for a bare `/rename`; the topic name stays
         elif kind is PromptFolded:
             self._fold_prompt(ev.prompt_id)
 
@@ -884,9 +979,8 @@ class AgentTopic(Topic):
 
     def _usage_parts(self, context_tokens: int) -> list[str]:
         """The context and quota parts of a status or summary line."""
-        window = self.context_window or self._default_context_window()
         parts = [
-            context_part(context_tokens, window),
+            context_part(context_tokens, self.context_window),
             quota_part(self._quota()),
         ]
         return [p for p in parts if p]
@@ -1050,7 +1144,6 @@ class AgentTopic(Topic):
                         NOTICE_NOT_DELIVERED, self.window, f"attachment {p}", error=error_text(e)
                     )
                 )
-        await self._sync_title()
         await self._settle_cancel_note()  # settle a '/cancel' bubble at the turn boundary
         self._note_transcript_offset()
         background.prune_finished(self, time.monotonic())
@@ -1146,7 +1239,6 @@ class AgentTopic(Topic):
         for media_type, b64 in images:
             self._send_in_order(lambda m=media_type, b=b64: self.send_photo(m, b))
         self._mirror_status(tools, in_flight)
-        await self._sync_title()
         return True
 
     def _mirror_status(self, tools, in_flight):
@@ -1185,18 +1277,6 @@ class AgentTopic(Topic):
             self.mirror_tools = 0
             self.mirror_recent = []
             self.mirror_tick = 0
-
-    # ── Title ──────────────────────────────────────────────────────
-    async def _sync_title(self):
-        await self._set_title(self._read_title())
-
-    async def _set_title(self, title: str | None):
-        if not title or title == self.title:
-            return
-        self.title = title
-        self.saved["base_name"] = title  # the session title becomes the topic name
-        self._save()
-        await self.refresh_title()
 
     # ── Media routing ──────────────────────────────────────────────
     def _attach_dir(self) -> Path:
@@ -1382,8 +1462,7 @@ class AgentTopic(Topic):
             return
         name = next((n for n, d in accounts.items() if d == choice), str(choice))
         self._switch_account(old_dir, Path(str(choice)), str(choice))
-        self.plugin.accounts[name] = str(choice)
-        self.plugin._save()
+        self.plugin.set_account(name, str(choice))
 
     def _switch_account(self, old_dir: Path, new_dir: Path, config_dir: str | None):
         """Point this window at another account, carrying its session files so history
@@ -1416,8 +1495,8 @@ class AgentTopic(Topic):
         self.model = None if choice == "__default__" else choice
         self.context_window = None  # the backend reports the new model's window
         self._save()
-        await self.send(f"🧠 model → {self.model or 'default'}")
-        await self.backend_set_option("model", self._model_id() or None)
+        await self.send(self._setting_note("model"))
+        await self._apply_settings()
 
     async def _pick_model_effort(self):
         if self.plugin.model_pool():  # only ask when there is a choice
@@ -1456,14 +1535,19 @@ class AgentTopic(Topic):
     @command("/stop", "close this window (session stays on disk)", icon="⏹")
     async def stop(self, ctx):
         question = f"Close topic '{self.name}'? The session stays on disk, resumable with /cli."
-        held = self._held_jobs()
-        if held:  # closing ends the process, and the process takes its jobs down
-            question += f" This also stops the running job ({', '.join(held)})."
+        warning = self.close_warning()
+        if warning:
+            question += f" {warning}"
         choice, _ = await self.ask_buttons(question, [("Yes, close", "yes")])
         if choice != "yes":
             await self.send("kept")
             return
         await self.close()
+
+    def close_warning(self) -> str:
+        """Closing ends the process, and a process holding jobs takes them down."""
+        held = self._held_jobs()
+        return f"This also stops the running job ({', '.join(held)})." if held else ""
 
     @command("/cancel", "interrupt the running turn", icon="✖️")
     async def cancel(self, ctx):
@@ -1629,9 +1713,8 @@ class AgentTopic(Topic):
         if not choice:
             return
         self.effort = None if choice == "__default__" else choice
-        self._save()
-        await self.send(f"⚡ effort → {self.effort or 'default'}")
-        await self.backend_set_option("effort", self.effort)
+        await self.send(self._setting_note("effort"))
+        await self._apply_settings()
 
     @command("/workspace", "switch, add, or remove workspace roots", icon="📁")
     async def workspace_cmd(self, ctx):
@@ -1717,14 +1800,8 @@ class AgentPlugin(Plugin):
         self._init_permission_mode = permission_mode or self.DEFAULT_PERMISSION_MODE
         self.brief = brief  # app-supplied extra guidance; None → try the bot-home file
         self.brief_resolved: str | None = None
-        self.default_model = model
-        self.permission_mode = self._init_permission_mode  # applied on every spawn
-        self.accounts: dict[str, str] = {}
-        self.models: list[list[str]] = [list(m) for m in (models or self.DEFAULT_MODELS)]
         # account data dir → its newest quota, shared by its windows
         self.quota: dict[str, dict] = {}
-        self.roots: list[str] = list(self._init_roots)
-        self.workspaces = resolve_roots(self.roots)
 
     # ── Account hooks (implemented by each backend) ────────────────
     @property
@@ -1756,27 +1833,55 @@ class AgentPlugin(Plugin):
         """The models the pickers offer: the editable list."""
         return self.models
 
-    # ── Store ──────────────────────────────────────────────────────
+    # ── Settings: read from the store at each use; an edit writes only its key ──
     def _load(self):
-        self.default_model = self.saved.get("model", self._init_model)
-        self.permission_mode = self.saved.get("permission_mode", self._init_permission_mode)
-        self.accounts = self.saved.get("accounts", {})
-        fallback = self._init_models or self.DEFAULT_MODELS
-        self.models = self.saved.get("models") or [list(m) for m in fallback]
+        """At startup: move legacy roots, and record the app's model list, which
+        `tgforge model` shows and resets to."""
         move_legacy_roots(self.shared[ROOTS_STORE])
-        self.roots = self.shared[ROOTS_STORE].get("roots") or list(self._init_roots)
-        self.workspaces = resolve_roots(self.roots)
+        self.saved[APP_MODELS] = [list(m) for m in (self._init_models or self.DEFAULT_MODELS)]
 
-    def _save(self):
-        self.saved["model"] = self.default_model
-        self.saved["permission_mode"] = self.permission_mode
-        self.saved["accounts"] = self.accounts
-        self.saved["models"] = self.models
-        self.shared[ROOTS_STORE]["roots"] = self.roots
+    @property
+    def default_model(self) -> str | None:
+        return self.saved.get("model", self._init_model)
+
+    def set_default_model(self, model: str) -> None:
+        self.saved["model"] = model
+
+    @property
+    def permission_mode(self) -> str:
+        """The mode every spawn applies."""
+        return self.saved.get("permission_mode", self._init_permission_mode)
 
     def set_permission_mode(self, mode: str) -> None:
-        self.permission_mode = mode
-        self._save()
+        self.saved["permission_mode"] = mode
+
+    @property
+    def accounts(self) -> dict[str, str]:
+        return self.saved.get("accounts", {})
+
+    def set_account(self, name: str, config_dir: str) -> None:
+        self.saved["accounts"] = {**self.accounts, name: config_dir}
+
+    @property
+    def models(self) -> list[list[str]]:
+        """The editable model list: the edited one, else the app's."""
+        return self.saved.get("models") or self.app_models()
+
+    def app_models(self) -> list[list[str]]:
+        """The app's own model list (`models=[…]`, recorded at startup for the CLI)."""
+        app = self.saved.get(APP_MODELS)
+        if app is not None:
+            return app
+        return [list(m) for m in (self._init_models or self.DEFAULT_MODELS)]
+
+    @property
+    def roots(self) -> list[str]:
+        """The workspace roots, one list for every agent plugin (the shared store)."""
+        return self.shared[ROOTS_STORE].get("roots") or list(self._init_roots)
+
+    @property
+    def workspaces(self) -> list[Path]:
+        return resolve_roots(self.roots)
 
     def _plugin_for(self, ctx) -> AgentPlugin:
         """The agent plugin a shared handler runs for: the one owning the window."""
@@ -1789,11 +1894,10 @@ class AgentPlugin(Plugin):
 
     # ── Accounts ───────────────────────────────────────────────────
     def seed_accounts(self):
-        before = dict(self.accounts)
+        known = self.accounts
         for name, d in self.scan_accounts().items():
-            self.accounts.setdefault(name, d)
-        if self.accounts != before:
-            self._save()
+            if name not in known:
+                self.set_account(name, d)
 
     async def login_new_account(self, topic):
         """Prompt for a name, then run the login flow into a fresh account dir."""
@@ -1809,15 +1913,13 @@ class AgentPlugin(Plugin):
         cfg = self.account_dir_for(name)
         if not await self._run_login(topic, name, cfg):
             return None
-        self.accounts[name] = str(cfg)
-        self._save()
+        self.set_account(name, str(cfg))
         return name, str(cfg)
 
     async def _relogin(self, ctx, name, cfg):
         if await self._run_login(ctx, name, cfg):
             if cfg != self.default_account_dir:
-                self.accounts[name] = str(cfg)
-                self._save()
+                self.set_account(name, str(cfg))
             await ctx.send(f"✅ '{name}' re-logged in")
 
     @universal("/login", "credential status; re-login any account", icon="🔑")
@@ -1866,46 +1968,42 @@ class AgentPlugin(Plugin):
 
     # ── Model-list edits (shared by the typed path + the /model menu) ─
     def add_model(self, label: str, value: str) -> None:
-        self.models.append([label, value])
-        self._save()
+        self.saved["models"] = [*self.models, [label, value]]
 
     def remove_model(self, idx: int) -> list | None:
-        if 0 <= idx < len(self.models):
-            removed = self.models.pop(idx)
-            self._save()
+        models = self.models
+        if 0 <= idx < len(models):
+            removed = models.pop(idx)
+            self.saved["models"] = models
             return removed
         return None
 
     def reset_models(self) -> None:
         """Back to the app's `models=[...]` list (the library default if none)."""
-        self.models = [list(m) for m in (self._init_models or self.DEFAULT_MODELS)]
-        self._save()
+        self.saved["models"] = self.app_models()
 
     def models_text(self) -> str:
         launch = self.topics[0]._tg_launch[0]
         lines = [f"models offered at {launch}:"]
-        lines += [f"  {i}. {label} — {value}" for i, (label, value) in enumerate(self.models, 1)]
+        default = self.default_model
+        lines += [
+            f"  {i}. {label} — {value}{' (default)' if value == default else ''}"
+            for i, (label, value) in enumerate(self.models, 1)
+        ]
         return "\n".join(lines)
 
     # ── Workspace-root edits (shared by the typed path + the menu) ─────
     def add_root(self, glob_str: str) -> int:
-        self.roots.append(glob_str)
-        self._roots_changed()
+        self.shared[ROOTS_STORE]["roots"] = [*self.roots, glob_str]
         return len(self.workspaces)
 
     def remove_root(self, idx: int) -> str | None:
-        if 0 <= idx < len(self.roots):
-            removed = self.roots.pop(idx)
-            self._roots_changed()
+        roots = self.roots
+        if 0 <= idx < len(roots):
+            removed = roots.pop(idx)
+            self.shared[ROOTS_STORE]["roots"] = roots
             return removed
         return None
-
-    def _roots_changed(self) -> None:
-        """Save the edited roots; every agent plugin of the app shows the same list."""
-        for plugin in self._agent_plugins() or [self]:
-            plugin.roots = self.roots
-            plugin.workspaces = resolve_roots(self.roots)
-        self._save()
 
     def roots_text(self) -> str:
         lines = ["workspace roots (globs):"]
@@ -1949,27 +2047,31 @@ class AgentPlugin(Plugin):
             await topic.send(self.models_text())
 
     async def _models_typed(self, ctx):
-        parts = ctx.args.split(maxsplit=1)
-        sub = parts[0].lower()
+        await ctx.send(self.edit_models(ctx.args))
+
+    def edit_models(self, args: str) -> str:
+        """`add <label>|<value>`, `rm <n or label or value>`, `reset`, else the list:
+        the typed `/model` forms and `tgforge model`; returns the reply."""
+        parts = args.split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
         rest = parts[1].strip() if len(parts) > 1 else ""
         if sub == "add" and rest:
             label, _, value = rest.partition("|")
             label, value = label.strip(), (value.strip() or label.strip())
             self.add_model(label, value)
-            await ctx.send(f"added '{label}' → {value}")
-        elif sub in ("rm", "remove", "del") and rest:
+            return f"added '{label}' → {value}"
+        if sub in ("rm", "remove", "del") and rest:
             idx = None
             if rest.isdigit():
                 idx = int(rest) - 1
             else:
                 idx = next((j for j, (la, va) in enumerate(self.models) if rest in (la, va)), None)
             removed = self.remove_model(idx) if idx is not None else None
-            await ctx.send(f"removed '{removed[0]}'" if removed else f"no model matching '{rest}'")
-        elif sub == "reset":
+            return f"removed '{removed[0]}'" if removed else f"no model matching '{rest}'"
+        if sub == "reset":
             self.reset_models()
-            await ctx.send("model list reset to defaults")
-        else:
-            await ctx.send(self.models_text())
+            return "model list reset to defaults"
+        return self.models_text()
 
     async def workspaces_cmd(self, ctx):
         parts = ctx.args.split(maxsplit=1)

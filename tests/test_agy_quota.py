@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 
-from agy_fakes import ACP, USAGE, client, settle, window
-from claude_fakes import THREAD
+from agy_fakes import ACP, SESSION, USAGE, client, session_db, settle, window
+from claude_fakes import THREAD, texts
 
 from tgforge.plugins.agent.render import quota_part
 from tgforge.plugins.agy import backend, driver
@@ -125,7 +126,7 @@ def test_the_poll_runs_at_most_once_a_minute_per_account(tmp_path, monkeypatch):
         assert len(other.usage_polls) == 1  # another account polls on its own
         monkeypatch.setattr(driver, "QUOTA_POLL_INTERVAL", 0.0)
         await _one_turn(c, t, "later")
-        assert len(t.usage_polls) == 2
+        assert len(t.usage_polls) == 3  # its spawn and its end each poll once
         await t.on_close()
         await other.on_close()
 
@@ -186,7 +187,7 @@ def test_a_running_poll_is_never_joined_by_a_second(tmp_path, monkeypatch):
         t.usage_hang.set()
         await settle(c, t)
         await _one_turn(c, t, "three")
-        assert len(t.usage_polls) == 2
+        assert len(t.usage_polls) == 3  # its spawn and its end each poll once
         await t.on_close()
 
     asyncio.run(scenario())
@@ -210,3 +211,68 @@ def test_a_hung_poll_is_stopped_and_counted_as_failed(tmp_path, monkeypatch):
         await t.on_close()
 
     asyncio.run(scenario())
+
+
+# ── a poll when the process starts ─────────────────────────────────
+
+
+def test_the_first_turns_summary_carries_the_quota_a_spawn_poll_brought(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        await t.submit("hi", reply_to=_user(c, "hi"))
+        await settle(c, t)
+        assert len(t.usage_polls) == 1 and t.turn_open  # polled at the spawn, mid-turn
+        agent = t.agents[-1]
+        agent.send({**ACP["prompt_reply_end_turn"], "id": agent.prompt_ids()[-1]})
+        await settle(c, t)
+        summary = next(x for x in texts(c) if " · ↓ " in x.splitlines()[0])
+        assert summary.splitlines()[0].endswith(" · 5h 3% · 7d 2%")
+        assert len(t.usage_polls) == 1  # the turn end within the minute starts none
+        await t.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_a_spawn_within_the_interval_starts_no_poll(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        first = window(c, tmp_path)
+        await first.submit("hi", reply_to=None)
+        await settle(c, first)
+        second = window(c, tmp_path, thread="556")  # the same account
+        await second.submit("hi", reply_to=None)
+        await settle(c, second)
+        assert len(first.usage_polls) == 1 and second.usage_polls == []
+        await first.on_close()
+        await second.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_a_revives_session_load_spawn_polls_too(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        t.session_id = SESSION
+        session_db(tmp_path)
+        await t.submit("again", reply_to=None)
+        await settle(c, t)
+        assert t.agents[-1].requests("session/load") and len(t.usage_polls) == 1
+        await t.on_close()
+
+    asyncio.run(scenario())
+
+
+def test_a_successful_poll_is_logged_with_its_account_and_group_count(tmp_path, caplog):
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        await t.submit("hi", reply_to=None)
+        await settle(c, t)
+        await t.on_close()
+        return t._account_key()
+
+    with caplog.at_level(logging.INFO, logger="tgforge"):
+        key = asyncio.run(scenario())
+    assert f"agy quota poll ({key}): 3 group(s)" in caplog.messages

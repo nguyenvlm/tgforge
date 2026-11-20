@@ -92,7 +92,7 @@ def test_one_turn_against_fake_cli(tmp_path):
         claude = core.plugin_by_id["claude"]
         claude.claude_bin = _fake_cli(tmp_path)
         claude.claude_dir = tmp_path / ".claude"
-        claude.workspaces = [tmp_path]
+        claude.add_root(str(tmp_path))
         # build a window without the interactive on_open pickers
         t = core._instantiate(ClaudeTopic, "555", "work")
         t.workspace = str(tmp_path)
