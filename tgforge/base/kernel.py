@@ -864,7 +864,7 @@ class Topic:
 
     async def download_file(self, attachment, dest):
         """Download an inbound attachment of this window to `dest` (None on failure)."""
-        return await self._tx.download_file(attachment, dest)
+        return await self._tx.download_file(self.window, attachment, dest)
 
     async def run_message_call(self, call):
         """Run `call`, a zero-arg factory of a transport call that posts or deletes a
@@ -2106,18 +2106,24 @@ class Transport:
         )
         return result is not None
 
-    async def download_file(self, attachment, dest: Path) -> Path | None:
-        """Download an inbound attachment to `dest`. Returns the path, or None on failure
-        (e.g. over the platform's download cap)."""
+    async def download_file(self, window, attachment, dest: Path) -> Path | None:
+        """Download an inbound attachment of `window` to `dest`. Returns the path, or
+        None on failure, which raises a not-delivered notice naming the platform's error
+        (a file over the download cap, a platform outage)."""
         try:
             return await self.adapter.download(attachment, dest)
         except Exception as e:
             if self.adapter.classify(e) is None:
                 raise
-            LOGGER.warning(
-                "download failed for %s (over the %dMB cap?)",
-                attachment.name or attachment.kind,
-                self.adapter.download_max // (1024 * 1024),
+            what = f"the user's attached {attachment.kind} {attachment.name or ''}".rstrip()
+            cap = self.adapter.download_max // (1024 * 1024)
+            self.on_notice(
+                Notice(
+                    NOTICE_NOT_DELIVERED,
+                    window,
+                    f"{what} (not downloaded; the download cap is {cap} MB)",
+                    error=error_text(e),
+                )
             )
             return None
 
@@ -2340,7 +2346,7 @@ class Context:
         return await self._tx.send_file(self.window, path)
 
     async def download_file(self, attachment, dest):
-        return await self._tx.download_file(attachment, dest)
+        return await self._tx.download_file(self.window, attachment, dest)
 
     async def send_photo(self, media_type, b64):
         if self.topic is not None:

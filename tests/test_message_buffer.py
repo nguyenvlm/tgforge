@@ -153,3 +153,26 @@ async def test_each_message_keeps_its_own_context_note(topic):
     assert prompt == (
         "[Forwarded message from Bob]\n\nfrom bob\n\n[Forwarded message from Carol]\n\nfrom carol"
     )
+
+
+def test_a_failed_download_tells_the_window_with_the_platforms_error(tmp_path):
+    """A photo Telegram cannot hand over (a Bad Gateway during an outage) raises a
+    not-delivered notice naming the error, so the window's agent can say so."""
+    from aiogram.exceptions import TelegramServerError
+
+    async def scenario():
+        c = client(tmp_path)
+        t = window(c, tmp_path)
+        tx = t._tx
+
+        async def download(attachment, dest):
+            raise TelegramServerError(method=None, message="Bad Gateway")
+
+        tx.adapter.download = download
+        attachment = SimpleNamespace(kind="photo", name=None)
+        assert await t.download_file(attachment, tmp_path / "p.jpg") is None
+        block = t._take_notice_block()
+        assert "not delivered" in block and "attached photo" in block
+        assert "Bad Gateway" in block
+
+    asyncio.run(scenario())
