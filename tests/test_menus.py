@@ -6,14 +6,14 @@ from __future__ import annotations
 
 import asyncio
 
+from tgforge.plugins.agent.window import ROOTS_STORE, SESSION_BRIEF
 from tgforge.plugins.claude import Claude, ClaudeTopic
-from tgforge.plugins.claude.driver import SESSION_BRIEF
 from tgforge.testing import TestClient
 
 
 def _topic(client, workspaces):
     claude = client.core.plugin_by_id["claude"]
-    claude.workspaces = list(workspaces)
+    claude.shared[ROOTS_STORE]["roots"] = [str(w) for w in workspaces]
     t = client.core._instantiate(ClaudeTopic, "555", "work")
     t.workspace = str(workspaces[0]) if workspaces else ""
     t._save()

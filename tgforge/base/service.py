@@ -5,9 +5,12 @@ restart from inside a bot-driven turn would deadlock against the graceful drain)
 Two backends, picked by platform: systemd --user on Linux, launchd LaunchAgent on
 macOS. Both grant the main process a drain window on stop (systemd
 KillMode=mixed + TimeoutStopSec, launchd ExitTimeOut) and both wait, before even
-issuing the restart, while any bot-driven `claude` is still alive — a live turn, a
-/compact, or a subagent, in any window — so a restart never interrupts another
-window's in-flight work. The wait is bounded (a 60-min cap), then it restarts anyway.
+issuing the restart, while any bot-driven agent CLI process (`claude` or `agy`) is
+still alive in any window — a live turn, a /compact, a subagent, or a CLI kept alive
+between turns for its background job (so a job whose CLI still runs does hold it) — so
+a restart never interrupts another window's in-flight work. A job whose CLI has ended
+(it runs on, its CLI gone) does not hold it. The wait is bounded (a 60-min cap), then it
+restarts anyway.
 """
 
 from __future__ import annotations
@@ -133,17 +136,21 @@ def service_active(service: str) -> bool:
     return r.stdout.strip() == "active"
 
 
-# Wait while any bot-driven claude is alive, then restart — a live turn, a /compact,
-# or a subagent, in ANY window — so a restart never interrupts another window's work.
+# Wait while any bot-driven agent CLI process (`claude` or `agy`) is alive, then restart
+# — a live turn, a /compact, a subagent, or a CLI kept alive for its background job, in
+# ANY window — so a restart never interrupts another window's work; a job whose CLI has
+# ended (a long run left behind, a wake loop) never holds it.
 # The scope is the bot's process subtree: on Linux that's exactly the unit's cgroup;
-# on macOS there is no cgroup, so each claude's parent chain is walked up to the bot.
+# on macOS there is no cgroup, so each CLI's parent chain is walked up to the bot.
 _LINUX_RESTART = """
 cgroup="$(systemctl --user show {service} -p ControlGroup --value)"
 cgroup_file="/sys/fs/cgroup$cgroup/cgroup.procs"
 for _ in $(seq 1 720); do
     busy=0
     for pid in $(cat "$cgroup_file" 2>/dev/null); do
-        if [ "$(cat /proc/$pid/comm 2>/dev/null)" = claude ]; then busy=1; break; fi
+        comm="$(cat /proc/$pid/comm 2>/dev/null)"
+        if [ "$comm" = claude ]; then busy=1; break; fi
+        if [ "$comm" = agy ]; then busy=1; break; fi
     done
     [ "$busy" -eq 0 ] && break
     sleep 5
@@ -169,7 +176,7 @@ descends_from_bot() {{
 for _ in $(seq 1 720); do
     [ -z "$bot" ] && break
     busy=0
-    for pid in $(pgrep -x claude 2>/dev/null); do
+    for pid in $(pgrep -x 'claude|agy' 2>/dev/null); do
         if descends_from_bot "$pid"; then busy=1; break; fi
     done
     [ "$busy" -eq 0 ] && break

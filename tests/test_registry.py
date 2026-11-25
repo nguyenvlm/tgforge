@@ -18,6 +18,9 @@ from tgforge.base.kernel import (
     prefix,
     universal,
 )
+from tgforge.plugins.agy import Agy
+from tgforge.plugins.claude import Claude
+from tgforge.testing import TestClient
 
 
 @launch("/shell", "open a shell")
@@ -125,3 +128,36 @@ def test_extend_merges_commands():
 
     reg = build_registry([P()])
     assert reg.classes["etopic"].commands["/rec"][0] == "rec"
+
+
+def test_each_window_reads_its_own_agent_in_the_command_help(tmp_path):
+    c = TestClient(Claude(), Agy(), home=str(tmp_path))
+    claude = c.core.registry.classes["claude"].commands
+    agy = c.core.registry.classes["agy"].commands
+    assert claude["/account"][1] == "switch this topic's Claude account"
+    assert claude["/mode"][1] == "set the Claude permission mode (app-wide)"
+    assert agy["/account"][1] == "switch this topic's agy account"
+    assert agy["/mode"][1] == "set the agy permission mode (app-wide)"
+    assert claude["/clear"][1] == agy["/clear"][1]  # a text with no field, unchanged
+
+
+@launch("/braces", "a window whose help fills a field and quotes braces")
+class _BracesTopic(Topic):
+    id = "braces"
+    help_fields = {"agent": "demo"}
+
+    @command("/show", 'show {agent} as JSON, e.g. {"k": 1}')
+    async def show(self, ctx):
+        pass
+
+
+class _Braces(Plugin):
+    id = "braces"
+    topics = [_BracesTopic]
+
+
+def test_a_help_text_with_literal_braces_fills_only_its_fields(tmp_path):
+    c = TestClient(_Braces(), home=str(tmp_path))
+    assert c.core.registry.classes["braces"].commands["/show"][1] == (
+        'show demo as JSON, e.g. {"k": 1}'
+    )

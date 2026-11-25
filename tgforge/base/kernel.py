@@ -357,16 +357,9 @@ def _job_tree(path: str) -> set[int] | None:
     # a holder that leads its session (the job's shell) brings the whole session; a
     # reader in someone else's session (a `tail -f` in a terminal) brings only itself
     sessions = {pid for pid in holders if pid in table and table[pid][2] == pid}
-    tree = holders | {pid for pid, (_, _, sid) in table.items() if sid in sessions}
-    children: dict[int, list[int]] = {}
-    for pid, (ppid, _, _) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    stack = list(tree)
-    while stack:
-        for child in children.get(stack.pop(), []):
-            if child not in tree:
-                tree.add(child)
-                stack.append(child)
+    tree = process_tree(
+        holders | {pid for pid, (_, _, sid) in table.items() if sid in sessions}, table
+    )
     own = (os.getpid(), os.getpgrp(), os.getsid(0))
     hits = sorted(
         pid
@@ -378,15 +371,58 @@ def _job_tree(path: str) -> set[int] | None:
     return tree
 
 
+def command_processes(root: int, command: str) -> list[int] | None:
+    """The descendants of `root` running `command`: one of their arguments is exactly
+    it (a shell's `-c` script). None where there is no probe (Linux only)."""
+    if not IS_LINUX:
+        return None
+
+    def argv(pid: int) -> list[str]:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return []  # the process exited mid-scan
+        return raw.decode(errors="replace").split("\0")
+
+    return matching_descendants(_process_table(), argv, root, command)
+
+
+def matching_descendants(table: dict, argv, root: int, command: str) -> list[int]:
+    """The pids under `root` in `table` (pid → (ppid, pgid, sid)) one of whose
+    arguments (`argv(pid)`) is exactly `command`, sorted."""
+    return sorted(pid for pid in process_tree({root}, table) - {root} if command in argv(pid))
+
+
+def process_tree(roots: set[int], table: dict | None = None) -> set[int]:
+    """`roots` and all their live descendants (`table`: pid → (ppid, pgid, sid), read
+    from /proc when not given) — the one descendant walk."""
+    children: dict[int, list[int]] = {}
+    for child, (ppid, _, _) in (table if table is not None else _process_table()).items():
+        children.setdefault(ppid, []).append(child)
+    tree, stack = set(roots), list(roots)
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in tree:
+                tree.add(child)
+                stack.append(child)
+    return tree
+
+
 async def kill_file_holders(path: str, grace: float = 2.0) -> int | None:
     """Stop the job writing `path` (see `_job_tree`): SIGTERM the whole tree, then
     SIGKILL whatever outlives `grace` seconds. Returns how many processes were
     signalled, or None where there is no probe."""
-    import signal
-
     tree = _job_tree(path)
     if tree is None:
         return None
+    return await kill_processes(tree, grace)
+
+
+async def kill_processes(tree: set[int], grace: float = 2.0) -> int:
+    """SIGTERM every process of `tree`, then SIGKILL whatever outlives `grace`
+    seconds; returns how many were signalled."""
+    import signal
+
     for pid in tree:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGTERM)
@@ -452,6 +488,11 @@ def plugin_ns(plugin_id: str) -> str:
     return f"plugin:{plugin_id}"
 
 
+def shared_ns(name: str) -> str:
+    """A store several plugins share (declared in `Plugin.shared_stores`)."""
+    return f"shared:{name}"
+
+
 def window_ns(class_id: str, window: str) -> str:
     return f"win:{class_id}:{window}"
 
@@ -486,6 +527,17 @@ class SavedDict:
     def __delitem__(self, key: str) -> None:
         self._db.conn.execute("DELETE FROM store WHERE namespace = ? AND key = ?", (self._ns, key))
         self._db.conn.commit()
+
+    def move_from(self, namespace: str, key: str) -> None:
+        """Move `key` from another namespace of the same file into this one, deleting it
+        there; a key this namespace already holds wins (the old one is still deleted)."""
+        old = SavedDict(self._db, namespace)
+        value = old.get(key, _MISSING)
+        if value is _MISSING:
+            return
+        if self.get(key, _MISSING) is _MISSING:
+            self[key] = value
+        del old[key]
 
     def pop(self, key: str, default=_MISSING):
         val = self.get(key, _MISSING)
@@ -691,6 +743,9 @@ class Topic:
     slash_commands: bool = True  # False → slashes are raw input (a shell), not commands
     icon: str = ""  # optional glyph for menus/titles (the class owns its own look)
     menu_label: str = ""  # optional display name in the launcher menu (else id.title())
+    # fills `{name}` fields in this class's `@command` help texts (a command a base class
+    # defines reads per subclass); empty: the help texts are taken as written
+    help_fields: dict[str, str] = {}
 
     def command_allowed(self, kind: str, name: str) -> bool:
         """Whether a command may appear and run in this window — the plugin's full say
@@ -755,6 +810,11 @@ class Topic:
         explicit rename) skips the spacing between renames."""
         self._core.refresh_title(self.window, immediate=immediate)
 
+    def close_warning(self) -> str:
+        """What closing this window also ends, added to `/close`'s question ("" for
+        nothing)."""
+        return ""
+
     # ── Lifecycle hooks (override as needed) ───────────────────────
     async def on_open(self) -> None:
         """A fresh window was just opened."""
@@ -804,7 +864,7 @@ class Topic:
 
     async def download_file(self, attachment, dest):
         """Download an inbound attachment of this window to `dest` (None on failure)."""
-        return await self._tx.download_file(attachment, dest)
+        return await self._tx.download_file(self.window, attachment, dest)
 
     async def run_message_call(self, call):
         """Run `call`, a zero-arg factory of a transport call that posts or deletes a
@@ -975,6 +1035,14 @@ class Topic:
 # ── Plugin base ─────────────────────────────────────────────────────
 
 
+def bind_store(plugin: Plugin, db: AppDB) -> None:
+    """Point a plugin at its stores in `db`: its own namespace and its shared stores
+    (the running bot and the offline CLI both bind this way)."""
+    ns = core_ns() if plugin.plugin_id == "core" else plugin_ns(plugin.plugin_id)
+    plugin.saved = db.saved(ns)
+    plugin.shared = {name: db.saved(shared_ns(name)) for name in plugin.shared_stores}
+
+
 class Plugin:
     id: str = ""  # store namespace; defaults to the lowercased class name
     topics: list[type[Topic]] = []
@@ -982,6 +1050,9 @@ class Plugin:
     #: set by the core at registration
     saved: SavedDict
     notice: Callable[[Notice], None]  # raise a bot notice; one with no window goes to General
+    peers: tuple = ()  # every plugin the app includes, this one too, in include order
+    shared_stores: tuple[str, ...] = ()  # the shared stores this plugin reads and writes
+    shared: dict[str, SavedDict] = {}  # set by the core: each of `shared_stores`, by name
 
     @property
     def plugin_id(self) -> str:
@@ -2035,18 +2106,24 @@ class Transport:
         )
         return result is not None
 
-    async def download_file(self, attachment, dest: Path) -> Path | None:
-        """Download an inbound attachment to `dest`. Returns the path, or None on failure
-        (e.g. over the platform's download cap)."""
+    async def download_file(self, window, attachment, dest: Path) -> Path | None:
+        """Download an inbound attachment of `window` to `dest`. Returns the path, or
+        None on failure, which raises a not-delivered notice naming the platform's error
+        (a file over the download cap, a platform outage)."""
         try:
             return await self.adapter.download(attachment, dest)
         except Exception as e:
             if self.adapter.classify(e) is None:
                 raise
-            LOGGER.warning(
-                "download failed for %s (over the %dMB cap?)",
-                attachment.name or attachment.kind,
-                self.adapter.download_max // (1024 * 1024),
+            what = f"the user's attached {attachment.kind} {attachment.name or ''}".rstrip()
+            cap = self.adapter.download_max // (1024 * 1024)
+            self.on_notice(
+                Notice(
+                    NOTICE_NOT_DELIVERED,
+                    window,
+                    f"{what} (not downloaded; the download cap is {cap} MB)",
+                    error=error_text(e),
+                )
             )
             return None
 
@@ -2106,6 +2183,8 @@ class Registry:
     classes: dict[str, ClassEntry] = field(default_factory=dict)  # class id -> entry
     launch_class: dict[str, type] = field(default_factory=dict)  # launch name -> Topic class
     services: dict[str, tuple] = field(default_factory=dict)  # service name -> (plugin_id, attr)
+    # the universal / prefix / service functions registered, for `_shared_handler`
+    shared_handlers: set = field(default_factory=set)
 
     def resolve_universal(self, cmd: str) -> str | None:
         if cmd in self.universals:
@@ -2137,6 +2216,8 @@ def _scan_class(cls: type, plugin_id: str) -> ClassEntry:
             continue
         if hasattr(fn, "_tg_command"):
             name, help, icon, inline, aliases = fn._tg_command
+            for field, value in cls.help_fields.items():  # a base class's command reads
+                help = help.replace("{" + field + "}", value)  # per subclass; other braces stay
             for n in (name, *aliases):
                 if n in entry.commands or n in entry.command_aliases:
                     raise RegistryConflict(f"command {n!r} defined twice in class {cls.id!r}")
@@ -2152,6 +2233,21 @@ def _scan_class(cls: type, plugin_id: str) -> ClassEntry:
     return entry
 
 
+def _shared_handler(reg: Registry, attr: str, fn) -> bool:
+    """Whether `fn` is a universal, prefix or service handler an earlier plugin already
+    registered from the same base-class function (two plugins sharing a base class, each
+    included). Its first registration serves them all; the handler finds the plugin a
+    call is for itself. Marks the function registered otherwise."""
+    markers = ("_tg_universal", "_tg_prefix", "_tg_service")
+    if not any(hasattr(fn, m) for m in markers):
+        return False
+    func = getattr(fn, "__func__", fn)
+    if func in reg.shared_handlers:
+        return True
+    reg.shared_handlers.add(func)
+    return False
+
+
 def build_registry(plugins: list) -> Registry:
     """Build the tables from constructed plugin instances (each with `plugin_id`
     and `topics`). Raises RegistryConflict on any clash."""
@@ -2160,9 +2256,13 @@ def build_registry(plugins: list) -> Registry:
         pid = plugin.plugin_id
         # universal commands + prefixes declared on the plugin
         for attr in dir(plugin):
+            if isinstance(getattr(type(plugin), attr, None), property):
+                continue  # a handler is a method; a property may read the unset store
             fn = getattr(plugin, attr)
             if not callable(fn):
                 continue
+            if _shared_handler(reg, attr, fn):
+                continue  # another plugin registered this inherited handler already
             if hasattr(fn, "_tg_universal"):
                 name, help, icon, menu, inline, aliases = fn._tg_universal
                 reg._claim_universal_name(name, f"universal in {pid}")
@@ -2246,7 +2346,7 @@ class Context:
         return await self._tx.send_file(self.window, path)
 
     async def download_file(self, attachment, dest):
-        return await self._tx.download_file(attachment, dest)
+        return await self._tx.download_file(self.window, attachment, dest)
 
     async def send_photo(self, media_type, b64):
         if self.topic is not None:
@@ -2340,8 +2440,9 @@ class _CorePlugin(Plugin):
         if ctx.topic is None:
             await ctx.send("run /close inside a window")
             return
+        warning = ctx.topic.close_warning()
         choice, _ = await ctx.ask_buttons(
-            "Close this window?",
+            f"Close this window?{f' {warning}' if warning else ''}",
             [("Keep (history stays)", "keep"), ("Delete", "delete")],
             timeout=60,
             announce=lambda label: f"🗂 {label}",
@@ -2433,9 +2534,9 @@ class Kernel:
         self.plugin_by_id = {p.plugin_id: p for p in self.plugins}
         self.plugin_saved = {}
         for p in self.plugins:
-            ns = core_ns() if p.plugin_id == "core" else plugin_ns(p.plugin_id)
-            p.saved = self.db.saved(ns)
+            bind_store(p, self.db)
             p.notice = self.notice_in_general
+            p.peers = tuple(self.plugins)
             self.plugin_saved[p.plugin_id] = p.saved
         self._reconcile_task: asyncio.Task | None = None
 

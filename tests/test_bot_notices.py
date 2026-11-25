@@ -21,8 +21,9 @@ from tgforge.base.kernel import (
     launch,
     on_message,
 )
-from tgforge.plugins.claude import driver as drv
-from tgforge.plugins.claude.driver import SESSION_BRIEF, ClaudeTopic
+from tgforge.plugins.agent import window as drv
+from tgforge.plugins.agent.window import SESSION_BRIEF
+from tgforge.plugins.claude.driver import ClaudeTopic
 from tgforge.plugins.shell import Shell, ShellTopic
 from tgforge.testing import MockBot, TestClient, telegram_transport
 

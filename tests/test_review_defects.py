@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from claude_fakes import THREAD, client, window
 
-from tgforge.plugins.claude.config import write_roots
+from tgforge.plugins.agent.window import ROOTS_STORE, write_roots
 from tgforge.plugins.gcloud import Gcloud
 from tgforge.plugins.shell import Shell, ShellTopic
 from tgforge.testing import TestClient
@@ -46,7 +46,7 @@ def test_a_workspace_switch_drops_a_live_idle_cli_process(tmp_path):
         a, b = tmp_path / "a", tmp_path / "b"
         a.mkdir()
         b.mkdir()
-        c.core.plugin_by_id["claude"].workspaces = [a, b]
+        c.core.plugin_by_id["claude"].shared[ROOTS_STORE]["roots"] = [str(a), str(b)]
         t = window(c, tmp_path)
         t.workspace = str(a)
         killed = _idle_proc(t)

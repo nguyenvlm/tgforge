@@ -7,7 +7,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from tgforge.plugins.claude import ClaudeTopic, background
+from tgforge.plugins.agent import background
+from tgforge.plugins.agent import window as agent_window
+from tgforge.plugins.claude import ClaudeTopic
 from tgforge.plugins.claude import driver as driver_module
 from tgforge.testing import TestClient
 
@@ -215,6 +217,7 @@ def test_kill_mid_turn_keeps_the_card_below_the_note(tmp_path, monkeypatch):
         assert t.turn_seq == seq and len(t.pending_writes) == 1  # turn bookkeeping untouched
         _respond(t, t.proc.stdin.writes[0][1])
         await task
+        card = t.turn.card_id  # the live card, re-sent below the note; message 1 at settle
 
         await t._finalize_turn("all done")
         await drain(c, t)
@@ -222,8 +225,9 @@ def test_kill_mid_turn_keeps_the_card_below_the_note(tmp_path, monkeypatch):
         ids = [mid for mid, _text in shown]
         note_id = next(mid for mid, text in shown if text == "stopping tests…")
         answer_id = next(mid for mid, text in shown if text == "all done")
-        panel_id = t.bottom_frame_id(driver_module.PANEL_FRAME)
+        panel_id = t.bottom_frame_id(agent_window.PANEL_FRAME)
         assert ids.index(note_id) < ids.index(answer_id)  # the reply stays below the note
+        assert ids.index(note_id) < ids.index(card)  # the tool-summary message 1 too
         assert ids[-1] == panel_id  # the job panel sits below the turn
 
     asyncio.run(scenario())

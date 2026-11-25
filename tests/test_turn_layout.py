@@ -28,8 +28,8 @@ from claude_fakes import (
 
 from tgforge.base.telegram import RichMessage, rich_fits
 from tgforge.base.ui import MAX_MSG
-from tgforge.plugins.claude import background
-from tgforge.plugins.claude.render import tool_line
+from tgforge.plugins.agent import background
+from tgforge.plugins.agent.render import tool_line
 
 
 class _Flood(TelegramRetryAfter):
@@ -398,7 +398,7 @@ def test_the_next_turn_card_waits_for_the_previous_settle(tmp_path):
 
 def test_the_heartbeat_never_paints_a_closed_turns_card(tmp_path, monkeypatch):
     async def scenario():
-        from tgforge.plugins.claude import driver as drv
+        from tgforge.plugins.agent import window as drv
 
         monkeypatch.setattr(drv, "EDIT_INTERVAL", 0.01)
         c = client(tmp_path)

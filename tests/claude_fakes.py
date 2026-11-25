@@ -47,11 +47,19 @@ class FakeStdout:
 
     async def __anext__(self):
         while self._lines and isinstance(self._lines[0], asyncio.Event):
-            await self._lines.pop(0).wait()
+            self._waiting = self._lines.pop(0)
+            await self._waiting.wait()
         if not self._lines:
             raise StopAsyncIteration
         self.consumed += 1
         return self._lines.pop(0)
+
+    def close(self):
+        """A killed CLI's output ends: the stream stops at once."""
+        self._lines = []
+        waiting = getattr(self, "_waiting", None)
+        if waiting is not None:
+            waiting.set()
 
 
 class FakeProc:
@@ -62,6 +70,7 @@ class FakeProc:
 
     def kill(self):
         self.returncode = -9
+        self.stdout.close()
 
 
 def line(ev: dict) -> bytes:

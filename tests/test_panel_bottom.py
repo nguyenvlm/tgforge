@@ -11,8 +11,8 @@ import time
 from aiogram.exceptions import TelegramRetryAfter
 from claude_fakes import FakeProc, cancel_task, client, drain, result, screen, window
 
-from tgforge.plugins.claude import background
-from tgforge.plugins.claude import driver as drv
+from tgforge.plugins.agent import background
+from tgforge.plugins.agent import window as drv
 
 
 class _Flood(TelegramRetryAfter):

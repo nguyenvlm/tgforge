@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
-from tgforge.plugins.claude import background
+from tgforge.plugins.agent import background
 
 
 def _session(tmp_path, finished_ago):

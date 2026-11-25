@@ -71,10 +71,14 @@ def test_scan_register_then_done():
 
 
 def test_bg_panel_none_when_empty():
+    from tgforge.plugins.agent import background
+
     assert background.panel(_session()) is None
 
 
 def test_bg_panel_renders_rows(tmp_path):
+    from tgforge.plugins.agent import background
+
     out = tmp_path / "bid.output"
     out.write_text("line one\nfinal line\n")
     s = _session()

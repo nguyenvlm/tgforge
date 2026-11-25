@@ -9,9 +9,9 @@ import copy
 
 from claude_fakes import FakeProc, client, drain, fixture_events, line, result, texts, window
 
-from tgforge.plugins.claude.events import rate_limit_windows, result_context_window
-from tgforge.plugins.claude.render import quota_part
-from tgforge.plugins.claude.session import TurnState, apply_event
+from tgforge.plugins.agent.render import quota_part
+from tgforge.plugins.agent.session import TurnState
+from tgforge.plugins.claude.events import apply_event, rate_limit_windows, result_context_window
 
 
 def _message_start(input_tokens, created, read, parent=None):
@@ -110,13 +110,13 @@ def test_the_summary_line_carries_context_and_quota(tmp_path):
     asyncio.run(scenario())
 
 
-def test_a_1m_model_assumes_a_1m_window_before_any_result(tmp_path):
+def test_no_window_is_guessed_before_a_result_reports_one(tmp_path):
     async def scenario():
         c = client(tmp_path)
         t = _usage_window(c, tmp_path, model="claude-opus-x[1m]")
-        assert t._usage_parts(100_000) == ["ctx 10% (100.0k)"]
+        assert t._usage_parts(100_000) == ["ctx ??% (100.0k)"]
         t.model = "claude-sonnet-x"
-        assert t._usage_parts(100_000) == ["ctx 50% (100.0k)"]
+        assert t._usage_parts(100_000) == ["ctx ??% (100.0k)"]
 
     asyncio.run(scenario())
 
@@ -125,6 +125,7 @@ def test_the_live_status_line_carries_context_and_quota(tmp_path):
     async def scenario():
         c = client(tmp_path)
         t = _usage_window(c, tmp_path)
+        t.context_window = 200_000  # an earlier result reported it
         t._open_holder()
         events = fixture_events()
         apply_event(t.turn, events["message_start"])
@@ -164,5 +165,57 @@ def test_no_separate_quota_alert_message_is_sent(tmp_path):
         await drain(c, t)
         assert not any("quota" in text for text in texts(c))
         assert "5h 97%" in texts(c)[0]
+
+    asyncio.run(scenario())
+
+
+def _live_head(t) -> str:
+    return t._live_view(t.turn).splitlines()[0]
+
+
+def test_the_live_card_reads_unknown_until_a_result_reports_the_window(tmp_path):
+    """No guessed window: `ctx ??%` on the first turn's card, the result's window from
+    then on, `??%` again after a model switch until the next result."""
+
+    async def scenario():
+        c = client(tmp_path)
+        t = _usage_window(c, tmp_path, model="claude-opus-5-5")
+        t._open_holder()
+        await drain(c, t)
+        events = fixture_events()
+        apply_event(t.turn, events["message_start"])
+        assert " · ctx ??% (41.4k)" in _live_head(t)
+        t.proc = FakeProc([line(events["result"])])
+        t.pending_writes = []
+        await asyncio.wait_for(t._reader(), 5)
+        await drain(c, t)
+        t._open_holder()
+        apply_event(t.turn, events["message_start"])
+        assert " · ctx 21% (41.4k)" in _live_head(t)  # the next turn: the reported window
+
+        async def menu(title, options):
+            return "__default__"
+
+        t.menu = menu
+        await t._switch_model()
+        assert " · ctx ??% (41.4k)" in _live_head(t)
+
+    asyncio.run(scenario())
+
+
+def test_a_summary_with_no_reported_window_reads_unknown(tmp_path):
+    async def scenario():
+        c = client(tmp_path)
+        t = _usage_window(c, tmp_path)
+        t._open_holder()
+        await drain(c, t)
+        events = fixture_events()
+        no_window = {k: v for k, v in events["result"].items() if k != "modelUsage"}
+        t.proc = FakeProc([line(events["message_start"]), line(no_window)])
+        t.pending_writes = []
+        await asyncio.wait_for(t._reader(), 5)
+        await drain(c, t)
+        summary = texts(c)[0].replace("\\", "").splitlines()[0]
+        assert summary.endswith(" · ctx ??% (41.4k)")
 
     asyncio.run(scenario())

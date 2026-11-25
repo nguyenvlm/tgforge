@@ -208,10 +208,10 @@ def main() -> None:
 
     from tgforge.base.kernel import IS_MACOS
     from tgforge.base.service import install_unit, service_active
-    from tgforge.plugins.claude import config as claude_config
+    from tgforge.plugins.agent.window import write_roots
     from tgforge.plugins.claude import setup
 
-    claude_config.write_roots(home, workspaces)
+    write_roots(home, workspaces)
     print(f"   ✓ configured {len(workspaces)} workspace root(s)")
     setup.install_claude_as()
     setup.install_shell_wrapper()

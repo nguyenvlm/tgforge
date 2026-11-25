@@ -25,7 +25,7 @@ from pathlib import Path
 
 from tgforge.base import ui
 from tgforge.base.kernel import Plugin, Topic, action, launch, on_message, pid_cwd, reap
-from tgforge.plugins.claude.config import read_roots, resolve_roots
+from tgforge.plugins.agent.window import AgentPlugin, read_roots, resolve_roots
 
 # ── PtyWindow: a Topic backed by a PTY-hosted child ────────────────
 # Owns the spawn / non-blocking read / write / reap plumbing. The child is reaped in
@@ -349,11 +349,11 @@ class Shell(Plugin):
         self._roots = list(roots) if roots else []
 
     def workspace_roots(self, core) -> list[Path]:
-        """The agent's workspace roots: the live claude plugin's (saved edits or its
-        `Claude(roots=[...])`), else the ones the install wizard / `tgforge workspaces`
-        saved in the bot home's state.db, else the roots this plugin was built with;
-        empty means the window falls back to home."""
-        agent = core.plugin_by_id.get("claude")
+        """The agent's workspace roots: the live agent plugins' (saved edits or their
+        `roots=[...]`), else the ones the install wizard / `tgforge workspaces` saved in
+        the bot home's state.db, else the roots this plugin was built with; empty means
+        the window falls back to home."""
+        agent = next((p for p in core.plugins if isinstance(p, AgentPlugin)), None)
         if agent is not None and agent.workspaces:
             return list(agent.workspaces)
         return resolve_roots(read_roots(core.config.home_path) or self._roots)

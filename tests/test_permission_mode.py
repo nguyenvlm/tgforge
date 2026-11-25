@@ -21,12 +21,16 @@ print(json.dumps({"type": "result", "result": "ok",
 """
 
 
-def test_default_is_auto():
-    assert Claude().permission_mode == "auto"
+def _stored(plugin, tmp_path):
+    return TestClient(plugin, home=str(tmp_path)).core.plugin_by_id["claude"]
 
 
-def test_constructor_override():
-    assert Claude(permission_mode="plan").permission_mode == "plan"
+def test_default_is_auto(tmp_path):
+    assert _stored(Claude(), tmp_path).permission_mode == "auto"
+
+
+def test_constructor_override(tmp_path):
+    assert _stored(Claude(permission_mode="plan"), tmp_path).permission_mode == "plan"
 
 
 def test_set_persists_and_reloads(tmp_path):
@@ -34,8 +38,7 @@ def test_set_persists_and_reloads(tmp_path):
     plugin = c.core.plugin_by_id["claude"]
     plugin.set_permission_mode("bypassPermissions")
     assert plugin.saved["permission_mode"] == "bypassPermissions"
-    plugin.permission_mode = "auto"  # scramble in-memory
-    plugin._load()  # a fresh load restores the saved value
+    plugin._load()  # a fresh load keeps the saved value
     assert plugin.permission_mode == "bypassPermissions"
 
 
