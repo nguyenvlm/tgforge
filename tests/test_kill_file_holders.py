@@ -12,8 +12,10 @@ import time
 from pathlib import Path
 
 import pytest
+from agy_fakes import AGY_PID, ARGV, BASH_PID, EXE_PID, JOB_COMMAND, PS_TABLE, SLEEP_PID, TABLE
 
 import tgforge.base.kernel as kernel
+from tgforge.base.kernel import matching_descendants, process_tree
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc probe")
 
@@ -189,3 +191,33 @@ def test_no_probe_off_linux(monkeypatch):
     monkeypatch.setattr(kernel, "IS_LINUX", False)
     assert kernel.file_holders("/x") is None
     assert asyncio.run(kernel.kill_file_holders("/x")) is None
+
+
+def test_process_tree_walks_from_a_set_of_roots():
+    assert process_tree({BASH_PID}, TABLE) == {BASH_PID, SLEEP_PID}
+    assert process_tree({EXE_PID, 99}, TABLE) == {EXE_PID, BASH_PID, SLEEP_PID, 99}
+    assert matching_descendants(TABLE, ARGV.get, AGY_PID, JOB_COMMAND) == [BASH_PID]
+
+
+def _table(rows):
+    return {r["pid"]: (r["ppid"], r["pid"], r["pid"]) for r in rows}
+
+
+def test_kill_matches_the_bash_running_the_command_line_and_takes_its_tree():
+    """`agy acp` → `exe` (the agy binary) → `bash -c <CommandLine>` → the command: the
+    match is the bash whose argument is exactly the CommandLine; its tree is it and
+    its child."""
+    agy, exe, bash, sleep = (r["pid"] for r in PS_TABLE)
+    argv = {r["pid"]: r["argv"] for r in PS_TABLE}
+    table = _table(PS_TABLE)
+    command = argv[bash][2]
+    assert command == "sleep 20; echo bg-a"
+    assert matching_descendants(table, argv.get, agy, command) == [bash]
+    assert matching_descendants(table, argv.get, agy, "sleep 20") == []  # an argument, whole
+    assert matching_descendants(table, argv.get, exe + 1000, command) == []  # not under root
+    assert process_tree({bash}, table) == {bash, sleep}
+    twin = {"pid": 9, "ppid": exe, "comm": "bash", "argv": ["bash", "-c", command]}
+    rows = [*PS_TABLE, twin]
+    assert matching_descendants(
+        _table(rows), {r["pid"]: r["argv"] for r in rows}.get, agy, command
+    ) == [9, bash]

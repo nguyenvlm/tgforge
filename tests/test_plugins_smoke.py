@@ -116,3 +116,14 @@ def test_a_backtick_heavy_file_view_fits_once_rendered(tmp_path):
         assert TelegramAdapter.measure(md) <= MAX_MSG  # rich, not the plain fallback
 
     asyncio.run(scenario())
+
+
+def test_the_default_app_includes_every_bundled_plugin_agy_too(tmp_path):
+    from tgforge.default import build_default_app
+
+    cfg = BotConfig(token="x", home=str(tmp_path), owner_id=1, chat_id=100, bot_username="bot")
+    ids = [p.id for p in build_default_app(cfg)._plugins]
+    assert ids == ["claude", "agy", "shell", "localfs", "gcloud"]
+    core = telegram_kernel(MockBot(), cfg, build_default_app(cfg)._plugins)
+    assert core.registry.launches["/agy"][0] == "agy"
+    assert core.registry.launches["/claude"][0] == "claude"

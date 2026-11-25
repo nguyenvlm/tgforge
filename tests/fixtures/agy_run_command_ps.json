@@ -1,0 +1,38 @@
+[
+ {
+  "pid": 3882284,
+  "ppid": 3882279,
+  "comm": "agy",
+  "argv": [
+   "agy",
+   "acp"
+  ]
+ },
+ {
+  "pid": 3882358,
+  "ppid": 3882284,
+  "comm": "exe",
+  "argv": [
+   "/home/user/.local/bin/agy"
+  ]
+ },
+ {
+  "pid": 3882387,
+  "ppid": 3882358,
+  "comm": "bash",
+  "argv": [
+   "bash",
+   "-c",
+   "sleep 20; echo bg-a"
+  ]
+ },
+ {
+  "pid": 3882388,
+  "ppid": 3882387,
+  "comm": "sleep",
+  "argv": [
+   "sleep",
+   "20"
+  ]
+ }
+]

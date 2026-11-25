@@ -25,6 +25,6 @@ def test_fmt_duration_full_units(seconds, expected):
 
 
 def test_status_head_uses_new_duration():
-    from tgforge.plugins.claude.render import status_head
+    from tgforge.plugins.agent.render import status_head
 
     assert "1h" in status_head(0, 0, 3600, 0)

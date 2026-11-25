@@ -93,9 +93,8 @@ class _FakeCtx:
 
 
 def _plugin(tmp_path):
-    p = Claude()
+    p = TestClient(Claude(), home=str(tmp_path)).core.plugin_by_id["claude"]
     p.claude_dir = tmp_path / ".claude"
-    p.accounts = {}
     return p
 
 
@@ -239,7 +238,7 @@ def test_login_arg_relogins_named_account(tmp_path, monkeypatch):
     plugin.claude_bin = _fake_login_cli(tmp_path)
     plugin.claude_dir = tmp_path / ".claude"
     cfg = tmp_path / ".claude-work"
-    plugin.accounts["work"] = str(cfg)
+    plugin.set_account("work", str(cfg))
     _write_ok(cfg)
 
     async def scenario():

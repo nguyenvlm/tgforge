@@ -12,7 +12,8 @@ from types import SimpleNamespace
 from aiogram.exceptions import TelegramAPIError
 
 from tgforge.base.telegram import _markup
-from tgforge.plugins.claude import Claude, ClaudeTopic, driver
+from tgforge.plugins.agent import window as driver
+from tgforge.plugins.claude import Claude, ClaudeTopic
 from tgforge.plugins.claude.driver import _project_dir
 from tgforge.plugins.localfs import Localfs, LocalfsTopic
 from tgforge.testing import TestClient, telegram_inbound

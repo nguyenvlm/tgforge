@@ -24,7 +24,7 @@ from claude_fakes import (
     window,
 )
 
-from tgforge.plugins.claude.driver import UNDELIVERED_NOTE
+from tgforge.plugins.agent.window import UNDELIVERED_NOTE
 
 
 def _queued_ack(c, t):

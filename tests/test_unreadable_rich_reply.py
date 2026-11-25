@@ -134,7 +134,7 @@ def test_a_frame_push_that_raises_resolves_its_land_frame_as_not_landed(caplog):
 
 
 def test_a_send_step_stuck_behind_the_one_before_it_is_logged(tmp_path, monkeypatch, caplog):
-    from tgforge.plugins.claude import driver as drv
+    from tgforge.plugins.agent import window as drv
 
     monkeypatch.setattr(drv, "SEND_STEP_STALL", 0.05)
 

@@ -9,7 +9,7 @@ import time
 
 from claude_fakes import client, drain, window
 
-from tgforge.plugins.claude import driver as drv
+from tgforge.plugins.agent import window as drv
 
 CARD_EDIT_DEADLINE = 2.0  # seconds a test waits for the heartbeat's first card edit
 

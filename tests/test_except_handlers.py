@@ -41,10 +41,10 @@ SITES = {
     ("base/kernel.py", "error_text"): "an exception whose text can't be read is named by its "
     "type alone",
     ("base/app.py", "start"): "closing a platform at shutdown: no window is served anymore",
-    ("plugins/claude/driver.py", "step"): "hands the exception to the caller awaiting the step",
-    ("plugins/claude/driver.py", "submit"): "a CLI that fails to launch is reported in the "
+    ("plugins/agent/window.py", "step"): "hands the exception to the caller awaiting the step",
+    ("plugins/agent/window.py", "submit"): "a CLI that fails to launch is reported in the "
     "window: there is no session to tell",
-    ("plugins/claude/driver.py", "_one_shot"): "a `!` command's failure is its result, shown "
+    ("plugins/agent/window.py", "_one_shot"): "a `!` command's failure is its result, shown "
     "in the window and handed to the agent",
     ("base/mermaid.py", "_fetch"): "a fetch that fails is named by the fallback notice of "
     "the next diagram, which goes out as code",
